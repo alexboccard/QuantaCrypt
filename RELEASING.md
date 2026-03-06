@@ -19,7 +19,7 @@ and shows a banner when a newer version is available.
 
    ```bash
    git tag v1.1.0
-   git push origin main --tags
+   git push origin master --tags
    ```
 
 2. **GitHub Actions takes over** — the `release.yml` workflow will:
@@ -28,7 +28,7 @@ and shows a banner when a newer version is available.
    - Build separate `.dmg` installers for **arm64** (Apple Silicon) and **x86_64** (Intel)
    - Create a GitHub Release with both DMGs attached
    - Auto-generate release notes from commits since the last tag
-   - Commit the version bump back to `main` so the repo stays in sync
+   - Commit the version bump back to `master` so the repo stays in sync
 
 3. **The release appears** at:
    ```

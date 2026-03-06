@@ -185,7 +185,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: master
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update version files
@@ -205,4 +205,4 @@ jobs:
           git add pyproject.toml src/quantacrypt/__init__.py
           git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
           git commit -m "chore: bump version to $VER [skip ci]"
-          git push origin main
+          git push origin master
