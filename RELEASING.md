@@ -15,28 +15,22 @@ and shows a banner when a newer version is available.
 
 ## How to release
 
-1. **Bump the version** in `pyproject.toml`:
-
-   ```toml
-   version = "1.1.0"
-   ```
-
-2. **Commit and tag**:
+1. **Tag and push** — the version comes from the tag name (no manual bump needed):
 
    ```bash
-   git add pyproject.toml
-   git commit -m "release: v1.1.0"
    git tag v1.1.0
    git push origin main --tags
    ```
 
-3. **GitHub Actions takes over** — the `release.yml` workflow will:
+2. **GitHub Actions takes over** — the `release.yml` workflow will:
    - Run the full test suite on Apple Silicon
+   - Stamp the tag version into `pyproject.toml` and `__init__.py` before building
    - Build separate `.dmg` installers for **arm64** (Apple Silicon) and **x86_64** (Intel)
    - Create a GitHub Release with both DMGs attached
    - Auto-generate release notes from commits since the last tag
+   - Commit the version bump back to `main` so the repo stays in sync
 
-4. **The release appears** at:
+3. **The release appears** at:
    ```
    https://github.com/alexboccard/QuantaCrypt/releases/tag/v1.1.0
    ```

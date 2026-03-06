@@ -563,6 +563,9 @@ def main():
         os.remove(icon_tmp)
 
     if result.returncode != 0:
+        # Clean up doc icon temp file on failure (success path handles it in _post_build)
+        if doc_icon_tmp and os.path.isfile(doc_icon_tmp):
+            os.remove(doc_icon_tmp)
         print("[!] Build failed"); sys.exit(1)
 
     _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label)

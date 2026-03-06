@@ -176,3 +176,33 @@ jobs:
             artifacts/quantacrypt-x86_64/quantacrypt-x86_64.dmg \
             --title "QuantaCrypt ${{ steps.version.outputs.tag }}" \
             --generate-notes
+
+  bump-version:
+    name: Commit released version back to repo
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update version files
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          echo "Bumping repo version to $VER"
+          sed -i "s/^version = .*/version = \"$VER\"/" pyproject.toml
+          sed -i "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
+          echo "pyproject.toml: $(grep '^version' pyproject.toml)"
+          echo "__init__.py:    $(grep '__version__' src/quantacrypt/__init__.py)"
+
+      - name: Commit and push
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/quantacrypt/__init__.py
+          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
+          git commit -m "chore: bump version to $VER [skip ci]"
+          git push origin main
