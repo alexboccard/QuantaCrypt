@@ -38,7 +38,7 @@ jobs:
           - arch: arm64
             runner: macos-14       # Apple Silicon
           - arch: x86_64
-            runner: macos-13       # Intel
+            runner: macos-15       # Intel cross-compile on latest macOS
 
     steps:
       - uses: actions/checkout@v4
