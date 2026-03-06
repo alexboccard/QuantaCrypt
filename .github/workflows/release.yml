@@ -41,6 +41,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          echo "Stamping version: $VER"
+          # Update pyproject.toml (used by build.py for Info.plist)
+          sed -i '' "s/^version = .*/version = \"$VER\"/" pyproject.toml
+          # Update __init__.py fallback (shown in the app UI)
+          sed -i '' "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
+          grep 'version' pyproject.toml | head -1
+          grep '__version__' src/quantacrypt/__init__.py
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -72,6 +84,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          echo "Stamping version: $VER"
+          sed -i '' "s/^version = .*/version = \"$VER\"/" pyproject.toml
+          sed -i '' "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
 
       - name: Install Rosetta 2
         run: sudo softwareupdate --install-rosetta --agree-to-license
