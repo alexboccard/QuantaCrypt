@@ -33,6 +33,7 @@ WORK = os.path.join(ROOT, "build")
 NAME = "quantacrypt"
 BUNDLE_ID = "com.alexboccard.quantacrypt"
 QCX_UTI   = "com.alexboccard.quantacrypt.qcx"
+DOC_ICON_NAME = "doc_icon.icns"
 
 SUF = ".app"
 
@@ -65,6 +66,7 @@ def _make_icns(png_path, out_path):
     """
     from PIL import Image
     src = Image.open(png_path).convert("RGBA")
+    _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
     # (type_code, pixel_size)
     SIZES = [
@@ -75,7 +77,7 @@ def _make_icns(png_path, out_path):
 
     chunks = b""
     for code, px in SIZES:
-        resized = src.resize((px, px), Image.LANCZOS)
+        resized = src.resize((px, px), _LANCZOS)
         buf = io.BytesIO()
         resized.save(buf, format="PNG")
         data = buf.getvalue()
@@ -116,7 +118,7 @@ def _build_doc_icon():
         print("[!] doc_icon.png not found — .qcx files will use a generic icon")
         return None
 
-    out = os.path.join(ROOT, "doc_icon.icns")
+    out = os.path.join(ROOT, DOC_ICON_NAME)
     try:
         _make_icns(png, out)
         print(f"[+] Generated {out}")
@@ -429,6 +431,62 @@ def _codesign_app_bundle(app_path):
         print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
 
 
+def _post_build(app_path, doc_icon_tmp, arch_label):
+    """Install doc icon, patch plist, code-sign, create DMG, and print summary."""
+    # Copy the document icon into the .app bundle's Resources directory
+    # so macOS can find it for .qcx file thumbnails in Finder
+    doc_icon_name = None
+    if doc_icon_tmp and os.path.isfile(doc_icon_tmp):
+        resources_dir = os.path.join(app_path, "Contents", "Resources")
+        os.makedirs(resources_dir, exist_ok=True)
+        dest = os.path.join(resources_dir, DOC_ICON_NAME)
+        shutil.copy2(doc_icon_tmp, dest)
+        os.remove(doc_icon_tmp)
+        doc_icon_name = DOC_ICON_NAME
+        print(f"[+] Installed {dest}")
+
+    # Patch Info.plist with .qcx file-association metadata
+    _patch_plist(app_path, doc_icon_name)
+
+    # Ad-hoc code sign the .app bundle so macOS Gatekeeper shows the
+    # standard "unidentified developer" dialog instead of "damaged".
+    # We must sign from the inside out: first every embedded binary
+    # (frameworks, .so, .dylib), then the main executable, then the
+    # outer bundle.  Using just `--deep` is unreliable, and
+    # `--options runtime` (hardened runtime) requires matching Team IDs
+    # which breaks ad-hoc signing when embedded frameworks (like
+    # Python.framework from python.org) carry a different Team ID.
+    print("[*] Ad-hoc code signing the .app bundle …")
+    _codesign_app_bundle(app_path)
+
+    # .app is a directory — report total size by walking it
+    total = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, files in os.walk(app_path)
+        for f in files
+    )
+    sz = total / 1_000_000
+
+    # Create distributable DMG with drag-to-Applications layout
+    dmg_path = _create_dmg(app_path, arch_label)
+
+    print(f"\n{'=' * 60}")
+    print(f"  BUILD COMPLETE  ({arch_label})")
+    print(f"{'=' * 60}")
+    print(f"  App:  {app_path}  ({sz:.1f} MB)")
+    if dmg_path:
+        dmg_sz = os.path.getsize(dmg_path) / 1_000_000
+        print(f"  DMG:  {dmg_path}  ({dmg_sz:.1f} MB)")
+    print()
+    if dmg_path:
+        print("  Share the .dmg — recipients open it and drag to Applications.")
+    else:
+        print("  Double-click the .app to launch, or drag it to /Applications.")
+    print("  First launch: right-click → Open → Open to bypass Gatekeeper.")
+    print(f"  If macOS says 'damaged': xattr -cr /Applications/{NAME}.app")
+    print(f"{'=' * 60}\n")
+
+
 def main():
     args = _parse_args()
     os.makedirs(DIST, exist_ok=True)
@@ -507,60 +565,7 @@ def main():
     if result.returncode != 0:
         print("[!] Build failed"); sys.exit(1)
 
-    out = os.path.join(DIST, NAME + SUF)
-
-    # Copy the document icon into the .app bundle's Resources directory
-    # so macOS can find it for .qcx file thumbnails in Finder
-    doc_icon_name = None
-    if doc_icon_tmp and os.path.isfile(doc_icon_tmp):
-        resources_dir = os.path.join(out, "Contents", "Resources")
-        os.makedirs(resources_dir, exist_ok=True)
-        dest = os.path.join(resources_dir, "doc_icon.icns")
-        shutil.copy2(doc_icon_tmp, dest)
-        os.remove(doc_icon_tmp)
-        doc_icon_name = "doc_icon.icns"
-        print(f"[+] Installed {dest}")
-
-    # Patch Info.plist with .qcx file-association metadata
-    _patch_plist(out, doc_icon_name)
-
-    # Ad-hoc code sign the .app bundle so macOS Gatekeeper shows the
-    # standard "unidentified developer" dialog instead of "damaged".
-    # We must sign from the inside out: first every embedded binary
-    # (frameworks, .so, .dylib), then the main executable, then the
-    # outer bundle.  Using just `--deep` is unreliable, and
-    # `--options runtime` (hardened runtime) requires matching Team IDs
-    # which breaks ad-hoc signing when embedded frameworks (like
-    # Python.framework from python.org) carry a different Team ID.
-    print("[*] Ad-hoc code signing the .app bundle …")
-    _codesign_app_bundle(out)
-
-    # .app is a directory — report total size by walking it
-    total = sum(
-        os.path.getsize(os.path.join(dp, f))
-        for dp, _, files in os.walk(out)
-        for f in files
-    )
-    sz = total / 1_000_000
-
-    # Create distributable DMG with drag-to-Applications layout
-    dmg_path = _create_dmg(out, arch_label)
-
-    print(f"\n{'='*60}")
-    print(f"  BUILD COMPLETE  ({arch_label})")
-    print(f"{'='*60}")
-    print(f"  App:  {out}  ({sz:.1f} MB)")
-    if dmg_path:
-        dmg_sz = os.path.getsize(dmg_path) / 1_000_000
-        print(f"  DMG:  {dmg_path}  ({dmg_sz:.1f} MB)")
-    print()
-    if dmg_path:
-        print(f"  Share the .dmg — recipients open it and drag to Applications.")
-    else:
-        print(f"  Double-click the .app to launch, or drag it to /Applications.")
-    print(f"  First launch: right-click → Open → Open to bypass Gatekeeper.")
-    print(f"  If macOS says 'damaged': xattr -cr /Applications/{NAME}.app")
-    print(f"{'='*60}\n")
+    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label)
 
 
 if __name__ == "__main__":

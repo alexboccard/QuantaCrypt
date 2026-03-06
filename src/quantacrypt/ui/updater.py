@@ -54,7 +54,7 @@ def _fetch_latest() -> Optional[dict]:
         return None
 
 
-def check_for_update(parent: tk.Widget, current_version: str) -> None:
+def check_for_update(parent: "tk.Toplevel", current_version: str) -> None:
     """Spawn a background thread to check for updates.
 
     If a newer version is found, schedule a banner to be added to *parent*
@@ -86,7 +86,7 @@ def check_for_update(parent: tk.Widget, current_version: str) -> None:
 
         # Schedule the UI update on the main thread
         try:
-            parent.after(0, lambda: _show_banner(parent, display_ver, html_url))
+            parent.after(0, _show_banner, parent, display_ver, html_url)
         except Exception:
             pass  # widget may have been destroyed
 
@@ -94,7 +94,7 @@ def check_for_update(parent: tk.Widget, current_version: str) -> None:
     t.start()
 
 
-def _show_banner(parent: tk.Widget, version: str, url: str) -> None:
+def _show_banner(parent: "tk.Toplevel", version: str, url: str) -> None:
     """Insert a subtle update banner near the top of the parent widget."""
     banner = tk.Frame(parent, bg=C["surface"], highlightbackground=C["accent"],
                       highlightthickness=1)

@@ -11,13 +11,26 @@ from quantacrypt.ui.shared import (
 )
 
 try:
-    from tkinterdnd2 import DND_FILES as _DND_FILES
+    from tkinterdnd2 import DND_FILES as _DND_FILES, TkinterDnD as _TkDnD
 except ImportError:
     _DND_FILES = None
+    _TkDnD = None  # type: ignore[assignment,misc]
+
+# Type alias: the launcher's master may be a plain Tk or a TkinterDnD.Tk,
+# and the launcher itself gains dnd methods at runtime when tkinterdnd2 is
+# available.  We use TYPE_CHECKING to keep the static analyser happy.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any
 
 
 class LauncherApp(tk.Toplevel):
-    def __init__(self, master):
+    # DnD methods are injected at runtime by tkinterdnd2; declare for type-checkers
+    drop_target_register: "Any"
+    dnd_bind: "Any"
+
+    def __init__(self, master: "tk.Misc"):
         super().__init__(master)
         self.title("QuantaCrypt")
         self.configure(bg=C["bg"])
@@ -158,59 +171,62 @@ class LauncherApp(tk.Toplevel):
             RecentFiles.clear()
             self._build_recent()
         FlatButton(hdr, "Clear", _do_clear, primary=False, small=True).pack(side="right")
-        import time as _t
         MAX_VISIBLE = 5
         for path, entry in entries[:MAX_VISIBLE]:
-            mode = entry.get("mode", "single")
-            k, n = entry.get("threshold", 0), entry.get("total", 0)
-            mode_tag = (f"Split key ({k} of {n})" if mode == "shamir" and k and n
-                        else "Password")
-            ts = entry.get("ts", 0)
-            try:
-                date_str = _t.strftime("%b %d", _t.localtime(ts)) if ts else ""
-            except Exception:
-                date_str = ""
-
-            row = tk.Frame(self._recent_frame, bg=C["surface"],
-                           highlightbackground=C["border"], highlightthickness=1,
-                           cursor="hand2")
-            row.pack(fill="x", pady=(0, 4))
-            top_inner = tk.Frame(row, bg=C["surface"])
-            top_inner.pack(fill="x", padx=12, pady=(8, 2))
-            name_lbl = tk.Label(top_inner, text=os.path.basename(path),
-                                font=F["caption"], bg=C["surface"], fg=C["text"])
-            name_lbl.pack(side="left")
-            # Show both date and mode, not one or the other
-            combined_meta = "  ·  ".join(x for x in [mode_tag, date_str] if x)
-            meta_lbl = tk.Label(top_inner, text=combined_meta,
-                                font=F["small"], bg=C["surface"], fg=C["text3"])
-            meta_lbl.pack(side="right")
-            dir_lbl = tk.Label(row, text=os.path.dirname(path),
-                               font=F["small"], bg=C["surface"], fg=C["text3"],
-                               anchor="w", cursor="hand2")
-            dir_lbl.pack(fill="x", padx=12, pady=(0, 6))
-
-            _all = [row, top_inner, name_lbl, meta_lbl, dir_lbl]
-
-            def _hl(on, widgets=_all):
-                col = C["surface2"] if on else C["surface"]
-                for w in widgets:
-                    try: w.config(bg=col)
-                    except Exception: pass
-
-            def _open(p=path):
-                self._open_qcx(p)
-
-            for w in _all:
-                w.bind("<Button-1>", lambda e, p=path: _open(p))
-                w.bind("<Enter>", lambda e: _hl(True))
-                w.bind("<Leave>", lambda e: _hl(False))
+            self._build_recent_row(path, entry)
         # Show overflow count so the launcher doesn't overflow the screen
         if len(entries) > MAX_VISIBLE:
             extra = len(entries) - MAX_VISIBLE
             tk.Label(self._recent_frame,
                      text=f"… and {extra} more",
                      font=F["small"], bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(2, 0))
+
+    def _build_recent_row(self, path, entry):
+        """Render a single recent-file row inside ``_recent_frame``."""
+        import time as _t
+
+        mode = entry.get("mode", "single")
+        k, n = entry.get("threshold", 0), entry.get("total", 0)
+        mode_tag = (f"Split key ({k} of {n})" if mode == "shamir" and k and n
+                    else "Password")
+        ts = entry.get("ts", 0)
+        try:
+            date_str = _t.strftime("%b %d", _t.localtime(ts)) if ts else ""
+        except Exception:
+            date_str = ""
+
+        row = tk.Frame(self._recent_frame, bg=C["surface"],
+                       highlightbackground=C["border"], highlightthickness=1,
+                       cursor="hand2")
+        row.pack(fill="x", pady=(0, 4))
+        top_inner = tk.Frame(row, bg=C["surface"])
+        top_inner.pack(fill="x", padx=12, pady=(8, 2))
+        name_lbl = tk.Label(top_inner, text=os.path.basename(path),
+                            font=F["caption"], bg=C["surface"], fg=C["text"])
+        name_lbl.pack(side="left")
+        combined_meta = "  ·  ".join(x for x in [mode_tag, date_str] if x)
+        meta_lbl = tk.Label(top_inner, text=combined_meta,
+                            font=F["small"], bg=C["surface"], fg=C["text3"])
+        meta_lbl.pack(side="right")
+        dir_lbl = tk.Label(row, text=os.path.dirname(path),
+                           font=F["small"], bg=C["surface"], fg=C["text3"],
+                           anchor="w", cursor="hand2")
+        dir_lbl.pack(fill="x", padx=12, pady=(0, 6))
+
+        widgets = (row, top_inner, name_lbl, meta_lbl, dir_lbl)
+
+        def _hl(on, _widgets=widgets):
+            col = C["surface2"] if on else C["surface"]
+            for w in _widgets:
+                try:
+                    w.config(bg=col)
+                except Exception:
+                    pass
+
+        for w in widgets:
+            w.bind("<Button-1>", lambda e, p=path: self._open_qcx(p))
+            w.bind("<Enter>", lambda e: _hl(True))
+            w.bind("<Leave>", lambda e: _hl(False))
 
 
     def _make_card(self, parent, icon, title, body, btn_text, command, accent):
