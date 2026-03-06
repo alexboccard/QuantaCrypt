@@ -5,7 +5,7 @@ from importlib.metadata import version as _v, PackageNotFoundError as _E
 try:
     __version__ = _v("quantacrypt")
 except _E:               # running from source or PyInstaller bundle
-    __version__ = "1.0.0"  # keep in sync with pyproject.toml
+    __version__ = "1.2.0"  # keep in sync with pyproject.toml
 
 
 def main():  # pragma: no cover
