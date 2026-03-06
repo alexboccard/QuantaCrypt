@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write      # needed to create GitHub Releases
 
+env:
+  # Universal2 Python from python.org — contains both arm64 and x86_64
+  PYTHON_PKG_URL: "https://www.python.org/ftp/python/3.13.2/python-3.13.2-macos11.pkg"
+  PYTHON_BIN: "/usr/local/bin/python3.13"
+
 jobs:
   test:
     name: Run tests
@@ -28,17 +33,10 @@ jobs:
       - name: Run tests
         run: python -m pytest --tb=short -q
 
-  build:
-    name: Build (${{ matrix.arch }})
+  build-arm64:
+    name: Build (arm64)
     needs: test
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14       # Apple Silicon
-          - arch: x86_64
-            runner: macos-15       # Intel cross-compile on latest macOS
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -52,18 +50,54 @@ jobs:
         run: pip install ".[dev]"
 
       - name: Build .app and .dmg
-        run: python scripts/build.py --arch ${{ matrix.arch }} --skip-tests
+        run: python scripts/build.py --arch arm64 --skip-tests
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: quantacrypt-${{ matrix.arch }}
-          path: dist/quantacrypt-${{ matrix.arch }}.dmg
+          name: quantacrypt-arm64
+          path: dist/quantacrypt-arm64.dmg
+          if-no-files-found: error
+
+  build-x86_64:
+    name: Build (x86_64 via Rosetta)
+    needs: test
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rosetta 2
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install universal2 Python from python.org
+        run: |
+          curl -L "$PYTHON_PKG_URL" -o /tmp/python.pkg
+          sudo installer -pkg /tmp/python.pkg -target /
+          # Verify this Python runs as x86_64 under Rosetta
+          arch -x86_64 $PYTHON_BIN -c "import platform; assert platform.machine() == 'x86_64', f'Expected x86_64, got {platform.machine()}'"
+          echo "✓ Python running as x86_64 under Rosetta"
+
+      - name: Install dependencies (x86_64)
+        run: arch -x86_64 $PYTHON_BIN -m pip install ".[dev]"
+
+      - name: Build .app and .dmg (x86_64)
+        run: arch -x86_64 $PYTHON_BIN scripts/build.py --arch x86_64 --skip-tests
+        env:
+          # Force all child processes (PyInstaller, pip) to use x86_64
+          ARCHFLAGS: "-arch x86_64"
+          _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantacrypt-x86_64
+          path: dist/quantacrypt-x86_64.dmg
           if-no-files-found: error
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build-arm64, build-x86_64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 

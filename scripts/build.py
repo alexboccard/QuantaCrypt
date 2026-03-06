@@ -439,6 +439,13 @@ def main():
     cmd.append(os.path.join(PKG, "__main__.py"))
 
     print(f"\n{'='*60}\n  Building: {NAME}{SUF}  ({arch_label})\n{'='*60}")
+    # When cross-building x86_64 on Apple Silicon, wrap the PyInstaller
+    # subprocess with `arch -x86_64` so it and all its children run under
+    # Rosetta.  Without this, sys.executable spawns an arm64 process even
+    # if the outer script was invoked with `arch -x86_64`.
+    import platform
+    if target_arch == "x86_64" and platform.machine() == "arm64":
+        cmd = ["arch", "-x86_64"] + cmd
     result = subprocess.run(cmd, cwd=ROOT)
 
     # Clean up the generated platform icon (icns/ico) — only needed during build
