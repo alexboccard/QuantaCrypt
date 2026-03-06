@@ -1,0 +1,19 @@
+# Core dependencies
+cryptography>=41.0
+argon2-cffi>=23.1
+kyber-py>=0.8
+shamirs>=1.0
+mnemonic>=0.20
+
+# Optional: drag-and-drop support
+tkinterdnd2>=0.3
+
+# Optional: password strength estimator
+zxcvbn>=4.4
+
+# Build (only needed to produce the .app bundle)
+pyinstaller>=6.0
+Pillow>=10.0
+
+# Development / testing
+pytest>=7.0

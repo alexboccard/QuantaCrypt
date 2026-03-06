@@ -1,0 +1,42 @@
+[project]
+name = "quantacrypt"
+version = "4.0.0"
+description = "Post-quantum file encryption using ML-KEM (Kyber-768) + AES-256-GCM with optional Shamir secret sharing"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+readme = "README.md"
+keywords = ["encryption", "post-quantum", "kyber", "shamir", "aes-gcm"]
+
+dependencies = [
+    "cryptography>=41.0",
+    "argon2-cffi>=23.1",
+    "kyber-py>=0.8",
+    "shamirs>=1.0",
+    "mnemonic>=0.20",
+]
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2>=0.3"]
+strength = ["zxcvbn>=4.4"]
+build = ["pyinstaller>=6.0", "Pillow>=10.0"]
+dev = [
+    "pytest>=7.0",
+    "quantacrypt[dnd,strength,build]",
+]
+
+[project.scripts]
+quantacrypt = "quantacrypt:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+quantacrypt = ["assets/*.png"]

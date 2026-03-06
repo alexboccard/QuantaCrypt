@@ -1,0 +1,90 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"          # triggers on v1.0.0, v1.2.3-beta, etc.
+
+  workflow_dispatch:   # allow manual runs for testing (no release created)
+
+permissions:
+  contents: write      # needed to create GitHub Releases
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest --tb=short -q
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14       # Apple Silicon
+          - arch: x86_64
+            runner: macos-13       # Intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+
+      - name: Build .app and .dmg
+        run: python scripts/build.py --arch ${{ matrix.arch }} --skip-tests
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantacrypt-${{ matrix.arch }}
+          path: dist/quantacrypt-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all DMG artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract version from tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            artifacts/quantacrypt-arm64/quantacrypt-arm64.dmg \
+            artifacts/quantacrypt-x86_64/quantacrypt-x86_64.dmg \
+            --title "QuantaCrypt ${{ steps.version.outputs.tag }}" \
+            --generate-notes
