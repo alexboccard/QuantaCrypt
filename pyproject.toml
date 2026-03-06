@@ -52,18 +52,10 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "--cov=quantacrypt --cov-report=term-missing --cov-report=html:htmlcov"
+addopts = "--cov=quantacrypt.core --cov-report=term-missing --cov-report=html:htmlcov"
 
 [tool.coverage.run]
-source = ["src/quantacrypt"]
-omit = [
-    "src/quantacrypt/assets/*",
-    "src/quantacrypt/ui/launcher.py",
-    "src/quantacrypt/ui/encryptor.py",
-    "src/quantacrypt/ui/decryptor.py",
-    "src/quantacrypt/ui/shared.py",
-    "src/quantacrypt/__main__.py",
-]
+source = ["src/quantacrypt/core"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -74,7 +66,7 @@ exclude_lines = [
 ]
 show_missing = true
 skip_empty = true
-fail_under = 90
+fail_under = 95
 
 [tool.setuptools.packages.find]
 where = ["src"]
