@@ -38,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/alexboccard/quantacrypt"
-Repository = "https://github.com/alexboccard/quantacrypt"
-Issues = "https://github.com/alexboccard/quantacrypt/issues"
+Homepage = "https://github.com/alexboccard/QuantaCrypt"
+Repository = "https://github.com/alexboccard/QuantaCrypt"
+Issues = "https://github.com/alexboccard/QuantaCrypt/issues"
 
 [project.scripts]
 quantacrypt = "quantacrypt:main"

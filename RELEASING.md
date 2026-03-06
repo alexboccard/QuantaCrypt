@@ -8,6 +8,11 @@ It propagates automatically to:
 - `__version__` at runtime (via `importlib.metadata`)
 - `CFBundleShortVersionString` / `CFBundleVersion` in the .app bundle (via `build.py`)
 
+In CI, the workflow also stamps the git tag version into both `pyproject.toml` and
+`src/quantacrypt/__init__.py` before building, so the frozen app always shows the
+correct release version. The in-app update checker queries the GitHub Releases API
+and shows a banner when a newer version is available.
+
 ## How to release
 
 1. **Bump the version** in `pyproject.toml`:
@@ -33,7 +38,7 @@ It propagates automatically to:
 
 4. **The release appears** at:
    ```
-   https://github.com/alexboccard/quantacrypt/releases/tag/v1.1.0
+   https://github.com/alexboccard/QuantaCrypt/releases/tag/v1.1.0
    ```
    with two downloads: `quantacrypt-arm64.dmg` and `quantacrypt-x86_64.dmg`.
 

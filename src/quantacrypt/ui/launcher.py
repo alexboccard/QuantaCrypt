@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """QuantaCrypt Launcher — home screen for the combined binary."""
 import os
-import sys
-
 import tkinter as tk
-from tkinter import filedialog
 
 from quantacrypt import __version__
 from quantacrypt.ui.shared import (
@@ -27,6 +24,9 @@ class LauncherApp(tk.Toplevel):
         self.resizable(False, False)
         self._build()
         self._center()
+        # Check for updates in the background (non-blocking)
+        from quantacrypt.ui.updater import check_for_update
+        check_for_update(self, __version__)
         # Keyboard shortcuts: Ctrl+E → Encrypt, Ctrl+D → Decrypt, Ctrl+I → Inspect
         self.bind("<Control-e>", lambda e: self._open_encryptor())
         self.bind("<Control-E>", lambda e: self._open_encryptor())
@@ -322,7 +322,6 @@ class LauncherApp(tk.Toplevel):
         """Open a .qcx file and show its metadata without entering credentials."""
         from tkinter import filedialog, messagebox
         from quantacrypt.ui.decryptor import load_pkg
-        import time as _t
         path = filedialog.askopenfilename(
             title="Inspect encrypted file",
             filetypes=[("QuantaCrypt", "*.qcx"), ("All files", "*")])

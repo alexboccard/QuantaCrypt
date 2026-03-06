@@ -39,7 +39,7 @@ SUF = ".app"
 HIDDEN = [
     "quantacrypt", "quantacrypt.core", "quantacrypt.core.crypto",
     "quantacrypt.ui", "quantacrypt.ui.shared", "quantacrypt.ui.launcher",
-    "quantacrypt.ui.encryptor", "quantacrypt.ui.decryptor",
+    "quantacrypt.ui.encryptor", "quantacrypt.ui.decryptor", "quantacrypt.ui.updater",
     "cryptography", "cryptography.hazmat.primitives.ciphers.aead",
     "argon2", "argon2.low_level",
     "kyber_py", "kyber_py.kyber",
@@ -395,7 +395,9 @@ def _codesign_app_bundle(app_path):
     import glob
 
     # 1. Sign all embedded .so, .dylib, and framework binaries
-    patterns = ["**/*.so", "**/*.dylib", "**/*.framework/Versions/*/Python",
+    patterns = ["**/*.so", "**/*.dylib",
+                "**/*.bundle/Contents/MacOS/*",
+                "**/*.framework/Versions/*/Python",
                 "**/*.framework/Versions/*/*/*"]
     signed = set()
     for pat in patterns:
