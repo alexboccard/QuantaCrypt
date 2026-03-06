@@ -472,6 +472,22 @@ def main():
     # Patch Info.plist with .qcx file-association metadata
     _patch_plist(out, doc_icon_name)
 
+    # Ad-hoc code sign the .app bundle so macOS Gatekeeper shows the
+    # standard "unidentified developer" dialog instead of "damaged".
+    # A paid Apple Developer ID would eliminate the warning entirely,
+    # but ad-hoc signing is sufficient for open-source distribution.
+    print("[*] Ad-hoc code signing the .app bundle …")
+    sign_cmd = [
+        "codesign", "--force", "--deep", "--sign", "-",
+        "--options", "runtime",
+        out,
+    ]
+    sign_result = subprocess.run(sign_cmd, capture_output=True, text=True)
+    if sign_result.returncode == 0:
+        print("[+] Code signing succeeded")
+    else:
+        print(f"[!] Code signing failed (non-fatal): {sign_result.stderr.strip()}")
+
     # .app is a directory — report total size by walking it
     total = sum(
         os.path.getsize(os.path.join(dp, f))
@@ -495,7 +511,8 @@ def main():
         print(f"  Share the .dmg — recipients open it and drag to Applications.")
     else:
         print(f"  Double-click the .app to launch, or drag it to /Applications.")
-    print(f"  First launch: right-click → Open to bypass Gatekeeper.")
+    print(f"  First launch: right-click → Open → Open to bypass Gatekeeper.")
+    print(f"  If macOS says 'damaged': xattr -cr /Applications/{NAME}.app")
     print(f"{'='*60}\n")
 
 
