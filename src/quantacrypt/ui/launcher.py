@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """QuantaCrypt Launcher — home screen for the combined binary."""
-import os, sys
+import os
+import sys
+
 import tkinter as tk
 from tkinter import filedialog
 
-if getattr(sys, "frozen", False):
-    _base = sys._MEIPASS
-    sys.path.insert(0, _base)
-else:
-    _base = os.path.dirname(os.path.abspath(__file__))
-
-from quantacrypt.ui.shared import *
+from quantacrypt import __version__
+from quantacrypt.ui.shared import (
+    C, F, UI,
+    fmt_size, rule,
+    FlatButton, RecentFiles,
+)
 
 try:
     from tkinterdnd2 import DND_FILES as _DND_FILES
@@ -45,11 +46,15 @@ class LauncherApp(tk.Toplevel):
                 pass
 
     def _on_drop(self, event):
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
-        path = raw.split("} {")[0]
-        if os.path.isfile(path):
-            self._open_qcx(path)
+        try:
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            # Fallback for non-standard Tcl encoding
+            raw = event.data.strip()
+            if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
+            paths = [raw.split("} {")[0]]
+        if paths and os.path.isfile(paths[0]):
+            self._open_qcx(paths[0])
 
     def _center(self):
         self.update_idletasks()
@@ -90,15 +95,15 @@ class LauncherApp(tk.Toplevel):
             cards,
             icon="🔓",
             title="Decrypt",
-            body="Open a .qcx file using your\npassword or Shamir shares.",
+            body="Open an encrypted .qcx file\nusing your password or shares.",
             btn_text="Decrypt a file →",
             command=self._open_decryptor,
             accent=False,
         )
         self._dec_card.grid(row=0, column=1, sticky="nsew")
 
-        cards.columnconfigure(0, weight=1, minsize=200)
-        cards.columnconfigure(1, weight=1, minsize=200)
+        cards.columnconfigure(0, weight=1, minsize=220)
+        cards.columnconfigure(1, weight=1, minsize=220)
 
         # ── Drop hint ─────────────────────────────────────────────────────────
         rule(self, pady=20, padx=P)
@@ -112,21 +117,23 @@ class LauncherApp(tk.Toplevel):
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
                  wraplength=420).pack(pady=(0, 12))
 
-        # UX-L2: Inspect button — previously only discoverable via Ctrl+I
+        # Inspect button — previously only discoverable via Ctrl+I
         inspect_row = tk.Frame(self, bg=C["bg"])
         inspect_row.pack(pady=(0, 8))
-        FlatButton(inspect_row, "Inspect a .qcx file", self._inspect_file,
+        FlatButton(inspect_row, "🔍 Inspect a .qcx file", self._inspect_file,
                    primary=False, small=True).pack()
+        tk.Label(inspect_row, text="View encryption details without the password",
+                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(2, 0))
         tk.Label(self,
-                 text="QuantaCrypt uses ML-KEM (Kyber-768) post-quantum encryption + AES-256-GCM.\n"
-                      "Files use the .qcx format. Shamir mode splits the key across multiple people.",
+                 text="Your files are protected with quantum-resistant encryption.\n"
+                      "Encrypted files use the .qcx format and can only be opened with your password.",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
                  wraplength=420, justify="center").pack(pady=(0, 8))
 
-        tk.Label(self, text="v4.0",
+        tk.Label(self, text=f"v{__version__}",
                  font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(0, 4))
 
-        # Fix 17: discoverable keyboard shortcut hint
+        # Discoverable keyboard shortcut hint
         tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+I  Inspect",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
                  wraplength=420).pack(pady=(0, 6))
@@ -156,7 +163,7 @@ class LauncherApp(tk.Toplevel):
         for path, entry in entries[:MAX_VISIBLE]:
             mode = entry.get("mode", "single")
             k, n = entry.get("threshold", 0), entry.get("total", 0)
-            mode_tag = (f"Shamir {k}-of-{n}" if mode == "shamir" and k and n
+            mode_tag = (f"Split key ({k} of {n})" if mode == "shamir" and k and n
                         else "Password")
             ts = entry.get("ts", 0)
             try:
@@ -173,7 +180,7 @@ class LauncherApp(tk.Toplevel):
             name_lbl = tk.Label(top_inner, text=os.path.basename(path),
                                 font=F["caption"], bg=C["surface"], fg=C["text"])
             name_lbl.pack(side="left")
-            # UX-L1: show both date and mode, not one or the other
+            # Show both date and mode, not one or the other
             combined_meta = "  ·  ".join(x for x in [mode_tag, date_str] if x)
             meta_lbl = tk.Label(top_inner, text=combined_meta,
                                 font=F["small"], bg=C["surface"], fg=C["text3"])
@@ -198,7 +205,7 @@ class LauncherApp(tk.Toplevel):
                 w.bind("<Button-1>", lambda e, p=path: _open(p))
                 w.bind("<Enter>", lambda e: _hl(True))
                 w.bind("<Leave>", lambda e: _hl(False))
-        # UX-L3: show overflow count so the launcher doesn't overflow the screen
+        # Show overflow count so the launcher doesn't overflow the screen
         if len(entries) > MAX_VISIBLE:
             extra = len(entries) - MAX_VISIBLE
             tk.Label(self._recent_frame,
@@ -208,7 +215,7 @@ class LauncherApp(tk.Toplevel):
 
     def _make_card(self, parent, icon, title, body, btn_text, command, accent):
         card = tk.Frame(parent, bg=C["surface"],
-                        highlightbackground=C["border"],  # UX-11: equal visual weight
+                        highlightbackground=C["border"],  # Equal visual weight
                         highlightthickness=1)
 
         inner = tk.Frame(card, bg=C["surface"])
@@ -230,7 +237,7 @@ class LauncherApp(tk.Toplevel):
         btn = FlatButton(inner, btn_text, command, primary=accent)
         btn.pack(anchor="w", fill="x")
 
-        # G-Q: collect every bg-carrying widget so the hover effect is visible
+        # Collect every bg-carrying widget so the hover effect is visible
         # across the full card area, not just the outer frame.
         _bg_widgets = [card, inner, lbl_icon, lbl_title, lbl_body]
 
@@ -268,7 +275,7 @@ class LauncherApp(tk.Toplevel):
         EncryptorApp(self.master, on_close=self.deiconify, center_at=(cx, cy))
 
     def _open_decryptor(self):
-        """G-A: trigger a file picker immediately so the Decrypt card does what it says.
+        """Trigger a file picker immediately so the Decrypt card does what it says.
         Only navigate to the decryptor if the user actually picks a file; if they
         cancel the dialog we stay on the launcher."""
         from tkinter import filedialog
@@ -345,14 +352,12 @@ class LauncherApp(tk.Toplevel):
             ("File",       os.path.basename(path)),
             ("Size",       fmt_size(os.path.getsize(path))),
             ("Format",     f"v{meta.get('version', '?')}"),
-            ("Mode",       "Single Password" if meta.get("mode") == "single"
-                           else f"Shamir  {meta.get('threshold')}-of-{meta.get('total')}"),
-            ("Cipher",     "AES-256-GCM"),
-            ("KEM",        "ML-KEM / Kyber-768"
-                           + (f"  ·  {meta['key_bits']}-bit key" if "key_bits" in meta else "")),
+            ("Mode",       "Password-protected" if meta.get("mode") == "single"
+                           else f"Split key — needs {meta.get('threshold')} of {meta.get('total')} people"),
+            ("Encryption", "Quantum-resistant (AES-256-GCM + ML-KEM)"),
         ]
         if meta.get("mode") == "single" and "argon_salt" in meta:
-            rows.append(("KDF", "Argon2id"))
+            rows.append(("Password", "Hardened with slow hash (Argon2id)"))
         if meta.get("payload_offset"):
             rows.append(("Embedded", "Decryptor binary included"))
         for lbl, val in rows:

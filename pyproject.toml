@@ -1,11 +1,23 @@
 [project]
 name = "quantacrypt"
-version = "4.0.0"
+version = "1.0.0"
 description = "Post-quantum file encryption using ML-KEM (Kyber-768) + AES-256-GCM with optional Shamir secret sharing"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 readme = "README.md"
 keywords = ["encryption", "post-quantum", "kyber", "shamir", "aes-gcm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+]
 
 dependencies = [
     "cryptography>=41.0",
@@ -21,8 +33,14 @@ strength = ["zxcvbn>=4.4"]
 build = ["pyinstaller>=6.0", "Pillow>=10.0"]
 dev = [
     "pytest>=7.0",
+    "pytest-cov>=4.0",
     "quantacrypt[dnd,strength,build]",
 ]
+
+[project.urls]
+Homepage = "https://github.com/alexboccard/quantacrypt"
+Repository = "https://github.com/alexboccard/quantacrypt"
+Issues = "https://github.com/alexboccard/quantacrypt/issues"
 
 [project.scripts]
 quantacrypt = "quantacrypt:main"
@@ -34,6 +52,29 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+addopts = "--cov=quantacrypt --cov-report=term-missing --cov-report=html:htmlcov"
+
+[tool.coverage.run]
+source = ["src/quantacrypt"]
+omit = [
+    "src/quantacrypt/assets/*",
+    "src/quantacrypt/ui/launcher.py",
+    "src/quantacrypt/ui/encryptor.py",
+    "src/quantacrypt/ui/decryptor.py",
+    "src/quantacrypt/ui/shared.py",
+    "src/quantacrypt/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__",
+    "if TYPE_CHECKING",
+    "raise NotImplementedError",
+]
+show_missing = true
+skip_empty = true
+fail_under = 90
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -2,6 +2,7 @@
 build/
 dist/
 *.spec
+*.dmg
 
 # Python
 __pycache__/
@@ -10,17 +11,22 @@ __pycache__/
 *.egg
 .eggs/
 *.pyz
+*.pyo
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# Editable installs
+src/*.egg-info/
+
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
 Icon?
+*.icns
 
 # IDE
 .idea/
@@ -29,10 +35,13 @@ Icon?
 *.swo
 *~
 
-# Generated icons
-icon.icns
-
-# pytest
+# Testing & coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+
+# Misc
+*.tmp
+BUG_REPORT.md
+pytest-cache-files-*/

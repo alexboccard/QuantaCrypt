@@ -10,7 +10,7 @@ import base64
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.helpers import MAGIC, make_pkg_bytes, load_pkg
+from tests.conftest import MAGIC, make_pkg_bytes, load_pkg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -308,11 +308,11 @@ class TestMnemonic:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. High-level encrypt/decrypt (v4 streaming only)
+# 5. High-level encrypt/decrypt (streaming)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_qcx(tmp_path, data, password="pw", filename="test.bin", n=None, k=None):
-    """Write a v4 .qcx and return (path, meta, shares, final_key)."""
+    """Write a .qcx and return (path, meta, shares, final_key)."""
     import json, base64 as _b64
     src = tmp_path / "src.bin"; src.write_bytes(data)
     enc = tmp_path / "enc.qcx"
@@ -517,7 +517,7 @@ class TestEncryptShamir:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestLoadPkgFormat:
-    def _make_v4_meta(self):
+    def _make_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
@@ -531,14 +531,14 @@ class TestLoadPkgFormat:
         return MAGIC + len(blob).to_bytes(4, "big") + blob
 
     def test_basic_parse(self):
-        meta = self._make_v4_meta()
+        meta = self._make_meta()
         raw  = self._make(meta)
         pkg  = load_pkg(raw)
         assert pkg["meta"]["mode"] == "single"
 
     def test_with_elf_prefix(self):
         """rfind() must skip over false magic bytes in ELF header."""
-        meta = self._make_v4_meta()
+        meta = self._make_meta()
         raw  = self._make(meta)
         elf = b"\x7fELF" + b"\x00"*46 + MAGIC + b"\x00"*50
         combined = elf + raw
@@ -550,13 +550,13 @@ class TestLoadPkgFormat:
             load_pkg(b"this is not a quantacrypt file at all")
 
     def test_truncated_raises(self):
-        meta = self._make_v4_meta()
+        meta = self._make_meta()
         raw  = self._make(meta)
         with pytest.raises(Exception):
             load_pkg(raw[:20])
 
     def test_original_name_preserved(self):
-        meta = self._make_v4_meta()
+        meta = self._make_meta()
         raw  = self._make(meta, name="secret_report.pdf")
         pkg  = load_pkg(raw)
         assert pkg["original_name"] == "secret_report.pdf"
@@ -564,7 +564,7 @@ class TestLoadPkgFormat:
     def test_old_version_rejected(self, tmp_path):
         """load_pkg (real decryptor version) rejects version < MIN_FORMAT_VERSION."""
         from quantacrypt.ui.decryptor import load_pkg as real_load_pkg
-        meta = {**self._make_v4_meta(), "version": 3}
+        meta = {**self._make_meta(), "version": 0}
         raw  = self._make(meta)
         p = tmp_path / "old.qcx"; p.write_bytes(raw)
         with pytest.raises(ValueError, match="older format|no longer supported"):
@@ -649,7 +649,7 @@ class TestEdgeCases:
 class TestLoadPkgVersionCheck:
     """A3: load_pkg rejects files outside supported version range [MIN, MAX]."""
 
-    def _min_v4_meta(self):
+    def _min_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
@@ -664,14 +664,14 @@ class TestLoadPkgVersionCheck:
 
     def test_current_version_accepted(self, tmp_path):
         from quantacrypt.ui.decryptor import load_pkg as dec_load_pkg
-        raw = self._make_raw(self._min_v4_meta())
+        raw = self._make_raw(self._min_meta())
         f = tmp_path / "ok.qcx"; f.write_bytes(raw)
         pkg = dec_load_pkg(str(f))
         assert pkg["meta"]["mode"] == "single"
 
     def test_future_version_rejected(self, tmp_path):
         from quantacrypt.ui.decryptor import load_pkg as dec_load_pkg
-        meta = {**self._min_v4_meta(), "version": cc.MAX_FORMAT_VERSION + 1}
+        meta = {**self._min_meta(), "version": cc.MAX_FORMAT_VERSION + 1}
         raw  = self._make_raw(meta)
         f = tmp_path / "future.qcx"; f.write_bytes(raw)
         with pytest.raises(ValueError, match="newer version"):
@@ -679,7 +679,7 @@ class TestLoadPkgVersionCheck:
 
     def test_old_version_rejected(self, tmp_path):
         from quantacrypt.ui.decryptor import load_pkg as dec_load_pkg
-        meta = {**self._min_v4_meta(), "version": 3}
+        meta = {**self._min_meta(), "version": 0}
         raw  = self._make_raw(meta)
         f = tmp_path / "old.qcx"; f.write_bytes(raw)
         with pytest.raises(ValueError, match="older format|no longer supported"):
@@ -856,6 +856,168 @@ class TestMagicConstantImport:
         import quantacrypt.__main__ as _main_mod
         src = open(_main_mod.__file__).read()
         assert 'MAGIC = b"QCBIN' not in src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage: error-branch tests for edge cases in crypto.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestVerifyMetaHmac:
+    """Cover _verify_meta_hmac error branches (lines 112-122)."""
+
+    def test_missing_hmac_raises(self):
+        key_material = os.urandom(64)
+        meta = {"version": 1, "mode": "single"}
+        with pytest.raises(ValueError, match="HMAC is missing"):
+            cc._verify_meta_hmac(key_material, meta)
+
+    def test_tampered_hmac_raises(self):
+        key_material = os.urandom(64)
+        fields = {"argon_salt": "AA==", "kyber_kem_ct": "BB=="}
+        real_hmac = cc._meta_hmac(key_material, fields)
+        meta = {**fields, "hmac": real_hmac + "TAMPERED", "version": 1, "mode": "single"}
+        with pytest.raises(ValueError, match="authentication failed"):
+            cc._verify_meta_hmac(key_material, meta)
+
+
+class TestShamirSplitEdge:
+    """Cover shamir_split overflow guard (line 140)."""
+
+    def test_secret_exceeds_m521_raises(self):
+        # M521 prime is 2^521 - 1.  A 66-byte all-0xFF secret exceeds it.
+        huge = b"\xff" * 66
+        with pytest.raises(ValueError, match="exceeds M521"):
+            cc.shamir_split(huge, n=3, k=2)
+
+
+class TestDecodeShareEdgeCases:
+    """Cover decode_share validation branches (lines 163-182)."""
+
+    def test_malformed_base64_raises(self):
+        with pytest.raises(ValueError, match="malformed"):
+            cc.decode_share("QCSHARE-!!!not-base64!!!")
+
+    def test_missing_field_raises(self):
+        # Valid JSON but missing 'modulus'
+        payload = base64.b64encode(json.dumps({"index": 1, "value": 2}).encode()).decode()
+        with pytest.raises(ValueError, match="missing required field"):
+            cc.decode_share("QCSHARE-" + payload)
+
+    def test_non_integer_field_raises(self):
+        payload = base64.b64encode(json.dumps({
+            "index": "one", "value": 2, "modulus": cc.SHAMIR_PRIME
+        }).encode()).decode()
+        with pytest.raises(ValueError, match="must be an integer"):
+            cc.decode_share("QCSHARE-" + payload)
+
+    def test_wrong_modulus_raises(self):
+        payload = base64.b64encode(json.dumps({
+            "index": 1, "value": 2, "modulus": 12345
+        }).encode()).decode()
+        with pytest.raises(ValueError, match="modulus does not match"):
+            cc.decode_share("QCSHARE-" + payload)
+
+    def test_index_out_of_range_raises(self):
+        payload = base64.b64encode(json.dumps({
+            "index": 0, "value": 2, "modulus": cc.SHAMIR_PRIME
+        }).encode()).decode()
+        with pytest.raises(ValueError, match="index out of range"):
+            cc.decode_share("QCSHARE-" + payload)
+
+    def test_value_out_of_range_raises(self):
+        payload = base64.b64encode(json.dumps({
+            "index": 1, "value": cc.SHAMIR_PRIME + 1, "modulus": cc.SHAMIR_PRIME
+        }).encode()).decode()
+        with pytest.raises(ValueError, match="value out of range"):
+            cc.decode_share("QCSHARE-" + payload)
+
+
+class TestDecryptPayloadTruncation:
+    """Cover stream_decrypt_payload truncation guards (lines 273, 279, 283)
+    and the progress callback path (lines 295-296)."""
+
+    def _encrypt_to_file(self, tmp_path, data=b"hello world"):
+        """Encrypt data via the streaming API and return (file_path, meta)."""
+        src = tmp_path / "plain.bin"
+        src.write_bytes(data)
+        dst_path = tmp_path / "enc.bin"
+        with open(str(dst_path), "wb") as dst:
+            meta = cc.encrypt_single_streaming(str(src), dst, "testpass")
+        # Record payload offset (bytes written before payload = 0 for this test)
+        meta["payload_offset"] = 0
+        return str(dst_path), meta
+
+    def test_truncated_seq_raises(self, tmp_path):
+        enc_path, meta = self._encrypt_to_file(tmp_path)
+        offset = meta.get("payload_offset", 0)
+        # Chop the file so the payload has < 4 bytes for the sequence header
+        with open(enc_path, "rb") as f:
+            data = f.read(offset + 2)
+        trunc = str(tmp_path / "trunc1.bin")
+        with open(trunc, "wb") as f:
+            f.write(data)
+        with open(os.devnull, "wb") as devnull:
+            with pytest.raises(ValueError, match="truncated"):
+                cc.stream_decrypt_payload(
+                    trunc, devnull, os.urandom(64), offset,
+                    meta["payload_chunk_count"],
+                    base64.b64decode(meta["payload_nonce"]))
+
+    def test_truncated_ct_len_raises(self, tmp_path):
+        enc_path, meta = self._encrypt_to_file(tmp_path)
+        offset = meta.get("payload_offset", 0)
+        # Keep seq (4 bytes) but chop before ct_len is complete
+        with open(enc_path, "rb") as f:
+            data = f.read(offset + 6)
+        trunc = str(tmp_path / "trunc2.bin")
+        with open(trunc, "wb") as f:
+            f.write(data)
+        with open(os.devnull, "wb") as devnull:
+            with pytest.raises(ValueError, match="truncated"):
+                cc.stream_decrypt_payload(
+                    trunc, devnull, os.urandom(64), offset,
+                    meta["payload_chunk_count"],
+                    base64.b64decode(meta["payload_nonce"]))
+
+    def test_truncated_chunk_data_raises(self, tmp_path):
+        enc_path, meta = self._encrypt_to_file(tmp_path)
+        offset = meta.get("payload_offset", 0)
+        # Keep seq + ct_len but chop the ciphertext short
+        with open(enc_path, "rb") as f:
+            data = f.read(offset + 10)
+        trunc = str(tmp_path / "trunc3.bin")
+        with open(trunc, "wb") as f:
+            f.write(data)
+        with open(os.devnull, "wb") as devnull:
+            with pytest.raises(ValueError, match="truncated"):
+                cc.stream_decrypt_payload(
+                    trunc, devnull, os.urandom(64), offset,
+                    meta["payload_chunk_count"],
+                    base64.b64decode(meta["payload_nonce"]))
+
+    def test_progress_callback_fires(self, tmp_path):
+        enc_path, meta = self._encrypt_to_file(tmp_path)
+        offset = meta.get("payload_offset", 0)
+        # Derive the real key to do a successful decrypt with progress
+        argon_salt = base64.b64decode(meta["argon_salt"])
+        argon_key  = cc.argon2id_derive("testpass".encode(), argon_salt)
+        kem_ct     = base64.b64decode(meta["kyber_kem_ct"])
+        sk_nonce   = base64.b64decode(meta["kyber_sk_enc_nonce"])
+        sk_ct      = base64.b64decode(meta["kyber_sk_enc"])
+        sk         = cc.aes_gcm_decrypt(argon_key, sk_nonce, sk_ct)
+        kem_ss     = cc.kyber_decaps(sk, kem_ct)
+        final_key  = cc.xor_bytes(argon_key, kem_ss)
+
+        dst = str(tmp_path / "dec.bin")
+        progress_msgs = []
+        with open(dst, "wb") as out:
+            cc.stream_decrypt_payload(
+                enc_path, out, final_key, offset,
+                meta["payload_chunk_count"],
+                base64.b64decode(meta["payload_nonce"]),
+                progress_cb=lambda m: progress_msgs.append(m))
+        assert len(progress_msgs) > 0
+        assert any("Decrypting" in m for m in progress_msgs)
 
 
 if __name__ == "__main__":

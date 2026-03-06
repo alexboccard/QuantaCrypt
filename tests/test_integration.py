@@ -2,6 +2,7 @@
 QuantaCrypt Integration Tests
 Full-stack tests for encryption, decryption, folder operations, and recent files.
 """
+import os
 import os as _os_t
 import tempfile as _tmp_t
 import shutil as _sh_t
@@ -11,10 +12,11 @@ import hashlib
 import base64
 import time
 import traceback
+import zipfile
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.helpers import MAGIC, make_pkg_bytes, load_pkg
+from tests.conftest import MAGIC, make_pkg_bytes, load_pkg
 
 
 
@@ -67,7 +69,7 @@ class TestIndividualShareFiles:
         _os_t.makedirs(self.out_dir)
         import struct
         with open(self.qcx_path, "wb") as f:
-            blob = json.dumps({"meta": {"version": 4, "mode": "shamir",
+            blob = json.dumps({"meta": {"version": 1, "mode": "shamir",
                                          "threshold": 2, "total": 3}},
                               separators=(",", ":")).encode()
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
@@ -699,7 +701,7 @@ class TestFileInspection:
         from quantacrypt.ui.decryptor import load_pkg
         pkg = load_pkg(str(qcx))
         assert pkg["meta"]["mode"] == "single"
-        assert pkg["meta"]["version"] == 4
+        assert pkg["meta"]["version"] == 1
 
     def test_inspect_rejects_invalid_file(self, tmp_path):
         from quantacrypt.ui.decryptor import load_pkg

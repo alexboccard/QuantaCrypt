@@ -1,7 +1,18 @@
-"""QuantaCrypt Shared UI Design System"""
+"""QuantaCrypt Shared UI Design System."""
+
 import os
-import tkinter as tk
+import sys
 import time
+
+import tkinter as tk
+
+__all__ = [
+    "C", "F", "UI", "MONO",
+    "styled_entry", "bind_context_menu", "fmt_size", "rule", "section_label",
+    "FlatButton", "SegmentedControl", "StagedProgressBar",
+    "PasswordStrengthBar", "FileCard", "WizardSteps",
+    "ClipboardTimer", "RecentFiles",
+]
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 C = {
@@ -25,23 +36,174 @@ UI   = "DejaVu Sans"
 MONO = "DejaVu Sans Mono"
 
 F = {
-    "display": (UI, 17, "bold"),
-    "heading": (UI, 12, "bold"),
-    "body":    (UI, 10),
-    "body_b":  (UI, 10, "bold"),
-    "caption": (UI,  9),
-    "small":   (UI,  8),
-    "mono":    (MONO, 9),
-    "mono_s":  (MONO, 8),
+    "display": (UI, 20, "bold"),
+    "heading": (UI, 15, "bold"),
+    "body":    (UI, 13),
+    "body_b":  (UI, 13, "bold"),
+    "caption": (UI, 11),
+    "small":   (UI, 10),
+    "mono":    (MONO, 12),
+    "mono_s":  (MONO, 10),
 }
 
 
+def bind_context_menu(widget):
+    """Attach a right-click Cut / Copy / Paste / Select All menu to any
+    Entry or Text widget.  Works on macOS (Button-2 or Control-Button-1)
+    and Linux/Windows (Button-3)."""
+
+    def _show(event):
+        menu = tk.Menu(widget, tearoff=0,
+                       bg=C["surface2"], fg=C["text"],
+                       activebackground=C["accent"], activeforeground="#fff",
+                       font=F["caption"], relief="flat", bd=0)
+        is_text = isinstance(widget, tk.Text)
+        has_sel = False
+        try:
+            if is_text:
+                has_sel = bool(widget.tag_ranges("sel"))
+            else:
+                has_sel = widget.selection_present()
+        except Exception:
+            pass
+
+        # Cut  (only for editable widgets with a selection)
+        read_only = str(widget.cget("state")) in ("disabled", "readonly")
+        if has_sel and not read_only:
+            menu.add_command(label="Cut", accelerator="⌘X",
+                             command=lambda: widget.event_generate("<<Cut>>"))
+        # Copy
+        if has_sel:
+            menu.add_command(label="Copy", accelerator="⌘C",
+                             command=lambda: widget.event_generate("<<Copy>>"))
+        # Paste
+        if not read_only:
+            menu.add_command(label="Paste", accelerator="⌘V",
+                             command=lambda: widget.event_generate("<<Paste>>"))
+        # Select All
+        if is_text:
+            menu.add_separator()
+            menu.add_command(label="Select All", accelerator="⌘A",
+                             command=lambda: (widget.tag_add("sel", "1.0", "end"),
+                                              widget.mark_set("insert", "end")))
+        else:
+            content = widget.get()
+            if content:
+                menu.add_separator()
+                menu.add_command(label="Select All", accelerator="⌘A",
+                                 command=lambda: (widget.select_range(0, "end"),
+                                                  widget.icursor("end")))
+
+        if menu.index("end") is not None:
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+    # macOS uses Button-2 or Control-Button-1; Linux/Windows use Button-3
+    widget.bind("<Button-2>", _show)
+    widget.bind("<Control-Button-1>", _show)
+    widget.bind("<Button-3>", _show)
+    return widget
+
+
 def styled_entry(parent, **kw):
-    return tk.Entry(
+    e = tk.Entry(
         parent, bg=C["surface2"], fg=C["text"],
         insertbackground=C["accent"], relief="flat",
         highlightbackground=C["border"], highlightcolor=C["accent"],
         highlightthickness=1, font=F["body"], **kw)
+    bind_context_menu(e)
+    return e
+
+
+def _find_app_icon() -> str:
+    """Return the absolute path to the app icon (.icns or .png), or empty."""
+    import os
+    # When running from a PyInstaller .app bundle the executable lives at
+    # …/quantacrypt.app/Contents/MacOS/quantacrypt  →  Resources is two up.
+    exe = os.path.abspath(os.sys.executable)
+    resources = os.path.join(os.path.dirname(os.path.dirname(exe)), "Resources")
+    for name in ("icon.icns", "icon.png"):
+        p = os.path.join(resources, name)
+        if os.path.isfile(p):
+            return p
+    # Fallback: check the source assets directory (running from source)
+    src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.png")
+    if os.path.isfile(src):
+        return src
+    return ""
+
+
+def notify(title: str, message: str, sound: bool = True) -> None:
+    """Send a macOS notification if the app window is not in focus.
+
+    Uses osascript with JXA (JavaScript for Automation) to call the native
+    NSUserNotification API in a safe subprocess — avoids ctypes/objc_msgSend
+    which can SIGSEGV on Apple Silicon.  The notification displays the
+    QuantaCrypt app icon when an icon file is found.
+    Silently does nothing on non-macOS platforms or if the call fails.
+    """
+    import sys
+    if sys.platform != "darwin":
+        return
+    try:
+        # Check if any app window currently has focus — skip notification if so
+        focus = tk.Tk._default_root  # type: ignore[attr-defined]
+        if focus and focus.focus_displayof() is not None:
+            return
+    except Exception:
+        pass
+
+    import subprocess
+
+    # Sanitise strings for JS embedding (escape backslash, quotes, newlines)
+    def _js(s: str) -> str:
+        return (s.replace("\\", "\\\\").replace('"', '\\"')
+                 .replace("\n", "\\n").replace("\r", ""))
+
+    icon_path = _find_app_icon()
+
+    # --- Primary: JXA via osascript (shows app icon) ---
+    try:
+        jxa = (
+            'ObjC.import("Cocoa");\n'
+            'var n = $.NSUserNotification.alloc.init;\n'
+            f'n.title = "{_js(title)}";\n'
+            f'n.informativeText = "{_js(message)}";\n'
+        )
+        if sound:
+            jxa += 'n.soundName = $.NSUserNotificationDefaultSoundName;\n'
+        if icon_path:
+            jxa += (
+                f'var img = $.NSImage.alloc.initByReferencingFile("{_js(icon_path)}");\n'
+                'n.setValue(img, {forKey: "contentImage"});\n'  # private but stable
+            )
+        jxa += '$.NSUserNotificationCenter.defaultUserNotificationCenter'
+        jxa += '.deliverNotification(n);\n'
+        subprocess.Popen(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    except Exception:
+        pass
+
+    # --- Fallback: plain AppleScript (shows Script Editor icon) ---
+    try:
+        sound_part = ' sound name "Glass"' if sound else ""
+        script = (
+            f'display notification "{_js(message)}" '
+            f'with title "{_js(title)}"{sound_part}'
+        )
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def fmt_size(n: int) -> str:
@@ -85,8 +247,8 @@ class FlatButton(tk.Label):
             bg, fg, hov = C["surface2"], C["text2"], C["surface3"]
 
         font = F["small"] if small else F["body_b"]
-        padx = 12 if small else 20
-        pady = 5  if small else 9
+        padx = 14 if small else 20
+        pady = 7  if small else 9
 
         super().__init__(parent, text=text, font=font,
                          bg=bg, fg=fg, cursor="hand2",
@@ -127,7 +289,7 @@ class FlatButton(tk.Label):
             except Exception:
                 pass
         else:
-            # Fix 29: use 'arrow' explicitly — cursor='' may inherit from parent
+            # Use 'arrow' explicitly — cursor='' may inherit from parent
             self.config(fg=C["text3"], cursor="arrow", bg=C["surface2"], takefocus=0,
                         highlightthickness=0)
             self.bind("<Button-1>", lambda e: None)
@@ -200,8 +362,8 @@ class StagedProgressBar(tk.Frame):
         self._stage_t   = None
         self._total_est = None
         self._running   = False
-        self._pulse_base = None  # G-C: base label text for animated dot pulse
-        self._pulse_job  = None  # G-C: pending after() id for pulse
+        self._pulse_base = None  # base label text for animated dot pulse
+        self._pulse_job  = None  # pending after() id for pulse
         self._stage_pcts = self._build_stage_pcts()
 
         # Stage name label
@@ -231,14 +393,14 @@ class StagedProgressBar(tk.Frame):
         self._dots_frame = tk.Frame(self, bg=C["surface"])
         self._dots_frame.pack(fill="x", padx=16, pady=(0, 14))
         self._dot_cvs = []
-        self._connector_cvs = []  # UX-4: dynamic colour connectors
+        self._connector_cvs = []  # dynamic colour connectors
         for i, (name, _) in enumerate(stages):
             cv = tk.Canvas(self._dots_frame, width=8, height=8,
                            bg=C["surface"], bd=0, highlightthickness=0)
             cv.pack(side="left", padx=(0, 4))
             self._dot_cvs.append(cv)
             if i < len(stages) - 1:
-                # UX-4: use Canvas so colour can be updated as stages complete
+                # Use Canvas so colour can be updated as stages complete
                 con = tk.Canvas(self._dots_frame, width=20, height=2,
                                 bg=C["border"], bd=0, highlightthickness=0)
                 con.pack(side="left", pady=3)
@@ -260,7 +422,7 @@ class StagedProgressBar(tk.Frame):
         self._start_t = time.time()
         self._stage_t = time.time()
         self._running = True
-        # Fix 19: reset all visual state so a second operation doesn't inherit stale
+        # Reset all visual state so a second operation doesn't inherit stale
         # "Complete" label/colours from a previous run
         self._current  = -1
         self._pct      = 0.0
@@ -272,27 +434,47 @@ class StagedProgressBar(tk.Frame):
         self._update_time()
 
     def advance(self, stage_idx, stage_name=None):
-        """Called when a new stage begins."""
+        """Called when a new stage begins or progresses.
+
+        If stage_name contains a percentage like '... 45%', the progress bar
+        interpolates within the stage rather than staying pinned at the start.
+        """
+        if stage_idx != self._current:
+            # New stage — reset stage timer
+            self._stage_t = time.time()
         self._current  = stage_idx
-        self._stage_t  = time.time()
         name = stage_name or (self._stages[stage_idx][0] if stage_idx < len(self._stages) else "")
         self._stage_lbl.config(text=name)
-        self._pulse_base = name  # G-C: base text for animated dots
-        self._pct = self._stage_pcts[stage_idx] if stage_idx < len(self._stage_pcts) else 1.0
+        self._pulse_base = name  # base text for animated dots
+
+        # Parse sub-progress from messages like "Encrypting payload... 45%"
+        stage_start = self._stage_pcts[stage_idx] if stage_idx < len(self._stage_pcts) else 1.0
+        if stage_idx + 1 < len(self._stage_pcts):
+            stage_end = self._stage_pcts[stage_idx + 1]
+        else:
+            stage_end = 1.0
+        sub_pct = 0.0
+        if stage_name:
+            import re
+            m = re.search(r'(\d+)%', stage_name)
+            if m:
+                sub_pct = min(int(m.group(1)) / 100.0, 1.0)
+        self._pct = stage_start + sub_pct * (stage_end - stage_start)
+
         self._draw_bar()
         self._draw_dots()
         self._update_time()
-        self._pulse_tick(0)      # G-C: start/restart dot-pulse for this stage
+        self._pulse_tick(0)      # start/restart dot-pulse for this stage
 
     def stop(self):
         """Halt the timer loop without marking as complete (used on failure/reset)."""
         self._running = False
-        self._pulse_base = None  # G-C: stop pulse loop
+        self._pulse_base = None  # stop pulse loop
 
     def complete(self):
         self._pct = 1.0
         self._running = False
-        self._pulse_base = None  # G-C: stop pulse loop
+        self._pulse_base = None  # stop pulse loop
         elapsed = time.time() - self._start_t if self._start_t else 0
         self._stage_lbl.config(text="Complete", fg=C["success"])
         self._pct_lbl.config(text="100%", fg=C["success"])
@@ -323,18 +505,34 @@ class StagedProgressBar(tk.Frame):
             else:
                 col = C["surface3"]
             cv.create_oval(0, 0, 8, 8, fill=col, outline="")
-        # UX-4: update connector colour — green when left stage is done
+        # Update connector colour — green when left stage is done
         for i, con in enumerate(self._connector_cvs):
             done = complete or i < self._current
             con.config(bg=C["success"] if done else C["border"])
 
     def _update_time(self):
         if not self._running or not self._start_t: return
-        elapsed = time.time() - self._start_t
+        now = time.time()
         pct = self._pct
         if pct > 0.01:
-            est_total = elapsed / pct
-            remaining = max(0, est_total - elapsed)
+            # Use stage-local rate for estimation when inside a stage with progress.
+            # This avoids the early slow stages (Argon2id) polluting the estimate
+            # once the fast payload stage begins.
+            stage_idx = self._current
+            stage_start_pct = self._stage_pcts[stage_idx] if stage_idx < len(self._stage_pcts) else 0.0
+            pct_within_stage = pct - stage_start_pct
+            stage_elapsed = now - self._stage_t
+
+            if pct_within_stage > 0.005 and stage_elapsed > 0.5:
+                # Estimate remaining from current stage's rate
+                rate = pct_within_stage / stage_elapsed  # pct per second
+                remaining = max(0, (1.0 - pct) / rate)
+            else:
+                # Fallback: whole-job linear extrapolation for early moments
+                elapsed = now - self._start_t
+                est_total = elapsed / pct
+                remaining = max(0, est_total - elapsed)
+
             self._pct_lbl.config(text=f"{int(pct*100)}%")
             if remaining > 0.5:
                 self._time_lbl.config(text=f"~{remaining:.0f}s left")
@@ -348,7 +546,7 @@ class StagedProgressBar(tk.Frame):
 
 
     def _pulse_tick(self, dot_count):
-        """G-C: Animate a cycling '…' suffix on the stage label when there is no
+        """Animate a cycling '…' suffix on the stage label when there is no
         sub-progress to display (pct == 0, e.g. during the Argon2id KDF stage).
         Stops automatically when _pulse_base is cleared by advance/stop/complete."""
         if self._pulse_base is None: return          # stopped
@@ -388,11 +586,11 @@ class PasswordStrengthBar(tk.Frame):
                               wraplength=400, justify="left")
         self._tip.pack(fill="x", pady=(2,0))
 
-        self._refresh_job = None  # UX-9: debounce handle
+        self._refresh_job = None  # debounce handle
         entry_var.trace_add("write", lambda *_: self._schedule_refresh())
 
     def _schedule_refresh(self):
-        """UX-9: debounce — run zxcvbn 150 ms after last keystroke."""
+        """Debounce — run zxcvbn 150 ms after last keystroke."""
         if self._refresh_job is not None:
             try: self.after_cancel(self._refresh_job)
             except Exception: pass
@@ -440,8 +638,8 @@ class PasswordStrengthBar(tk.Frame):
 
 
 class FileCard(tk.Frame):
-    """A1: Consolidated drop-zone / file picker used by both encryptor and decryptor.
-    
+    """Consolidated drop-zone / file picker used by both encryptor and decryptor.
+
     Parameters
     ----------
     parent      : tk widget
@@ -475,7 +673,7 @@ class FileCard(tk.Frame):
 
         for w in [self, self._icon, self._line1, self._line2]:
             w.bind("<Button-1>", lambda e: self._pick())
-        # UX-13: bind hover only on self (Frame) to avoid flicker when cursor
+        # Bind hover only on self (Frame) to avoid flicker when cursor
         # crosses child label boundaries (each child fires its own Enter/Leave)
         self.bind("<Enter>", lambda e: self._hl(True))
         self.bind("<Leave>", lambda e: self._hl(False))
@@ -552,7 +750,7 @@ class WizardSteps(tk.Canvas):
         self._steps  = steps
         self._active = 0
         self._min_w  = nsteps * 100  # renamed: self._w is reserved by Tkinter for widget path
-        self.config(takefocus=0)  # UX-L13: informational only — skip in Tab order
+        self.config(takefocus=0)  # informational only — skip in Tab order
         self.bind("<Configure>", lambda e: self._draw())
         self._draw()
 
@@ -582,7 +780,7 @@ class WizardSteps(tk.Canvas):
                 self.create_line(lx, cy, rx, cy,
                                  fill=C["success"] if done else C["border"], width=1)
 
-            # Circle — Fix 20: done circles use success green (matches connectors)
+            # Done circles use success green (matches connectors)
             if done:
                 self.create_oval(cx-r, cy-r, cx+r, cy+r,
                                   fill=C["success"], outline="")
@@ -690,7 +888,13 @@ class RecentFiles:
     def _resolve_path(cls):
         if cls._PATH:
             return cls._PATH
-        base = os.path.expanduser("~/Library/Application Support")
+        if sys.platform == "darwin":
+            base = os.path.expanduser("~/Library/Application Support")
+        elif sys.platform == "win32":
+            base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        else:
+            base = os.environ.get("XDG_DATA_HOME",
+                                  os.path.expanduser("~/.local/share"))
         d = os.path.join(base, "QuantaCrypt")
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, "recent.json")

@@ -2,6 +2,9 @@
 QuantaCrypt GUI Layer Logic Tests
 Tests for validation, file loading, and GUI helper functions.
 """
+import base64
+import io
+import math
 import os
 import sys
 import json
@@ -14,7 +17,7 @@ import types
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.helpers import MAGIC, make_pkg_bytes, load_pkg
+from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, _make_qcx, _decrypt_qcx
 
 # ─────────────────────────────────────────────────────────────────────────────
 # A4: GUI-layer tests
@@ -122,7 +125,7 @@ class TestEncryptorValidate:
 class TestLoadPkg:
     """Test the .qcx file parser (load_pkg) and version checks."""
 
-    def _make_v4_meta(self):
+    def _make_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
@@ -142,7 +145,7 @@ class TestLoadPkg:
         return f.name
 
     def test_valid_file_parsed(self):
-        meta = self._make_v4_meta()
+        meta = self._make_meta()
         path = self._make_qcx(meta)
         try:
             from quantacrypt.ui.decryptor import load_pkg
@@ -166,7 +169,7 @@ class TestLoadPkg:
             os.unlink(f.name)
 
     def test_future_version_raises(self):
-        path = self._make_qcx(self._make_v4_meta(), version_override=999)
+        path = self._make_qcx(self._make_meta(), version_override=999)
         try:
             from quantacrypt.ui.decryptor import load_pkg
             with pytest.raises(ValueError, match="newer version"):
@@ -175,7 +178,7 @@ class TestLoadPkg:
             os.unlink(path)
 
     def test_old_version_raises(self):
-        path = self._make_qcx(self._make_v4_meta(), version_override=3)
+        path = self._make_qcx(self._make_meta(), version_override=0)
         try:
             from quantacrypt.ui.decryptor import load_pkg
             with pytest.raises(ValueError, match="older format|no longer supported"):
@@ -184,7 +187,7 @@ class TestLoadPkg:
             os.unlink(path)
 
     def test_current_version_accepted(self):
-        path = self._make_qcx(self._make_v4_meta(), version_override=cc.FORMAT_VERSION)
+        path = self._make_qcx(self._make_meta(), version_override=cc.FORMAT_VERSION)
         try:
             from quantacrypt.ui.decryptor import load_pkg
             result = load_pkg(path)
@@ -361,17 +364,15 @@ class TestFileInfoCard:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestHardFileSizeLimit:
-    """v4 streaming removed the in-memory size cap. MAX_FILE_BYTES is now a
-    large practical guard (filesystem/OS limit), not a RAM constraint."""
+    """Streaming has no file size cap — O(CHUNK_SIZE) RAM regardless of input."""
 
-    def test_max_file_bytes_constant_exists(self):
-        # Constant retained for backward compat; now a very large practical cap
-        assert hasattr(cc, "MAX_FILE_BYTES")
-        # Must be well above the old 200 MB limit — streaming supports multi-GB files
-        assert cc.MAX_FILE_BYTES > 1 * 1024 * 1024 * 1024
+    def test_no_max_file_bytes_constant(self):
+        # Size cap fully removed — streaming handles any file the OS can open
+        assert not hasattr(cc, "MAX_FILE_BYTES"), \
+            "MAX_FILE_BYTES should be removed — streaming has no size limit"
 
     def test_no_size_rejection_for_large_files(self, tmp_path):
-        # v4 streaming: no arbitrary size cap exists in the crypto layer
+        # Streaming: no arbitrary size cap exists in the crypto layer
         assert not hasattr(cc, "_LEGACY_MAX_FILE_BYTES"), \
             "Legacy hard limit should be removed, not kept as a separate constant"
         # CHUNK_SIZE constant must exist and be a reasonable power-of-two block
@@ -386,7 +387,8 @@ class TestSharesPendingGuard:
 
     def test_shares_pending_initialises_false(self):
         """EncryptorApp starts with no pending shares."""
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp.__init__)
         assert "_shares_pending=False" in src or "_shares_pending = False" in src
 
@@ -396,7 +398,8 @@ class TestSharesPendingGuard:
 
     def test_save_shares_clears_pending(self):
         """_save_shares sets _shares_pending=False after saving."""
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._save_shares)
         assert "_shares_pending" in src and "False" in src
 
@@ -405,7 +408,8 @@ class TestWizardStepDuringEncryption:
     """Fix 8: set_step(4) during encryption, not set_step(3)."""
 
     def test_start_sets_step_4(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._start)
         assert "set_step(4)" in src, "_start should set wizard to step 4 (Encrypt)"
         assert "set_step(3)" not in src, "_start should not set wizard to step 3 (Output)"
@@ -415,7 +419,8 @@ class TestDecryptorFailStep:
     """Fix 7: _fail stays at step 2 (Decrypt), not retreats to step 1."""
 
     def test_fail_sets_step_2(self):
-        import inspect, decryptor
+        import inspect
+        import quantacrypt.ui.decryptor as decryptor
         src = inspect.getsource(decryptor.DecryptorApp._fail)
         assert "set_step(2)" in src, "_fail should keep wizard at step 2"
         assert "set_step(1)" not in src, "_fail should not retreat to step 1"
@@ -425,17 +430,20 @@ class TestFileCardKeyboard:
     """Fix 4: FileCard is keyboard accessible."""
 
     def test_filecard_has_takefocus(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.FileCard.__init__)
         assert "takefocus" in src, "FileCard should set takefocus=True"
 
     def test_filecard_has_return_binding(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.FileCard.__init__)
         assert "<Return>" in src, "FileCard should bind <Return> to _pick"
 
     def test_filecard_has_space_binding(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.FileCard.__init__)
         assert "<space>" in src, "FileCard should bind <space> to _pick"
 
@@ -449,12 +457,14 @@ class TestSegmentedControlKeyboard:
 
     def test_step_wraps_around(self):
         """_step should cycle through options with wraparound."""
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.SegmentedControl._step)
         assert "%" in src, "_step should use modulo for wraparound"
 
     def test_segmented_control_has_keyboard_bindings(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.SegmentedControl.__init__)
         assert "<Left>" in src, "SegmentedControl should bind <Left>"
         assert "<Right>" in src, "SegmentedControl should bind <Right>"
@@ -465,7 +475,8 @@ class TestFlatButtonHoverOnEnable:
     """Fix 22: FlatButton checks hover state when re-enabled."""
 
     def test_enable_checks_pointer_position(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.FlatButton.enable)
         assert "winfo_pointerxy" in src, "enable(True) should check if mouse is already hovering"
 
@@ -474,7 +485,8 @@ class TestOutputPathPreservation:
     """Fix 13: _load_payload only sets suggested path if field is empty."""
 
     def test_load_payload_preserves_typed_path(self):
-        import inspect, decryptor
+        import inspect
+        import quantacrypt.ui.decryptor as decryptor
         src = inspect.getsource(decryptor.DecryptorApp._load_payload)
         assert "self._out.get().strip()" in src, \
             "_load_payload should check if output field is empty before overwriting"
@@ -484,7 +496,8 @@ class TestFnameSanitization:
     """Fix 15: fname from metadata is sanitized with os.path.basename."""
 
     def test_done_applies_basename_to_fname(self):
-        import inspect, decryptor
+        import inspect
+        import quantacrypt.ui.decryptor as decryptor
         src = inspect.getsource(decryptor.DecryptorApp._done)
         assert "os.path.basename(fname)" in src, \
             "_done should apply os.path.basename() to fname to prevent path traversal display"
@@ -503,7 +516,8 @@ class TestShareChecksumError:
     """Fix 16: Share checksum error shows sanitized message."""
 
     def test_fail_sanitizes_checksum_error(self):
-        import inspect, decryptor
+        import inspect
+        import quantacrypt.ui.decryptor as decryptor
         src = inspect.getsource(decryptor.DecryptorApp._fail)
         # Should NOT use f-string with {msg} for Checksum branch
         # Find the checksum branch
@@ -521,7 +535,8 @@ class TestMatchLblClearedOnDone:
     """Fix 20: _match_lbl cleared on successful encryption."""
 
     def test_done_clears_match_label(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._done)
         assert "_match_lbl" in src, "_done should clear the match label"
         assert 'text=""' in src or "text='')" in src or 'config(text="")' in src
@@ -531,7 +546,8 @@ class TestWizardStepsLabelTruncation:
     """Fix 21: WizardSteps truncates long step labels."""
 
     def test_draw_truncates_labels(self):
-        import inspect, shared_ui
+        import inspect
+        import quantacrypt.ui.shared as shared_ui
         src = inspect.getsource(shared_ui.WizardSteps._draw)
         assert "…" in src or "\\u2026" in src, \
             "WizardSteps._draw should truncate long labels with ellipsis"
@@ -549,12 +565,14 @@ class TestFreezeThaw:
         assert hasattr(encryptor.EncryptorApp, "_thaw")
 
     def test_freeze_disables_password_fields(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._freeze)
         assert "_pw1" in src and "_pw2" in src, "_freeze should disable both password fields"
 
     def test_thaw_re_enables_fields(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._thaw)
         assert "_pw1" in src or "normal" in src, "_thaw should re-enable fields"
 
@@ -567,7 +585,8 @@ class TestShamirKClamp:
         assert hasattr(encryptor.EncryptorApp, "_clamp_k")
 
     def test_clamp_k_logic(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         # _clamp_k was refactored to debounce via _do_clamp so that typing
         # a two-digit number doesn't flash the minimum value after the first digit.
         # The actual clamping (self._k.set) now lives in _do_clamp.
@@ -582,7 +601,8 @@ class TestDropHintConditional:
     """Fix 9: Drop hint only mentions drag-and-drop if tkinterdnd2 is available."""
 
     def test_launcher_has_conditional_drop_hint(self):
-        import inspect, launcher
+        import inspect
+        import quantacrypt.ui.launcher as launcher
         src = inspect.getsource(launcher.LauncherApp._build)
         assert "_DND_FILES" in src, \
             "Launcher drop hint should be conditional on _DND_FILES being available"
@@ -592,17 +612,19 @@ class TestSelfExecutingSection:
     """Fix 11: SELF-EXECUTING section hidden when no binary found."""
 
     def test_build_checks_for_binary(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._build)
         assert "_find_dec" in src or "frozen" in src, \
             "_build should check for binary before showing SELF-EXECUTING section"
 
     def test_section_shown_conditionally(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._build)
         # Should only show section inside an if block
         lines = src.split("\n")
-        section_line = next((i for i, l in enumerate(lines) if "SELF-EXECUTING" in l), None)
+        section_line = next((i for i, l in enumerate(lines) if "PORTABLE FILE" in l or "SELF-EXECUTING" in l), None)
         assert section_line is not None
         # The section should be inside an if block (preceded by an if statement)
         preceding = "\n".join(lines[max(0,section_line-5):section_line])
@@ -613,30 +635,32 @@ class TestSizeAnnotation:
     """Fix 19: Success card annotates decryptor overhead in size label."""
 
     def test_done_annotates_embedded_size(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._done)
         assert "dec_size" in src or "decryptor" in src.lower(), \
             "_done should annotate decryptor size in the success card"
 
     def test_done_labels_payload_separately(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._done)
         assert "payload_size" in src or "data)" in src, \
             "_done should show payload vs decryptor sizes separately"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tests for v4 Streaming Encryption (large-file support)
+# Tests for Streaming Encryption (large-file support)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestV4StreamingConstants:
-    """v4 crypto_core constants and module-level exports."""
+class TestStreamingConstants:
+    """Crypto core constants and module-level exports."""
 
-    def test_format_version_is_4(self):
-        assert cc.FORMAT_VERSION == 4
+    def test_format_version_is_1(self):
+        assert cc.FORMAT_VERSION == 1
 
-    def test_max_format_version_is_4(self):
-        assert cc.MAX_FORMAT_VERSION == 4
+    def test_max_format_version_is_1(self):
+        assert cc.MAX_FORMAT_VERSION == 1
 
     def test_chunk_size_is_power_of_two(self):
         cs = cc.CHUNK_SIZE
@@ -671,7 +695,7 @@ class TestV4StreamingConstants:
         assert cc._chunk_nonce(b1, 0) != cc._chunk_nonce(b2, 0)
 
 
-class TestV4RoundTrip:
+class TestStreamingRoundTrip:
     """Full encrypt → decrypt round-trips with the streaming API."""
 
     def _enc_dec(self, tmp_path, data, password="hunter2", filename="test.bin"):
@@ -776,18 +800,18 @@ class TestV4RoundTrip:
                                base64.b64decode(meta2["kyber_sk_enc_nonce"]),
                                base64.b64decode(meta2["kyber_sk_enc"]))
 
-    def test_version_field_is_4(self, tmp_path):
+    def test_version_field_is_1(self, tmp_path):
         import os
         data = os.urandom(256)
         _, _, _, _, meta = self._enc_dec(tmp_path, data)
-        assert meta["version"] == 4
+        assert meta["version"] == 1
 
     def test_no_payload_field_in_meta(self, tmp_path):
-        """v4 never stores the payload blob in meta JSON — it's on disk as chunks."""
+        """Meta never stores the payload blob in JSON — it's on disk as chunks."""
         import os
         data = os.urandom(1024)
         _, _, _, _, meta = self._enc_dec(tmp_path, data)
-        assert "payload" not in meta, "v4 meta must not contain an in-memory payload blob"
+        assert "payload" not in meta, "Meta must not contain an in-memory payload blob"
 
     def test_chunk_count_matches_expected(self, tmp_path):
         data = os.urandom(cc.CHUNK_SIZE * 3 + 1)
@@ -796,7 +820,7 @@ class TestV4RoundTrip:
         assert meta["payload_chunk_count"] == expected
 
 
-class TestV4Security:
+class TestStreamingSecurity:
     """Security properties of the streaming format."""
 
     def _make_encrypted(self, tmp_path, data=None, password="pw"):
@@ -901,7 +925,7 @@ class TestV4Security:
         """Metadata HMAC field exists and covers payload_chunk_count."""
         import os
         data = os.urandom(1024)
-        _, _, _, _, meta = TestV4RoundTrip()._enc_dec(tmp_path, data)
+        _, _, _, _, meta = TestStreamingRoundTrip()._enc_dec(tmp_path, data)
         assert "hmac" in meta
         # payload_chunk_count must be in auth_fields (covered by HMAC)
         # We verify this structurally: if we flip chunk_count and re-check HMAC it fails
@@ -910,7 +934,7 @@ class TestV4Security:
         assert isinstance(meta["hmac"], str) and len(meta["hmac"]) > 10
 
 
-class TestV4ShamirStreaming:
+class TestShamirStreaming:
     """Shamir + streaming round-trip."""
 
     def test_shamir_round_trip(self, tmp_path):
@@ -928,7 +952,7 @@ class TestV4ShamirStreaming:
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
 
         assert len(shares) == 3
-        assert meta["version"] == 4
+        assert meta["version"] == 1
         assert meta["payload_chunk_count"] > 0
 
         # Decrypt with k=2 shares (shares 0 and 2)
@@ -970,11 +994,11 @@ class TestV4ShamirStreaming:
                                base64.b64decode(meta["kyber_sk_enc"]))
 
 
-class TestV4FileDetection:
-    """v4 file format detection and load_pkg integration."""
+class TestFileDetection:
+    """File format detection and load_pkg integration."""
 
-    def test_v4_file_detected_correctly(self, tmp_path):
-        """is_v4 detection: payload_chunk_count present → streaming path."""
+    def test_streaming_file_detected_correctly(self, tmp_path):
+        """Streaming detection: payload_chunk_count present → streaming path."""
         data = os.urandom(1024)
         src  = tmp_path / "src.bin"
         enc  = tmp_path / "src.qcx"
@@ -990,9 +1014,9 @@ class TestV4FileDetection:
         from quantacrypt.ui.decryptor import load_pkg
         pkg  = load_pkg(str(enc))
         meta = pkg["meta"]
-        # is_v4 check matches what decryptor._run uses
-        is_v4 = (meta.get("version", 2) >= 4 and "payload_chunk_count" in meta)
-        assert is_v4
+        # Streaming check: payload_chunk_count present in meta
+        is_streaming = (meta.get("version", 0) >= 1 and "payload_chunk_count" in meta)
+        assert is_streaming
 
 
 
@@ -1006,7 +1030,7 @@ def _make_qcx_bytes(meta_override=None):
     import struct, json
     from quantacrypt.core.crypto import MAGIC
     meta = {
-        "version": 4, "mode": "single", "key_bits": 512,
+        "version": 1, "mode": "single", "key_bits": 512,
         "chunk_size": 4194304, "argon_salt": "AA==", "kyber_kem_ct": "AA==",
         "kyber_sk_enc_nonce": "AA==", "kyber_sk_enc": "AA==",
         "payload_nonce": "AA==", "payload_chunk_count": 1,
@@ -1039,7 +1063,7 @@ class TestLoadPkgValidation:
         import struct, json
         from quantacrypt.core.crypto import MAGIC
         from quantacrypt.ui.decryptor import load_pkg
-        meta = {"version": 4, "key_bits": 512}  # no 'mode'
+        meta = {"version": 1, "key_bits": 512}  # no 'mode'
         blob = json.dumps({"meta": meta}, separators=(",", ":")).encode()
         data = b"x" * 16 + MAGIC + struct.pack(">I", len(blob)) + blob
         path = _write_qcx(data, tmp_path / "bad.qcx")
@@ -1084,7 +1108,8 @@ class TestEncryptorDecSizeGuard:
     """BUG-A: dec_size getsize must not propagate OSError."""
 
     def test_dec_size_oserror_is_caught(self):
-        import inspect, encryptor
+        import inspect
+        import quantacrypt.ui.encryptor as encryptor
         src = inspect.getsource(encryptor.EncryptorApp._run)
         # After the fix an except OSError clause guards the getsize
         assert "except OSError" in src, "_run should catch OSError around dec_size getsize"

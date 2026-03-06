@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """QuantaCrypt Decryptor — decryption GUI with password and Shamir modes."""
-import os, sys, json, struct, threading, subprocess, time as _time, base64 as _b64
+import base64 as _b64
+import json
+import os
+import struct
+import subprocess
+import sys
+import threading
+import time as _time
+import uuid
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-if getattr(sys,"frozen",False):
-    _base = sys._MEIPASS
-    sys.path.insert(0, _base)
-else:
-    _base = os.path.dirname(os.path.abspath(__file__))
 from quantacrypt.core import crypto as cc
-from quantacrypt.ui.shared import *
-
-# A2: import MAGIC from crypto_core — single canonical definition
-from quantacrypt.core.crypto import MAGIC, FORMAT_VERSION, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION
+from quantacrypt.core.crypto import (
+    MAGIC, FORMAT_VERSION, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION,
+)
+from quantacrypt.ui.shared import (
+    C, F, UI,
+    styled_entry, bind_context_menu, fmt_size, rule, section_label,
+    FlatButton, SegmentedControl, StagedProgressBar,
+    FileCard, WizardSteps, RecentFiles, notify,
+)
 
 P = 24  # consistent padding throughout
 
 STAGES = [
-    ("Key derivation",  0.55, "Argon2id"),
-    ("Load key",        0.05, "Parsing"),
-    ("Recover key",     0.10, "Reconstructing"),
-    ("Post-quantum",    0.15, "Decapsulat"),
-    ("Decrypt file",    0.15, "Decrypting payload"),
+    ("Verifying password",  0.55, "Argon2id"),
+    ("Loading key",         0.05, "Parsing"),
+    ("Recovering key",      0.10, "Reconstructing"),
+    ("Unlocking",           0.15, "Decapsulat"),
+    ("Decrypting file",     0.15, "Decrypting payload"),
 ]
 
 _WL = None
@@ -52,7 +61,11 @@ def load_pkg(path):
     if o + 4 + n > len(tail):
         raise ValueError("File appears truncated or corrupt")
     pkg = json.loads(tail[o+4:o+4+n])
+    if not isinstance(pkg, dict):
+        raise ValueError("File metadata envelope is not a valid dictionary — file may be corrupt")
     meta = pkg.get("meta", {})
+    if not isinstance(meta, dict):
+        raise ValueError("File metadata is not a valid dictionary — file may be corrupt")
     ver = meta.get("version", 1)
     # Reject files from future versions (need a newer app)
     if ver > MAX_FORMAT_VERSION:
@@ -60,7 +73,7 @@ def load_pkg(path):
             f"This file was created with a newer version of QuantaCrypt (format v{ver}). "
             f"Please upgrade the app."
         )
-    # Reject files from older versions (v4 is the minimum supported format)
+    # Reject files from older versions (v1 is the minimum supported format)
     if ver < MIN_FORMAT_VERSION:
         raise ValueError(
             f"This file uses an older format (v{ver}) that is no longer supported. "
@@ -86,17 +99,27 @@ def _find_stage(msg):
     return None, None
 
 def _reveal(path):
-    """U4: Open the containing folder in the system file manager."""
+    """Open the containing folder in the system file manager."""
     try:
-        subprocess.Popen(["open", "-R", path])
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", path], check=False)
+        elif sys.platform == "win32":
+            subprocess.run(["explorer", "/select,", path], check=False)
+        else:
+            subprocess.run(["xdg-open", os.path.dirname(os.path.abspath(path))], check=False)
     except Exception:
         pass
 
 
 def _open_file(path):
-    """G1: Open the decrypted file directly with the system default application."""
+    """Open the decrypted file directly with the system default application."""
     try:
-        subprocess.Popen(["open", path])
+        if sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        elif sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", path], check=False)
     except Exception:
         pass
 
@@ -119,6 +142,7 @@ class WordEntry(tk.Frame):
                            bg=C["surface2"], fg=C["text"],
                            insertbackground=C["accent"],
                            relief="flat", bd=0, highlightthickness=0, width=9)
+        bind_context_menu(self._e)
         self._e.pack(side="left", fill="x", expand=True, ipady=4, padx=(0,4))
         for ev,fn in [("<Down>",self._dn),("<Up>",self._up),("<Return>",self._ret),
                       ("<Tab>",self._tab),("<space>",self._spc),
@@ -236,7 +260,7 @@ class WordEntry(tk.Frame):
         x   = self._e.winfo_rootx()
         ey  = self._e.winfo_rooty()
         eh  = self._e.winfo_height()
-        # Fix 5: estimate dropdown pixel height to check screen bounds
+        # Estimate dropdown pixel height to check screen bounds
         # Listbox row height ≈ font size + 2px padding; approximate as 16px per row
         dd_h = row_h * 16 + 4
         screen_h = self.winfo_toplevel().winfo_screenheight()
@@ -288,7 +312,7 @@ class WordEntry(tk.Frame):
 # ── MnemonicShareInput ────────────────────────────────────────────────────────
 
 class MnemonicShareInput(tk.Frame):
-    """G-H: Collapsible mnemonic share panel.  Share 1 starts expanded; others
+    """Collapsible mnemonic share panel.  Share 1 starts expanded; others
     start collapsed so only the header/progress bar is visible.  Clicking the
     header row (or the chevron) toggles the 50-word grid open/closed."""
 
@@ -365,7 +389,7 @@ class MnemonicShareInput(tk.Frame):
     def is_complete(self): return all(c.valid() for c in self._cells)
     def valid_count(self): return sum(1 for c in self._cells if c.valid())
     def focus(self):
-        """G-H: expand first so cells are visible before giving focus."""
+        """Expand first so cells are visible before giving focus."""
         self.expand()
         if self._cells: self._cells[0].focus()
     def clear(self):
@@ -398,7 +422,10 @@ class MnemonicShareInput(tk.Frame):
         try: text = self.clipboard_get()
         except Exception: messagebox.showwarning("Paste","Clipboard empty."); return
         if text.strip().startswith("QCSHARE-"):
-            messagebox.showinfo("Wrong format","That's a QCSHARE- code.\nSwitch to raw mode."); return
+            messagebox.showinfo("Wrong format",
+                "That looks like a code share (starts with QCSHARE-).\n\n"
+                "Switch the share to \"code\" format using the toggle button,\n"
+                "then paste it there instead."); return
         words = text.strip().split()
         if len(words) != 50:
             messagebox.showwarning("Wrong length",f"Expected 50 words, got {len(words)}."); return
@@ -412,32 +439,28 @@ class MnemonicShareInput(tk.Frame):
 # ── FileInfoCard ──────────────────────────────────────────────────────────────
 
 class FileInfoCard(tk.Frame):
-    """U3: Shows file metadata including encrypted-at date and original size."""
+    """Shows file metadata including encrypted-at date and original size."""
     def __init__(self, parent, meta, orig, sz=0, ts=0, **kw):
         super().__init__(parent, bg=C["surface"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
-        key_bits = meta.get('key_bits')
-        kem_label = (f"ML-KEM / Kyber-768  ·  {key_bits}-bit key material"
-                     if key_bits else "ML-KEM / Kyber-768")
-        # Filename is always inside the encrypted payload in v4 (revealed after decryption).
+        # Filename is always inside the encrypted payload (revealed after decryption).
         if orig:
             file_label = orig
         else:
             file_label = "Hidden — shown after decryption"
         mode = meta.get("mode", "?")
         if mode == "single":
-            mode_label = "Single Password"
+            mode_label = "Password-protected"
         elif mode == "shamir":
-            mode_label = f"Shamir  {meta.get('threshold','?')}-of-{meta.get('total','?')}"
+            mode_label = f"Split key — needs {meta.get('threshold','?')} of {meta.get('total','?')} people"
         else:
             mode_label = mode
         rows = [
-            ("File",    file_label),
-            ("Mode",    mode_label),
-            ("Cipher",  "AES-256-GCM"),
-            ("KEM",     kem_label),
+            ("File",       file_label),
+            ("Mode",       mode_label),
+            ("Encryption", "Quantum-resistant (AES-256-GCM + ML-KEM)"),
         ]
-        # U3: show original size and encryption date if available
+        # Show original size and encryption date if available
         if sz: rows.append(("Orig size", fmt_size(sz)))
         if ts:
             try:
@@ -501,17 +524,19 @@ class DecryptorApp(tk.Toplevel):
         self.title("QuantaCrypt · Decrypt")
         self.configure(bg=C["bg"])
         self.resizable(True, True)
-        self.geometry("560x700")
-        self.minsize(500, 500)
+        self.geometry("620x780")
+        self.minsize(560, 560)
 
         self._payload  = payload
         self._qcx_path = qcx_path
         self._meta     = payload["meta"] if payload else None
         self._orig     = None
-        self._sz       = 0   # U3: original size (known after decryption)
-        self._ts       = 0   # U3: encryption timestamp (known after decryption)
+        self._sz       = 0   # Original size (known after decryption)
+        self._ts       = 0   # Encryption timestamp (known after decryption)
         self._mode_val = self._meta["mode"] if self._meta else None
         self._busy     = False
+        self._cancel   = False   # signals worker thread to abort
+        self._tmp_path = None    # tracks temp file for cleanup on close
         self._imode    = tk.StringVar(value="mnemonic")
         self._inputs   = []
         self._entries  = []
@@ -529,14 +554,14 @@ class DecryptorApp(tk.Toplevel):
         elif self._payload:
             self._load_payload()
 
-        # U1: register drag-and-drop (only works when base class is TkinterDnD.Tk)
+        # Register drag-and-drop (only works when base class is TkinterDnD.Tk)
         if _DND_FILES:
             try:
                 self.drop_target_register(_DND_FILES)
                 self.dnd_bind("<<Drop>>", self._on_drop)
             except Exception:
                 pass
-        # U2: Ctrl+O to open file (guarded: no-op while busy)
+        # Ctrl+O to open file (guarded: no-op while busy)
         def _ctrl_o(e):
             if self._busy:
                 self._err.config(text="Busy — please wait for decryption to finish")
@@ -559,15 +584,30 @@ class DecryptorApp(tk.Toplevel):
 
     def _close(self):
         if self._busy:
-            self._err.config(text="Decryption in progress — please wait until it finishes")
-            self.after(3000, lambda: self._err.config(text="")
-                       if self._err.cget("text").startswith("Decryption in progress") else None)
+            # Signal worker to stop, clean up temp file, then close
+            self._cancel = True
+            self._err.config(text="Cancelling — please wait…")
+            # Poll until worker finishes (or force close after 5s)
+            self._poll_close(0)
             return
+        # Clean up any leftover temp file
+        if self._tmp_path:
+            try: os.remove(self._tmp_path)
+            except OSError: pass
+            self._tmp_path = None
         self.destroy()
         if self._on_close:
             self._on_close()
         else:
             self.master.destroy()  # no launcher — quit app
+
+    def _poll_close(self, attempts):
+        """Poll until the worker thread finishes, then close."""
+        if self._busy and attempts < 50:  # up to ~5 seconds
+            self.after(100, self._poll_close, attempts + 1)
+        else:
+            self._busy = False
+            self._close()
 
     def _center(self, center_at=None):
         self.update_idletasks()
@@ -582,7 +622,7 @@ class DecryptorApp(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
     def _on_drop(self, event):
-        """U1: Handle drag-and-drop .qcx file."""
+        """Handle drag-and-drop .qcx file."""
         if self._busy: return          # ignore drops during active decryption
         raw = event.data.strip()
         if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
@@ -621,11 +661,11 @@ class DecryptorApp(tk.Toplevel):
             cv.yview_scroll(delta, "units")
         cv.bind_all("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
 
-        # 1. File — A1: uses shared FileCard from shared_ui
+        # 1. File — uses shared FileCard from shared_ui
         section_label(b, "1  FILE", padx=P)
         self._file_card = FileCard(b, self._on_file,
-                                   prompt="Select an encrypted file",
-                                   sub="Click anywhere · .qcx files · or drag & drop",
+                                   prompt="Select an encrypted .qcx file",
+                                   sub="Click anywhere · .qcx is QuantaCrypt's encrypted format · or drag & drop",
                                    filetypes=[("QuantaCrypt","*.qcx"),("All files","*")])
         self._file_card.pack(fill="x", padx=P)
         self._info_wrap = tk.Frame(b, bg=C["bg"])
@@ -634,8 +674,8 @@ class DecryptorApp(tk.Toplevel):
         self._inspect_row = tk.Frame(b, bg=C["bg"])
         self._inspect_row.pack(fill="x", padx=P, pady=(4,0))
 
-        # 2. Secret
-        section_label(b, "2  SECRET", padx=P)
+        # 2. Password / Shares
+        section_label(b, "2  PASSWORD / SHARES", padx=P)
         self._sec_wrap = tk.Frame(b, bg=C["bg"])
         self._sec_wrap.pack(fill="x", padx=P)
         tk.Label(self._sec_wrap, text="Open a file to see decryption options.",
@@ -662,7 +702,7 @@ class DecryptorApp(tk.Toplevel):
                                        primary=False, small=True)
         self._verify_btn.pack(side="left", padx=(10,0))
         self._verify_btn.enable(False)   # enabled once a file is loaded
-        # UX-L12: tooltip so first-time users understand what "Verify key only" does
+        # Tooltip so first-time users understand what "Verify key only" does
         _Tooltip(self._verify_btn,
                  "Checks your password/shares are correct without writing any output")
         self._err = tk.Label(b, text="", font=F["caption"], bg=C["bg"], fg=C["error"],
@@ -671,7 +711,7 @@ class DecryptorApp(tk.Toplevel):
 
         self._prog = StagedProgressBar(b, [(n,w) for n,w,_ in STAGES])
         self._results = tk.Frame(b, bg=C["bg"]); self._results.pack(fill="x", padx=P)
-        # UX-13: keyboard shortcut hint
+        # keyboard shortcut hint
         tk.Label(b, text="Ctrl+O  Open file  ·  Ctrl+↵  Decrypt",
                  font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(8,0))
         tk.Frame(b, bg=C["bg"], height=16).pack()
@@ -679,17 +719,17 @@ class DecryptorApp(tk.Toplevel):
     # ── File loading ──────────────────────────────────────────────────────────
 
     def _on_file(self, path):
-        """B4: sanitize exception — show our ValueError messages, mask OS errors."""
-        self._err.config(text="")  # UX-2: clear any previous file-load error
+        """Sanitize exception — show our ValueError messages, mask OS errors."""
+        self._err.config(text="")  # Clear any previous file-load error
         try:
             pkg = load_pkg(path)
             self._payload  = pkg
             self._meta     = pkg["meta"]
             self._orig     = None
             self._mode_val = self._meta["mode"]
-            self._qcx_path = path  # Bug 2: keep in sync so _run decrypts the right file
+            self._qcx_path = path  # Keep in sync so _run decrypts the right file
             self._load_payload(path)
-            self.title(f"{os.path.basename(path)} — QuantaCrypt · Decrypt")  # U8
+            self.title(f"{os.path.basename(path)} — QuantaCrypt · Decrypt")
         except ValueError as e:
             # Our own descriptive messages are safe to show
             self._err.config(text=f"File error: {e}")
@@ -712,14 +752,16 @@ class DecryptorApp(tk.Toplevel):
                 self._out.delete(0,"end"); self._out.insert(0, suggested_dir)
             self._out_hint.config(text="Output folder — the original filename will be restored.")
 
-        # Refresh inspect button row
+        # Refresh inspect button row — make it discoverable
         for w in self._inspect_row.winfo_children(): w.destroy()
-        FlatButton(self._inspect_row, "Inspect file →", self._show_inspect,
+        FlatButton(self._inspect_row, "🔍 View file details", self._show_inspect,
                    primary=False, small=True).pack(side="left")
+        tk.Label(self._inspect_row, text="(no password needed)",
+                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(side="left", padx=(6, 0))
 
         # Enable action buttons now that a valid file is loaded
         self._btn.enable(True)
-        self._btn.config(text="Decrypt File →")  # UX-L9: restore action label
+        self._btn.config(text="Decrypt File →")  # Restore action label
         self._verify_btn.enable(True)
 
         for w in self._sec_wrap.winfo_children(): w.destroy()
@@ -729,7 +771,7 @@ class DecryptorApp(tk.Toplevel):
         if self._mode_val == "single":
             tk.Label(self._sec_wrap, text="Password", font=F["caption"],
                      bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,3))
-            # U7: password row with per-field show/hide toggle
+            # Password row with per-field show/hide toggle
             pw_row = tk.Frame(self._sec_wrap, bg=C["bg"])
             pw_row.pack(fill="x")
             self._pw = styled_entry(pw_row, show="•")
@@ -741,9 +783,9 @@ class DecryptorApp(tk.Toplevel):
         else:
             k=self._meta.get("threshold", 2); n=self._meta.get("total", k)
             tk.Label(self._sec_wrap,
-                     text=f"Enter any {k} of the {n} shares to decrypt.",
+                     text=f"Enter any {k} of the {n} shares to unlock this file.",
                      font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,6))
-            # Bug 1: remove stale trace from previous file load before _imode.set
+            # Remove stale trace from previous file load before _imode.set
             # (which fires all live traces against the destroyed _inputs_frame)
             if self._imode_trace_id:
                 try: self._imode.trace_remove("write", self._imode_trace_id)
@@ -763,7 +805,7 @@ class DecryptorApp(tk.Toplevel):
         if not self._meta or not self._qcx_path:
             return
         meta = self._meta
-        import hashlib, time as _t
+        import hashlib
 
         # Compute file fingerprint
         fp = ""
@@ -780,9 +822,9 @@ class DecryptorApp(tk.Toplevel):
         mode = meta.get("mode", "?")
         if mode == "shamir":
             k, n = meta.get("threshold", "?"), meta.get("total", "?")
-            mode_str = f"Shamir  {k}-of-{n}  (any {k} shares needed)"
+            mode_str = f"Split key — needs {k} of {n} people"
         else:
-            mode_str = "Single password"
+            mode_str = "Password-protected"
 
         version = meta.get("version", "?")
         key_bits = meta.get("key_bits", 512)
@@ -813,11 +855,11 @@ class DecryptorApp(tk.Toplevel):
                      fg=C["success"] if hl else C["text2"],
                      anchor="w", justify="left", wraplength=320).pack(side="left", fill="x")
 
-        row("File size",  file_size)
-        row("Mode",       mode_str)
-        row("Cipher",     "AES-256-GCM  ·  " + str(key_bits) + "-bit key material")
-        row("KEM",        "ML-KEM / Kyber-768  (post-quantum)")
-        row("Format",     f"QuantaCrypt v{version}")
+        row("File size",   file_size)
+        row("Mode",        mode_str)
+        row("Encryption",  "Quantum-resistant (AES-256-GCM + ML-KEM)")
+        row("Password",    "Hardened with slow hash (Argon2id)")
+        row("Format",      f"QuantaCrypt v{version}")
         if fp:
             row("Fingerprint", fp + "…  (first 64KB SHA-256)")
         tk.Label(win,
@@ -837,7 +879,7 @@ class DecryptorApp(tk.Toplevel):
         win.geometry(f"+{pw+(ww-dw)//2}+{ph+(wh-dh)//2}")
 
     def _toggle_pw(self):
-        """U7: Toggle password field visibility with text button."""
+        """Toggle password field visibility with text button."""
         if not hasattr(self, "_pw"): return
         vis = self._pw.cget("show") == "•"
         self._pw.config(show="" if vis else "•")
@@ -850,20 +892,20 @@ class DecryptorApp(tk.Toplevel):
         if self._imode.get() == "mnemonic":
             wl = get_wl()
             for i in range(k):
-                # G-H: first share expanded, rest collapsed to reduce initial height
+                # First share expanded, rest collapsed to reduce initial height
                 inp = MnemonicShareInput(self._inputs_frame, i+1, wl, start_expanded=(i==0))
                 inp.pack(fill="x", pady=(0,12))
                 self._inputs.append(inp)
             if self._inputs: self._inputs[0].focus()
         else:
-            # U6: raw share mode — header row with fill counter + Paste all button
+            # Raw share mode — header row with fill counter + Paste all button
             hdr_row = tk.Frame(self._inputs_frame, bg=C["bg"])
             hdr_row.pack(fill="x", pady=(0,6))
             self._share_counter = tk.Label(hdr_row,
                 text=f"0 of {k} shares entered",
                 font=F["caption"], bg=C["bg"], fg=C["text3"])
             self._share_counter.pack(side="left")
-            # G6: Paste all — finds QCSHARE- lines in clipboard and fills entries in order
+            # Paste all — finds QCSHARE- lines in clipboard and fills entries in order
             FlatButton(hdr_row, "Paste all", self._paste_all_shares,
                        primary=False, small=True).pack(side="right")
             for i in range(k):
@@ -883,13 +925,18 @@ class DecryptorApp(tk.Toplevel):
                     else:
                         entry.config(highlightbackground=C["error"])
                 e.bind("<KeyRelease>", _on_share_key)
-                # UX-L10: <<Paste>> fires before text lands; schedule validation 10ms later
+                # <<Paste>> fires before text lands; schedule validation 10ms later
                 e.bind("<<Paste>>", lambda ev: self.after(10, _on_share_key, None))
+                # Individual paste button for each share
+                def _paste_one(entry=e):
+                    self._paste_single_share(entry)
+                FlatButton(row, "Paste", _paste_one,
+                           primary=False, small=True).pack(side="left", padx=(6,0))
                 self._entries.append(e)
             if self._entries: self._entries[0].focus()
 
     def _update_share_counter(self):
-        """U6: Update fill count label for raw QCSHARE- mode."""
+        """Update fill count label for raw QCSHARE- mode."""
         if not hasattr(self, "_share_counter"): return
         filled = sum(1 for e in self._entries if e.get().strip())
         total  = len(self._entries)
@@ -898,8 +945,30 @@ class DecryptorApp(tk.Toplevel):
             text=f"{filled} of {total} share{'s' if total!=1 else ''} entered",
             fg=col)
 
+    def _paste_single_share(self, entry):
+        """Paste a single QCSHARE- code from the clipboard into one entry."""
+        try:
+            text = self.clipboard_get().strip()
+        except Exception:
+            messagebox.showwarning("Paste", "Clipboard is empty or unreadable.")
+            return
+        # If clipboard has multiple lines, grab the first QCSHARE- line
+        code = text
+        for ln in text.splitlines():
+            ln = ln.strip()
+            if ln.startswith("QCSHARE-"):
+                code = ln
+                break
+        entry.delete(0, "end")
+        entry.insert(0, code)
+        if code.startswith("QCSHARE-"):
+            entry.config(highlightbackground=C["success"])
+        else:
+            entry.config(highlightbackground=C["error"])
+        self._update_share_counter()
+
     def _paste_all_shares(self):
-        """G6: Find all QCSHARE- lines in clipboard and fill entries in order."""
+        """Find all QCSHARE- lines in clipboard and fill entries in order."""
         try:
             text = self.clipboard_get()
         except Exception:
@@ -938,7 +1007,7 @@ class DecryptorApp(tk.Toplevel):
                         "Switching input mode will clear any shares you have entered.",
                         icon="warning"):
                     if getattr(self, "_rebuilding", False): return
-                    # Fix 11: use try/finally so flag always gets reset, even on exception
+                    # Use try/finally so flag always gets reset, even on exception
                     try:
                         self._rebuilding = True
                         prev = "raw" if self._imode.get() == "mnemonic" else "mnemonic"
@@ -971,20 +1040,28 @@ class DecryptorApp(tk.Toplevel):
         if self._mode_val == "single":
             if not hasattr(self, "_pw") or not self._pw.get(): return "Enter your password"
         else:
+            # Validate enough shares are provided for the threshold
+            threshold = self._meta.get("threshold", 2) if self._meta else 2
             if self._imode.get() == "mnemonic":
+                if len(self._inputs) < threshold:
+                    return f"Need at least {threshold} shares, but only {len(self._inputs)} provided"
                 bad = [(i+1, inp.valid_count()) for i,inp in enumerate(self._inputs)
                        if not inp.is_complete()]
                 if bad:
                     return "Incomplete: " + ", ".join(f"Share {i}: {n}/50" for i,n in bad)
             else:
+                if len(self._entries) < threshold:
+                    return f"Need at least {threshold} shares, but only {len(self._entries)} provided"
                 empty = [i+1 for i,e in enumerate(self._entries) if not e.get().strip()]
                 if empty: return f"Share(s) {empty} are empty"
-                # Fix 9: check QCSHARE- prefix so bad pastes give a clear error
+                # Check QCSHARE- prefix so bad pastes give a clear error
                 bad_fmt = [i+1 for i,e in enumerate(self._entries)
                            if e.get().strip() and not e.get().strip().startswith("QCSHARE-")]
                 if bad_fmt:
-                    return (f"Share{'s' if len(bad_fmt)>1 else ''} "
-                            f"{bad_fmt} {'do' if len(bad_fmt)>1 else 'does'} not start with QCSHARE-")
+                    verb = "don't" if len(bad_fmt) > 1 else "doesn't"
+                    pl = "s" if len(bad_fmt) > 1 else ""
+                    return (f"Share{pl} {bad_fmt} {verb} look right — "
+                            f"code shares start with QCSHARE-")
         return None
 
     def _start(self):
@@ -992,11 +1069,11 @@ class DecryptorApp(tk.Toplevel):
         err = self._validate()
         if err:
             self._err.config(text=err)
-            self.after(50, lambda: self._cv.yview_moveto(1.0))  # UX-4/6: scroll after layout reflow
+            self.after(50, lambda: self._cv.yview_moveto(1.0))  # Scroll after layout reflow
             return
         out = self._out.get().strip()
         self._err.config(text=""); self._busy=True
-        self._prog.pack(fill="x", padx=P, pady=(0,4))
+        self._prog.pack(fill="x", padx=P, pady=(0,4), before=self._results)
         self._prog.start(); self._freeze(); self._wiz.set_step(2)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -1018,7 +1095,7 @@ class DecryptorApp(tk.Toplevel):
     def _freeze(self):
         """Disable all interactive controls while decryption runs."""
         self._btn.enable(False)
-        try: self._browse_btn.enable(False)  # UX-5: prevent browse during decrypt
+        try: self._browse_btn.enable(False)  # Prevent browse during decrypt
         except Exception: pass
         try: self._out.config(state="disabled")
         except Exception: pass
@@ -1027,7 +1104,7 @@ class DecryptorApp(tk.Toplevel):
             for w in [self._file_card, self._file_card._icon,
                       self._file_card._line1, self._file_card._line2]:
                 w.unbind("<Button-1>")
-            # UX-4: suppress hover highlight during decryption
+            # Suppress hover highlight during decryption
             self._file_card.unbind("<Enter>")
             self._file_card.unbind("<Leave>")
         except Exception: pass
@@ -1041,7 +1118,7 @@ class DecryptorApp(tk.Toplevel):
     def _thaw(self):
         """Re-enable all interactive controls after decryption completes or fails."""
         self._btn.enable(True)
-        try: self._browse_btn.enable(True)  # UX-5: restore browse button
+        try: self._browse_btn.enable(True)  # Restore browse button
         except Exception: pass
         try: self._out.config(state="normal")
         except Exception: pass
@@ -1050,7 +1127,7 @@ class DecryptorApp(tk.Toplevel):
             for w in [self._file_card, self._file_card._icon,
                       self._file_card._line1, self._file_card._line2]:
                 w.bind("<Button-1>", lambda e: self._file_card._pick())
-            # UX-4: restore hover bindings after decryption
+            # Restore hover bindings after decryption
             self._file_card.bind("<Enter>", lambda e: self._file_card._hl(True))
             self._file_card.bind("<Leave>", lambda e: self._file_card._hl(False))
         except Exception: pass
@@ -1065,36 +1142,39 @@ class DecryptorApp(tk.Toplevel):
         if idx is not None: self.after(0, self._prog.advance, idx, msg)
 
     def _run(self, out_dir, pw_captured, shares_captured=None):
-        """Worker thread — v4 streaming path only."""
-        tmp = os.path.join(out_dir, ".qcx_decrypt.tmp")
+        """Worker thread — streaming decryption."""
+        tmp = os.path.join(out_dir, f".qcx_decrypt_{uuid.uuid4().hex[:8]}.tmp")
+        self._tmp_path = tmp
         try:
+            if self._cancel:
+                return
             meta = self._meta
 
             # Derive final_key from whichever credential mode was used
             if self._mode_val == "single":
-                self.after(0, self._prog.advance, 0, "Re-deriving 512-bit password key (Argon2id)...")
+                self.after(0, self._prog.advance, 0, "Verifying your password...")
                 argon_key = cc.argon2id_derive(pw_captured.encode(),
                                                _b64.b64decode(meta["argon_salt"]))
-                self.after(0, self._prog.advance, 1, "Decrypting Kyber private key...")
+                self.after(0, self._prog.advance, 1, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(argon_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 2, "Decapsulating + HKDF-SHA-512 expanding to 512 bits...")
+                self.after(0, self._prog.advance, 2, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(argon_key, kem_ss)
                 hmac_key  = final_key
-                # G3: mark stage 3 done so no dot is skipped in the visual sequence
+                # Mark stage 3 done so no dot is skipped in the visual sequence
                 self.after(0, self._prog.advance, 3, "Key ready")
             else:
-                self.after(0, self._prog.advance, 0, f"Parsing {len(shares_captured)} shares...")
+                self.after(0, self._prog.advance, 0, f"Reading {len(shares_captured)} shares...")
                 share_dicts = [cc.decode_share(s) for s in shares_captured]
-                self.after(0, self._prog.advance, 1, "Reconstructing 512-bit master key (Shamir over M521)...")
+                self.after(0, self._prog.advance, 1, "Combining shares to recover the key...")
                 master_key = cc.shamir_recover(share_dicts[:meta["threshold"]])
-                self.after(0, self._prog.advance, 2, "Decrypting Kyber private key...")
+                self.after(0, self._prog.advance, 2, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(master_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 3, "Decapsulating + HKDF-SHA-512 expanding to 512 bits...")
+                self.after(0, self._prog.advance, 3, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(master_key, kem_ss)
                 hmac_key  = master_key
@@ -1102,7 +1182,7 @@ class DecryptorApp(tk.Toplevel):
             # Verify metadata HMAC before touching the payload
             cc._verify_meta_hmac(hmac_key, meta)
 
-            self.after(0, self._prog.advance, 4, "Decrypting payload (AES-256-GCM)...")
+            self.after(0, self._prog.advance, 4, "Decrypting your file...")
             with open(tmp, "wb") as f:
                 fname, sz, ts = cc.decrypt_streaming(
                     self._qcx_path, f, meta, final_key, progress_cb=self._prog_cb)
@@ -1143,8 +1223,9 @@ class DecryptorApp(tk.Toplevel):
                 mn_k = sd.get("threshold", 0)
                 if mn_k and mn_k != meta_k:
                     raise ValueError(
-                        f"Threshold mismatch on share {i}: mnemonic says {mn_k}-of-n "
-                        f"but this file requires {meta_k}. Wrong share for this file?"
+                        f"Share {i} doesn't match this file — it was created for a "
+                        f"different encryption that needs {mn_k} people, but this file "
+                        f"needs {meta_k}. Check you have the right shares."
                     )
             return [cc.encode_share(sd) for sd in share_dicts]
         return [e.get().strip() for e in self._entries]
@@ -1160,7 +1241,7 @@ class DecryptorApp(tk.Toplevel):
             self.after(50, lambda: self._cv.yview_moveto(1.0))
             return
         self._err.config(text=""); self._busy = True
-        self._prog.pack(fill="x", padx=P, pady=(0,4))
+        self._prog.pack(fill="x", padx=P, pady=(0,4), before=self._results)
         self._prog.start(); self._freeze(); self._wiz.set_step(2)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -1186,34 +1267,34 @@ class DecryptorApp(tk.Toplevel):
         try:
             meta = self._meta
             if self._mode_val == "single":
-                self.after(0, self._prog.advance, 0, "Re-deriving 512-bit password key (Argon2id)...")
+                self.after(0, self._prog.advance, 0, "Verifying your password...")
                 argon_key = cc.argon2id_derive(pw_captured.encode(),
                                                _b64.b64decode(meta["argon_salt"]))
-                self.after(0, self._prog.advance, 1, "Decrypting Kyber private key...")
+                self.after(0, self._prog.advance, 1, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(argon_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 2, "Decapsulating + HKDF-SHA-512 expanding...")
+                self.after(0, self._prog.advance, 2, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(argon_key, kem_ss)
                 hmac_key  = final_key
                 self.after(0, self._prog.advance, 3, "Key ready")
             else:
-                self.after(0, self._prog.advance, 0, f"Parsing {len(shares_captured)} shares...")
+                self.after(0, self._prog.advance, 0, f"Reading {len(shares_captured)} shares...")
                 share_dicts = [cc.decode_share(s) for s in shares_captured]
-                self.after(0, self._prog.advance, 1, "Reconstructing 512-bit master key (Shamir)...")
+                self.after(0, self._prog.advance, 1, "Combining shares to recover the key...")
                 master_key = cc.shamir_recover(share_dicts[:meta["threshold"]])
-                self.after(0, self._prog.advance, 2, "Decrypting Kyber private key...")
+                self.after(0, self._prog.advance, 2, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(master_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 3, "Decapsulating + HKDF-SHA-512 expanding...")
+                self.after(0, self._prog.advance, 3, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(master_key, kem_ss)
                 hmac_key  = master_key
 
             # Step 1: verify metadata HMAC
-            self.after(0, self._prog.advance, 4, "Verifying file integrity (HMAC + first chunk)...")
+            self.after(0, self._prog.advance, 4, "Checking file integrity...")
             cc._verify_meta_hmac(hmac_key, meta)
 
             # Step 2: decrypt first chunk only — proves AES key is correct without full decrypt
@@ -1287,9 +1368,11 @@ class DecryptorApp(tk.Toplevel):
         self._btn.enable(False)
         # set_step past the last step → all circles show ✓ (complete)
         self._wiz.set_step(len(self.STEPS))
-        # U3: store sz/ts and recovered filename so FileInfoCard shows them
+        display = os.path.basename(fname) if fname else os.path.basename(path)
+        notify("Decryption complete", display)
+        # Store sz/ts and recovered filename so FileInfoCard shows them
         self._sz = sz; self._ts = ts
-        # UX-10: update _orig with the decrypted filename and refresh the info card
+        # Update _orig with the decrypted filename and refresh the info card
         self._orig = os.path.basename(fname) if fname else None
         # Add to recent files list
         try:
@@ -1306,7 +1389,7 @@ class DecryptorApp(tk.Toplevel):
         for inp in self._inputs:
             try: inp.clear(); cleared_shares = True
             except Exception: pass
-        # UX-L11: also clear raw QCSHARE- entry widgets (used in raw mode)
+        # Also clear raw QCSHARE- entry widgets (used in raw mode)
         for entry in getattr(self, "_entries", []):
             try:
                 entry.config(state="normal")
@@ -1330,7 +1413,7 @@ class DecryptorApp(tk.Toplevel):
         tk.Label(ok, text=path, font=F["caption"],
                  bg=C["surface"], fg=C["text3"], anchor="w",
                  wraplength=490, justify="left").pack(anchor="w", padx=14, pady=(2,0))
-        # U3: show original size and timestamp if available
+        # Show original size and timestamp if available
         if sz or ts:
             info_parts = []
             if sz: info_parts.append(f"Original: {fmt_size(sz)}")
@@ -1346,12 +1429,12 @@ class DecryptorApp(tk.Toplevel):
                      font=F["caption"], bg=C["surface"], fg=C["text3"]).pack(anchor="w", padx=14, pady=(2,0))
         # Label the button so it's clear re-running needs "Decrypt another →"
         self._btn.config(text="Decrypt again →")
-        # U4: reveal + decrypt another
+        # Reveal + decrypt another
         btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", padx=14, pady=(8,12))
         FlatButton(btn_row, "Decrypt another →", self._reset, primary=False, small=True).pack(side="left")
         # If output looks like a folder-encrypted zip, offer one-click extraction
         import zipfile as _zf
-        _is_folder_zip = fname.endswith(".zip") and os.path.isfile(path) and _zf.is_zipfile(path)
+        _is_folder_zip = (fname or "").endswith(".zip") and os.path.isfile(path) and _zf.is_zipfile(path)
         if _is_folder_zip:
             def _extract(p=path):
                 import zipfile, tkinter.messagebox as _mb
@@ -1359,6 +1442,12 @@ class DecryptorApp(tk.Toplevel):
                 try:
                     with zipfile.ZipFile(p) as zf:
                         names = zf.namelist()
+                        # Validate paths to prevent directory traversal attacks
+                        real_out = os.path.realpath(out_dir)
+                        for member in names:
+                            target = os.path.realpath(os.path.join(out_dir, member))
+                            if not target.startswith(real_out + os.sep) and target != real_out:
+                                raise ValueError(f"Path traversal detected in archive: {member}")
                         zf.extractall(out_dir)
                     top = os.path.join(out_dir, names[0].split("/")[0]) if names else out_dir
                     _reveal(top)
@@ -1375,7 +1464,7 @@ class DecryptorApp(tk.Toplevel):
         self._payload  = None; self._meta = None; self._orig = None
         self._mode_val = None; self._inputs = []; self._entries = []
         self._sz = 0; self._ts = 0
-        # Bug 11: clear trace ID so next file load does not attempt to remove a stale ID
+        # Clear trace ID so next file load does not attempt to remove a stale ID
         if self._imode_trace_id:
             try: self._imode.trace_remove("write", self._imode_trace_id)
             except Exception: pass
@@ -1390,24 +1479,28 @@ class DecryptorApp(tk.Toplevel):
         self._verify_btn.enable(False)
         tk.Label(self._sec_wrap, text="Open a file to see decryption options.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
-        # A1: use FileCard.reset() — no destroy/recreate needed
+        # Use FileCard.reset() — no destroy/recreate needed
         self._file_card.reset("Select an encrypted file",
                               "Click anywhere · .qcx files · or drag & drop")
         # btn stays disabled — re-enabled by _load_payload when a valid file is opened
-        self._btn.config(text="Open a file to begin")  # UX-L9: neutral text while disabled
+        self._btn.config(text="Open a file to begin")  # Neutral text while disabled
         self._prog.pack_forget(); self._wiz.set_step(0)
-        self.title("QuantaCrypt · Decrypt")  # U8
+        self.title("QuantaCrypt · Decrypt")
         self.after(10, lambda: self._cv.yview_moveto(0))
-        self.after(20, self._file_card.focus_set)  # UX-7: restore focus after reset
+        self.after(20, self._file_card.focus_set)  # Restore focus after reset
 
     def _fail(self, msg):
-        self._busy=False; self._prog.stop(); self._prog.pack_forget(); self._thaw()
+        self._busy=False; self._cancel=False; self._tmp_path=None
+        self._prog.stop(); self._prog.pack_forget(); self._thaw()
         self._wiz.set_step(2)  # stay at Decrypt step — error is shown there
         if "InvalidTag" in msg:
-            self._err.config(text="Wrong password or shares — decryption failed")
+            hint = ("Wrong password — please re-enter and try again."
+                    if self._mode_val == "single" else
+                    "Wrong shares — check you have the correct shares for this file.")
+            self._err.config(text=hint)
             # Auto-select the password field so the user can immediately retype
             if self._mode_val == "single" and hasattr(self, "_pw"):
-                # UX-10: defer focus so _thaw's state=normal is processed first
+                # Defer focus so _thaw's state=normal is processed first
                 def _refocus():
                     try: self._pw.focus_set(); self._pw.selection_range(0, "end")
                     except Exception: pass
@@ -1415,30 +1508,27 @@ class DecryptorApp(tk.Toplevel):
         elif "older format" in msg.lower() or "no longer supported" in msg.lower():
             self._err.config(text=msg)
         elif "Checksum" in msg:
-            self._err.config(text="Share checksum mismatch — verify you have the correct share for this file")
-        elif "threshold mismatch" in msg.lower():
-            self._err.config(text=msg)
+            self._err.config(text="One of your shares has a checksum error — it may be damaged or for a different file.")
+        elif "threshold mismatch" in msg.lower() or "doesn't match this file" in msg.lower():
+            self._err.config(text=msg)  # our own descriptive message
         elif "newer version" in msg.lower():
-            self._err.config(text=msg)  # A3: safe — our own message
+            self._err.config(text=msg)  # Safe — our own message
         elif "No space left" in msg or "disk" in msg.lower():
-            self._err.config(text="Error: Not enough disk space to write the output file")
+            self._err.config(text="Not enough disk space. Free up some storage and try again.")
         elif "Permission" in msg or "Access is denied" in msg:
-            self._err.config(text="Error: Permission denied — cannot write to that location")
+            self._err.config(text="Can't write to that folder — check permissions or choose a different output folder.")
         elif "Not a QuantaCrypt" in msg or "truncated" in msg.lower():
-            self._err.config(text=f"File error: {msg}")
+            self._err.config(text="This doesn't appear to be a valid .qcx file. Make sure you selected the right file.")
         elif "out of range" in msg.lower():
-            self._err.config(text="Shares appear corrupted or from a different file")
+            self._err.config(text="These shares don't work — they may be damaged or from a different file.")
         elif "Metadata authentication" in msg or "tampered" in msg.lower():
-            self._err.config(text=msg)  # our own descriptive message — safe to show
+            self._err.config(text="This file appears to have been modified or corrupted. It can't be safely decrypted.")
         elif "Authentication failed" in msg or "chunk" in msg.lower():
-            # G-D: stream_decrypt_payload raises ValueError("Authentication failed on
-            # chunk N — file may be corrupt or the wrong key was used").  Surface the
-            # specific message rather than the generic fallback.
-            self._err.config(text=f"File integrity error: {msg}")
+            self._err.config(text="File integrity check failed — the file may be damaged or corrupted.")
         else:
-            self._err.config(text="Decryption failed — check your inputs and try again")
+            self._err.config(text="Something went wrong. Double-check your inputs and try again.")
         # Scroll to bottom so the error label is visible
-        self.after(50, lambda: self._cv.yview_moveto(1.0))  # UX-3: reflow delay
+        self.after(50, lambda: self._cv.yview_moveto(1.0))  # Reflow delay
 
 
 def main():

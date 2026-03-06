@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """QuantaCrypt Encryptor — encryption GUI with password and Shamir modes."""
-import os, sys, json, threading, stat, subprocess, zipfile, tempfile
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import zipfile
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+from quantacrypt.core import crypto as cc
+from quantacrypt.ui.shared import (
+    C, F,
+    styled_entry, bind_context_menu, fmt_size, rule, section_label,
+    FlatButton, SegmentedControl, StagedProgressBar,
+    PasswordStrengthBar, FileCard, WizardSteps, ClipboardTimer,
+    notify,
+)
 
 
 def _folder_stats(folder):
@@ -10,47 +27,46 @@ def _folder_stats(folder):
     count, total = 0, 0
     for dirpath, _, filenames in os.walk(folder):
         for fn in filenames:
-            try: total += os.path.getsize(os.path.join(dirpath, fn))
-            except OSError: pass
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                pass
             count += 1
     return count, total
 
 
 def _zip_folder(folder, dst_path, progress_cb=None):
-    """Zip folder into dst_path with paths relative to folder's parent
-    (so the top-level directory name is preserved inside the archive).
-    Fires progress_cb(msg) every file.  Returns bytes written."""
+    """Zip folder into dst_path with paths relative to folder's parent.
+
+    The top-level directory name is preserved inside the archive.
+    Fires progress_cb(msg) every file.  Returns bytes written.
+    """
     parent = os.path.dirname(os.path.abspath(folder))
     total_files, _ = _folder_stats(folder)
     done = 0
     with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
         for dirpath, dirnames, filenames in os.walk(folder):
-            dirnames.sort(); filenames.sort()
+            dirnames.sort()
+            filenames.sort()
             for fn in filenames:
-                full    = os.path.join(dirpath, fn)
+                full = os.path.join(dirpath, fn)
                 arcname = os.path.relpath(full, parent)
                 zf.write(full, arcname)
                 done += 1
                 if progress_cb and total_files:
                     pct = done / total_files
-                    progress_cb(f"Compressing folder… {int(pct*100)}% ({done}/{total_files} files)")
-    return os.path.getsize(dst_path)
-
-if getattr(sys,"frozen",False):
-    _base = sys._MEIPASS
-    sys.path.insert(0, _base)
-else:
-    _base = os.path.dirname(os.path.abspath(__file__))
-from quantacrypt.core import crypto as cc
-from quantacrypt.ui.shared import *
+                    progress_cb(
+                        f"Compressing folder… {int(pct * 100)}%"
+                        f" ({done}/{total_files} files)"
+                    )
 
 STAGES = [
-    ("Compress",          0.10, "Compressing"),  # folder-only; skipped for plain files
-    ("Key derivation",    0.50, "Argon2id"),
-    ("Post-quantum KEM",  0.13, "Kyber"),
-    ("Encrypt key",       0.04, "private key"),
-    ("Encrypt file",      0.18, "payload"),
-    ("Finalise",          0.05, "Writing"),
+    ("Compressing folder",    0.10, "Compressing"),  # folder-only; skipped for plain files
+    ("Securing password",     0.50, "Argon2id"),
+    ("Generating protection", 0.13, "Kyber"),
+    ("Locking key",           0.04, "private key"),
+    ("Encrypting file",       0.18, "payload"),
+    ("Saving",                0.05, "Writing"),
 ]
 # Indices for stages that carry semantic meaning in the code
 STAGE_COMPRESS = 0
@@ -66,7 +82,7 @@ def _find_stage(msg):
     return None, None
 
 def _reveal(path, open_file=False):
-    """U4 / G-O: open the containing folder (or the file itself) in the OS."""
+    """Open the containing folder (or the file itself) in the OS."""
     try:
         if open_file:
             subprocess.Popen(["open", path])
@@ -94,6 +110,7 @@ class ShareCard(tk.Frame):
         self._txt=tk.Text(self,font=F["mono_s"],bg=C["surface2"],fg=C["text2"],
                           relief="flat",bd=0,highlightthickness=0,wrap="word",
                           selectbackground=C["accent_dim"])
+        bind_context_menu(self._txt)
         self._txt.pack(fill="x",padx=14,pady=(0,4))
         self._refresh()
         btn_row = tk.Frame(self, bg=C["surface"]); btn_row.pack(fill="x", padx=14, pady=(0,10))
@@ -131,7 +148,7 @@ class ShareCard(tk.Frame):
             self.after(2000, lambda: self._copy_btn.config(text="Copy") if self.winfo_exists() else None)
 
     def mark_saved(self):
-        """UX-M2: visually indicate this share has been written to a file."""
+        """Visually indicate this share has been written to a file."""
         try:
             self._clip_timer.cancel()
             self._copy_btn.enable(False)
@@ -149,37 +166,37 @@ except ImportError:
 
 class EncryptorApp(tk.Toplevel):
     STEPS = ["File", "Mode", "Secret", "Output", "Encrypt"]
-    _P    = 24   # B1/B2: single class-level padding constant
+    _P    = 24   # Single class-level padding constant
 
     def __init__(self, master=None, on_close=None, center_at=None):
         super().__init__(master)
         self.title("QuantaCrypt · Encrypt")
         self.configure(bg=C["bg"])
         self.resizable(True, True)
-        self.geometry("560x700")
-        self.minsize(500, 500)
+        self.geometry("620x780")
+        self.minsize(560, 560)
         self._path=None; self._is_folder=False; self._batch_paths=[]; self._mode=tk.StringVar(value="single")
         self._n=tk.IntVar(value=3); self._k=tk.IntVar(value=2)
         self._pw1v=tk.StringVar(); self._pw2v=tk.StringVar()
         self._embed_dec=tk.BooleanVar(value=False)
         self._shares_pending=False   # True after Shamir encrypt until shares saved/dismissed
         self._pending_shares=[]
-        self._scroll_job=None  # UX-9: track pending scroll so _reset can cancel it
+        self._scroll_job=None  # Track pending scroll so _reset can cancel it
         self._busy=False; self._on_close=on_close
-        self._out_auto=False  # UX-1: True when output path was auto-generated
+        self._out_auto=False  # True when output path was auto-generated
         # Always wire WM_DELETE_WINDOW through _close so share guard fires
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._build()
         self._center(center_at=center_at)
         self.update()  # macOS: force canvas embedded-window Configure event so form renders
-        # U1: register DnD (only works when base class is TkinterDnD.Tk)
+        # Register DnD (only works when base class is TkinterDnD.Tk)
         if _DND_FILES:
             try:
                 self.drop_target_register(_DND_FILES)
                 self.dnd_bind("<<Drop>>", self._on_drop)
             except Exception:
                 pass
-        # U2: Ctrl+O to open file (guarded: no-op while busy)
+        # Ctrl+O to open file (guarded: no-op while busy)
         def _ctrl_o(e):
             if self._busy:
                 self._err.config(text="Busy — please wait for encryption to finish")
@@ -206,9 +223,9 @@ class EncryptorApp(tk.Toplevel):
             return True
         if not messagebox.askyesno(
                 "Shares not saved",
-                "You haven't saved the Shamir shares yet.\n\n"
-                "If you leave now, the shares will be lost and the encrypted file "
-                "cannot be decrypted.\n\n"
+                "You haven't saved the shares yet.\n\n"
+                "If you leave now, the shares will be lost and nobody will be able "
+                "to unlock the encrypted file.\n\n"
                 "Leave anyway?",
                 icon="warning", default="no"):
             return False
@@ -240,7 +257,7 @@ class EncryptorApp(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
     def _on_drop(self, event):
-        """U1: Handle drag-and-drop file or folder."""
+        """Handle drag-and-drop file or folder."""
         if self._busy: return
         raw = event.data.strip()
         if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
@@ -255,7 +272,7 @@ class EncryptorApp(tk.Toplevel):
             self._on_file(path)
 
     def _build(self):
-        P = self._P  # B1: local alias so all padx=P in _build use class constant
+        P = self._P  # Local alias so all padx=P in _build use class constant
         hdr=tk.Frame(self,bg=C["bg"])
         hdr.pack(fill="x",padx=P,pady=(18,0))
         tk.Label(hdr,text="QuantaCrypt",font=F["display"],bg=C["bg"],fg=C["text"]).pack(side="left")
@@ -300,7 +317,7 @@ class EncryptorApp(tk.Toplevel):
         # (packed/unpacked by _on_src_type)
 
         # 2. Mode
-        section_label(b,"2  ENCRYPTION MODE",padx=P)
+        section_label(b,"2  PROTECTION TYPE",padx=P)
         self._mode_w=SegmentedControl(b,[("single","Single Password"),("shamir","Split Between People")],
                          self._mode)
         self._mode_w.pack(fill="x",padx=P)
@@ -310,13 +327,13 @@ class EncryptorApp(tk.Toplevel):
         self._mode.trace_add("write",self._on_mode)
 
         # 3. Secret
-        section_label(b,"3  SECRET",padx=P)
+        section_label(b,"3  PASSWORD",padx=P)
         self._sec_wrap=tk.Frame(b,bg=C["bg"]); self._sec_wrap.pack(fill="x",padx=P)
         self._pw_panel=tk.Frame(self._sec_wrap,bg=C["bg"])
         tk.Label(self._pw_panel,text="Password",font=F["caption"],bg=C["bg"],
                  fg=C["text3"]).pack(anchor="w",pady=(0,3))
 
-        # U7: password row with per-field show/hide toggle
+        # Password row with per-field show/hide toggle
         pw1_row=tk.Frame(self._pw_panel,bg=C["bg"]); pw1_row.pack(fill="x",pady=(0,4))
         self._pw1=styled_entry(pw1_row,textvariable=self._pw1v,show="•")
         self._pw1.pack(side="left",fill="x",expand=True,ipady=8,ipadx=10)
@@ -354,12 +371,16 @@ class EncryptorApp(tk.Toplevel):
         self._out.pack(side="left",fill="x",expand=True,ipady=8,ipadx=10)
         self._browse_btn = FlatButton(out_row,"…",self._browse_out,primary=False,small=True)
         self._browse_btn.pack(side="left",padx=(6,0))
-        # UX-1: any manual edit marks the path as user-supplied (don't auto-replace)
+        # Any manual edit marks the path as user-supplied (don't auto-replace)
         self._out.bind("<Key>", lambda e: setattr(self, "_out_auto", False))
+        self._out_hint = tk.Label(self._out_section,
+            text=".qcx is QuantaCrypt's encrypted format — safe to store or share",
+            font=F["small"], bg=C["bg"], fg=C["text3"], anchor="w")
+        self._out_hint.pack(fill="x", padx=P, pady=(4, 0))
 
         # 5. Embed decryptor — only shown when a binary is available or app is frozen
         if getattr(sys,"frozen",False) or self._find_dec():
-            section_label(b,"5  SELF-EXECUTING",padx=P)
+            section_label(b,"5  PORTABLE FILE",padx=P)
             embed_row=tk.Frame(b,bg=C["bg"]); embed_row.pack(fill="x",padx=P)
             self._embed_chk=tk.Checkbutton(
                 embed_row, variable=self._embed_dec,
@@ -390,12 +411,12 @@ class EncryptorApp(tk.Toplevel):
 
         self._prog=StagedProgressBar(b,[(n,w) for n,w,_ in STAGES])
         self._results=tk.Frame(b,bg=C["bg"]); self._results.pack(fill="x",padx=P,pady=(0,12))
-        # UX-14: keyboard shortcut hint
+        # Keyboard shortcut hint
         tk.Label(b, text="Ctrl+O  Open file  ·  Ctrl+↵  Encrypt",
                  font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(0,16))
         self._on_mode()
 
-    # U7: per-field show/hide toggle with text button
+    # Per-field show/hide toggle with text button
     def _toggle_pw(self, field=0):
         if field == 1:
             vis = self._pw1.cget("show") == "•"
@@ -423,14 +444,14 @@ class EncryptorApp(tk.Toplevel):
                 self._embed_hint.config(text="Decryptor binary not found. Build with: python3 build.py",
                                         fg=C["error"])
         else:
-            # UX-8: always show hint so user understands the checkbox even without a file
+            # Always show hint so user understands the checkbox even without a file
             self._embed_hint.config(text="Recipients will need the quantacrypt app to open this file.",
                                     fg=C["text3"])
 
     def _build_shamir(self,parent):
         # Header row: hint + collapsible ? help button
         hdr=tk.Frame(parent,bg=C["bg"]); hdr.pack(fill="x",pady=(0,4))
-        tk.Label(hdr,text="The key is split into N shares. Any K can decrypt.",
+        tk.Label(hdr,text="Choose how many people hold a share, and how many are needed to unlock.",
             font=F["caption"],bg=C["bg"],fg=C["text3"]).pack(side="left")
         self._shamir_help_visible=False
         help_btn=tk.Label(hdr,text=" ? ",font=F["caption"],bg=C["surface2"],
@@ -443,14 +464,17 @@ class EncryptorApp(tk.Toplevel):
         self._shamir_help=tk.Frame(parent,bg=C["surface"],
                                    highlightbackground=C["border"],highlightthickness=1)
         tk.Label(self._shamir_help,
-            text="Think of it like a safe that needs K of N keys to open.\n"
-                 "Each person holds one share. Nobody alone can decrypt the file.\n"
-                 "Example: 3 trustees, any 2 can open — good for wills or team backups.",
+            text="Imagine a vault that needs multiple keys to open:\n\n"
+                 "• You give each person a unique share (like a unique key)\n"
+                 "• No single person can open the file alone\n"
+                 "• Only when enough people combine their shares can the file be unlocked\n\n"
+                 "Example: Give 3 family members a share, require any 2 to unlock — "
+                 "great for wills, team backups, or shared secrets.",
             font=F["caption"],bg=C["surface"],fg=C["text2"],
             justify="left",wraplength=480,anchor="w").pack(padx=12,pady=10,fill="x")
         # Don't pack yet — _toggle_shamir_help will do it when needed
 
-        # G-F: preset buttons for the three most common Shamir configurations
+        # Preset buttons for the three most common Shamir configurations
         preset_row = tk.Frame(parent, bg=C["bg"])
         preset_row.pack(fill="x", pady=(4,6))
         tk.Label(preset_row, text="Quick presets:", font=F["caption"],
@@ -466,13 +490,13 @@ class EncryptorApp(tk.Toplevel):
         self._shamir_grid.pack(fill="x",pady=(0,0))
         self._shamir_grid.columnconfigure(0,weight=1); self._shamir_grid.columnconfigure(1,weight=1)
         for col,(lbl,var,tip) in enumerate([
-            ("Total Shares (N)",self._n,"How many shares to create"),
-            ("Threshold (K)",self._k,"Minimum needed to decrypt"),
+            ("Required to unlock",self._k,"Minimum people needed"),
+            ("Total people",self._n,"How many shares to create"),
         ]):
             card=tk.Frame(self._shamir_grid,bg=C["surface"],highlightbackground=C["border"],highlightthickness=1)
             card.grid(row=0,column=col,padx=(0 if col==0 else 8,0),sticky="ew")
             tk.Label(card,text=lbl,font=F["caption"],bg=C["surface"],fg=C["text3"]).pack(anchor="w",padx=12,pady=(10,2))
-            # G-I: wrap Spinbox in a focus-ring Frame so keyboard users get a
+            # Wrap Spinbox in a focus-ring Frame so keyboard users get a
             # visible accent outline matching the rest of the form's style.
             sp_wrap = tk.Frame(card, bg=C["surface"],
                                highlightbackground=C["border"], highlightthickness=1)
@@ -485,9 +509,9 @@ class EncryptorApp(tk.Toplevel):
             sp.bind("<FocusIn>",  lambda e, w=sp_wrap: w.config(highlightbackground=C["accent"], highlightthickness=2))
             sp.bind("<FocusOut>", lambda e, w=sp_wrap: w.config(highlightbackground=C["border"], highlightthickness=1))
             tk.Label(card,text=tip,font=F["caption"],bg=C["surface"],fg=C["text3"]).pack(anchor="w",padx=12,pady=(2,10))
-        # UX-4: live summary label showing current threshold interpretation
+        # Live summary label showing current threshold interpretation
         self._shamir_summary = tk.Label(parent,
-            text=f"Any {self._k.get()} of {self._n.get()} shares can decrypt the file",
+            text=f"Any {self._k.get()} of {self._n.get()} people can unlock the file",
             font=F["caption"], bg=C["bg"], fg=C["accent"], anchor="w")
         self._shamir_summary.pack(fill="x", pady=(6,0))
         # Live K≤N clamping: whenever N or K changes, keep K ≤ N
@@ -502,7 +526,7 @@ class EncryptorApp(tk.Toplevel):
             self._shamir_help.pack_forget()
 
     def _clamp_k(self, *_):
-        """UX-4 / G-M: Clamp N/K with a short debounce so that typing a two-digit
+        """Clamp N/K with a short debounce so that typing a two-digit
         number (e.g. "10") doesn't flash the minimum value after the first digit.
         The actual clamping is deferred by 400 ms and cancelled if another
         keystroke arrives first."""
@@ -518,13 +542,13 @@ class EncryptorApp(tk.Toplevel):
                 nd = max(2, min(20, n))
                 kd = max(2, min(nd, k))
                 self._shamir_summary.config(
-                    text=f"Any {kd} of {nd} shares can decrypt the file")
+                    text=f"Any {kd} of {nd} people can unlock the file")
         except (tk.TclError, ValueError):
             pass
         self._clamp_job = self.after(400, self._do_clamp)
 
     def _do_clamp(self):
-        """G-M: Deferred actual clamping — runs 400 ms after the last keystroke."""
+        """Deferred actual clamping — runs 400 ms after the last keystroke."""
         self._clamp_job = None
         try:
             n, k = self._n.get(), self._k.get()
@@ -534,7 +558,7 @@ class EncryptorApp(tk.Toplevel):
             if k > n: k = n; self._k.set(k)
             if hasattr(self, "_shamir_summary"):
                 self._shamir_summary.config(
-                    text=f"Any {k} of {n} shares can decrypt the file")
+                    text=f"Any {k} of {n} people can unlock the file")
         except (tk.TclError, ValueError):
             pass
 
@@ -544,13 +568,13 @@ class EncryptorApp(tk.Toplevel):
             self._pw_panel.pack(fill="x")
             self._pw1.config(state="normal"); self._pw2.config(state="normal")
             self._sh_panel.pack_forget()
-            self._mode_hint.config(text="One password unlocks the file. Never stored anywhere.")
+            self._mode_hint.config(text="Choose a strong password. It's the only way to unlock the file — we never store it.")
         else:
             # Hide pw panel and disable its fields to remove them from Tab order
             self._pw_panel.pack_forget()
             self._pw1.config(state="disabled"); self._pw2.config(state="disabled")
             self._sh_panel.pack(fill="x")
-            self._mode_hint.config(text="Splits the key across multiple people. No single person can decrypt alone.")
+            self._mode_hint.config(text="Give each person a unique share. The file can only be unlocked when enough people combine their shares.")
             # Re-show help panel if it was open before mode was switched away
             if self._shamir_help_visible:
                 self._shamir_help.pack(fill="x", pady=(0,8), before=self._shamir_grid)
@@ -568,7 +592,7 @@ class EncryptorApp(tk.Toplevel):
     def _freeze(self):
         """Disable all interactive controls while encryption runs."""
         self._btn.enable(False)
-        try: self._browse_btn.enable(False)  # UX-6: prevent browse during encrypt
+        try: self._browse_btn.enable(False)  # Prevent browse during encrypt
         except Exception: pass
         for w in [self._pw1, self._pw2, self._out]:
             try: w.config(state="disabled")
@@ -579,7 +603,7 @@ class EncryptorApp(tk.Toplevel):
             for w in [self._file_card, self._file_card._icon,
                       self._file_card._line1, self._file_card._line2]:
                 w.unbind("<Button-1>")
-            # UX-4: suppress hover highlight during encryption
+            # Suppress hover highlight during encryption
             self._file_card.unbind("<Enter>")
             self._file_card.unbind("<Leave>")
         except Exception: pass
@@ -588,7 +612,7 @@ class EncryptorApp(tk.Toplevel):
             for lbl in self._mode_w._labels.values():
                 lbl.config(cursor="", fg=C["text3"])
             self._mode_w.unbind("<Left>"); self._mode_w.unbind("<Right>")
-            self._mode_w.config(takefocus=0)  # UX-M8: skip frozen control on Tab
+            self._mode_w.config(takefocus=0)  # Skip frozen control on Tab
         except Exception: pass
         try:
             for lbl in self._src_toggle._labels.values():
@@ -602,7 +626,7 @@ class EncryptorApp(tk.Toplevel):
     def _thaw(self):
         """Re-enable all interactive controls after encryption completes or fails."""
         self._btn.enable(True)
-        try: self._browse_btn.enable(True)  # UX-6: restore browse button
+        try: self._browse_btn.enable(True)  # Restore browse button
         except Exception: pass
         # Only re-enable pw fields in single mode — Shamir mode keeps them disabled
         if self._mode.get() == "single":
@@ -617,7 +641,7 @@ class EncryptorApp(tk.Toplevel):
             for w in [self._file_card, self._file_card._icon,
                       self._file_card._line1, self._file_card._line2]:
                 w.bind("<Button-1>", lambda e: self._file_card._pick())
-            # UX-4: restore hover bindings after encryption
+            # Restore hover bindings after encryption
             self._file_card.bind("<Enter>", lambda e: self._file_card._hl(True))
             self._file_card.bind("<Leave>", lambda e: self._file_card._hl(False))
         except Exception: pass
@@ -627,7 +651,7 @@ class EncryptorApp(tk.Toplevel):
                 lbl.config(cursor="hand2")
             self._mode_w.bind("<Left>",  lambda e: self._mode_w._step(-1))
             self._mode_w.bind("<Right>", lambda e: self._mode_w._step(1))
-            self._mode_w.config(takefocus=1)  # UX-M8: restore Tab focus
+            self._mode_w.config(takefocus=1)  # Restore Tab focus
         except Exception: pass
         try:
             self._src_toggle._refresh()
@@ -668,7 +692,7 @@ class EncryptorApp(tk.Toplevel):
                     self._file_card.reset("Select a file to encrypt",
                                           "Click anywhere · or drag & drop")
                     self._path = None; self._is_folder = False
-        # Fix 3: update button label and section-4 visibility to match source mode
+        # Update button label and section-4 visibility to match source mode
         try:
             if mode == "batch":
                 n = len(self._batch_paths)
@@ -815,25 +839,27 @@ class EncryptorApp(tk.Toplevel):
 
     def _on_file(self,path):
         self._path=path; self._is_folder=False
-        # UX-1: refresh output path when auto-generated or empty; preserve manual edits
+        # Refresh output path when auto-generated or empty; preserve manual edits
         if self._out_auto or not self._out.get().strip():
-            base = os.path.splitext(path)[0]  # UX-7: strip source extension
+            base = os.path.splitext(path)[0]  # Strip source extension
             self._out.delete(0,"end"); self._out.insert(0, base + ".qcx")
             self._out_auto = True  # still auto-generated
+            self._out_hint.config(text="Auto-generated — click … to choose a different location")
         self._err.config(text=""); self._wiz.set_step(1)
         self._on_embed_toggle()
-        self.title(f"{os.path.basename(path)} — QuantaCrypt · Encrypt")  # U8
-        self.after(80, lambda: self._cv.yview_moveto(0.55))  # UX-3: nudge to reveal lower form
+        self.title(f"{os.path.basename(path)} — QuantaCrypt · Encrypt")
+        self.after(80, lambda: self._cv.yview_moveto(0.55))  # Nudge to reveal lower form
 
     def _browse_out(self):
-        # B3: pre-seed directory from current output field
+        # Pre-seed directory from current output field
         cur=self._out.get().strip()
         init_dir=os.path.dirname(os.path.abspath(cur)) if cur else ""
         p=filedialog.asksaveasfilename(initialdir=init_dir,defaultextension=".qcx",
             filetypes=[("QuantaCrypt","*.qcx"),("All files","*")])
         if p:
             self._out.delete(0,"end"); self._out.insert(0,p)
-            self._out_auto = False  # UX-2: browsed path is user-supplied
+            self._out_auto = False  # Browsed path is user-supplied
+            self._out_hint.config(text=".qcx is QuantaCrypt's encrypted format — safe to store or share")
 
     def _validate(self):
         if self._src_type.get() == "batch": return self._validate_batch()
@@ -871,10 +897,10 @@ class EncryptorApp(tk.Toplevel):
         err=self._validate()
         if err:
             self._err.config(text=err)
-            self.after(50, lambda: self._cv.yview_moveto(1.0))  # UX-4/6: scroll after layout reflow
+            self.after(50, lambda: self._cv.yview_moveto(1.0))  # Scroll after layout reflow
             return
         out=self._out.get().strip()
-        # Fix 2: warn if password is rated Weak (zxcvbn score 0 or 1)
+        # Warn if password is rated Weak (zxcvbn score 0 or 1)
         if self._mode.get() == "single":
             pw = self._pw1v.get()
             try:
@@ -886,22 +912,21 @@ class EncryptorApp(tk.Toplevel):
                 if not messagebox.askyesno(
                         "Weak password",
                         "Your password is rated Weak.\n\n"
-                        "A weak password offers little protection against brute-force attacks.\n\n"
+                        "A weak password could be guessed relatively easily. "
+                        "Consider using a longer password with a mix of words, numbers, and symbols.\n\n"
                         "Continue with this password anyway?",
                         icon="warning", default="no"):
                     return
-        # G-E: K=N means every shareholder must participate — unusual and worth confirming.
+        # K=N means every shareholder must participate — unusual and worth confirming.
         if self._mode.get() == "shamir":
             k, n = self._k.get(), self._n.get()
             if k == n:
                 if not messagebox.askyesno(
-                        "All shares required",
-                        f"You've set threshold = total = {n}.\n\n"
-                        f"This means every single shareholder must cooperate to decrypt — "
-                        f"there is no redundancy. Losing even one share makes the file "
-                        f"permanently unrecoverable.\n\n"
-                        f"This is usually only intentional for {n}-person consensus scenarios. "
-                        f"For backup/recovery use cases, consider a lower threshold.\n\n"
+                        "All people required",
+                        f"You've set \"required to unlock\" and \"total people\" both to {n}.\n\n"
+                        f"This means every single person must participate — "
+                        f"if even one person loses their share, the file can never be unlocked.\n\n"
+                        f"If you want some safety margin, set \"required to unlock\" lower than \"total people\".\n\n"
                         f"Continue with {k}-of-{n}?",
                         icon="warning", default="no"):
                     return
@@ -910,7 +935,7 @@ class EncryptorApp(tk.Toplevel):
                     f"{os.path.basename(out)} already exists. Overwrite it?",icon="warning"):
                 return
         self._err.config(text=""); self._busy=True
-        self._prog.pack(fill="x",padx=self._P,pady=(0,4))
+        self._prog.pack(fill="x",padx=self._P,pady=(0,4),before=self._results)
         self._prog.start(); self._freeze(); self._wiz.set_step(4)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -950,7 +975,7 @@ class EncryptorApp(tk.Toplevel):
                     icon="warning"):
                 return
         self._err.config(text=""); self._busy = True
-        self._prog.pack(fill="x", padx=self._P, pady=(0,4))
+        self._prog.pack(fill="x", padx=self._P, pady=(0,4), before=self._results)
         self._prog.start(); self._freeze(); self._wiz.set_step(4)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -1018,6 +1043,12 @@ class EncryptorApp(tk.Toplevel):
         self._wiz.set_step(len(self.STEPS))
         self._err.config(text="")
         self._pw1v.set(""); self._pw2v.set("")
+        if failed:
+            notify("Batch encryption finished",
+                   f"{len(succeeded)} succeeded, {len(failed)} failed")
+        else:
+            notify("Batch encryption complete",
+                   f"{len(succeeded)} file{'s' if len(succeeded)!=1 else ''} encrypted")
         ok = tk.Frame(self._results, bg=C["surface"],
                       highlightbackground=C["success"] if not failed else C["warning"],
                       highlightthickness=1)
@@ -1057,7 +1088,7 @@ class EncryptorApp(tk.Toplevel):
             w_hdr = tk.Frame(warn, bg=C["surface"]); w_hdr.pack(fill="x", padx=14, pady=(10,4))
             k = self._k.get()
             tk.Label(w_hdr,
-                     text=f"Save Shamir shares — {len(files_with_shares)} file{'s' if len(files_with_shares)!=1 else ''} need share distribution",
+                     text=f"Save key shares — {len(files_with_shares)} file{'s' if len(files_with_shares)!=1 else ''} need share distribution",
                      font=F["body_b"], bg=C["surface"], fg=C["warning"]).pack(anchor="w")
             tk.Label(warn,
                      text="Each file has its own set of shares. Save individual share files "
@@ -1075,13 +1106,14 @@ class EncryptorApp(tk.Toplevel):
                 FlatButton(sec_hdr, "Save individual files →",
                            lambda _p=out_path, _s=shares, _sec=sec: self._save_individual_shares(
                                _s, os.path.splitext(os.path.basename(_p))[0], qcx_path=_p, banner_frame=_sec),
-                           primary=True, small=True).pack(side="right")
+                           primary=True, small=False).pack(side="right")
                 # Share cards (collapsed — just the save button is enough for batch)
-                try:
-                    mnemonics = [_cc.share_to_mnemonic({**_cc.decode_share(s), "threshold": k})
-                                 for s in shares]
-                except Exception:
-                    mnemonics = [None] * len(shares)
+                mnemonics = []
+                for s in shares:
+                    try:
+                        mnemonics.append(_cc.share_to_mnemonic({**_cc.decode_share(s), "threshold": k}))
+                    except Exception:
+                        mnemonics.append(None)
                 for i, sh in enumerate(shares, 1):
                     mn = mnemonics[i-1] if i-1 < len(mnemonics) else None
                     ShareCard(sec, i, sh, mnemonic=mn).pack(fill="x", padx=8, pady=(0,6))
@@ -1099,7 +1131,7 @@ class EncryptorApp(tk.Toplevel):
         if idx is not None: self.after(0,self._prog.advance,idx,msg)
 
     def _run(self, p):
-        """Worker thread — v4 streaming: O(64 KB) RAM regardless of file size.
+        """Worker thread — streaming: O(64 KB) RAM regardless of file size.
         For folder inputs, zips the folder to a temp file first, then encrypts
         the zip.  The temp zip is always deleted before returning."""
         out = p["out"]; tmp = out + ".tmp"
@@ -1172,6 +1204,8 @@ class EncryptorApp(tk.Toplevel):
             if zip_tmp:
                 try: os.remove(zip_tmp)
                 except OSError: pass
+            # Clear password from worker params to reduce memory exposure
+            p["pw"] = None
 
     def _find_dec(self):
         if getattr(sys,"frozen",False): return sys.executable
@@ -1186,9 +1220,10 @@ class EncryptorApp(tk.Toplevel):
         self._busy=False; self._prog.complete(); self._thaw()
         # set_step past the last step index → all circles show ✓ (complete state)
         self._wiz.set_step(len(self.STEPS))
-        self._err.config(text="")                # UX-1: clear any stale busy/error message
-        self._pw1v.set(""); self._pw2v.set("")  # S2: clear passwords after success
+        self._err.config(text="")                # Clear any stale busy/error message
+        self._pw1v.set(""); self._pw2v.set("")  # Clear passwords after success
         self._match_lbl.config(text="")          # clear "✓ Passwords match" residue
+        notify("Encryption complete", os.path.basename(out))
 
         ok=tk.Frame(self._results,bg=C["surface"],highlightbackground=C["success"],highlightthickness=1)
         ok.pack(fill="x",pady=(14,12 if shares else 0))
@@ -1198,7 +1233,7 @@ class EncryptorApp(tk.Toplevel):
         except OSError:
             out_size = 0
         if embedded:
-            # Bug 4: use dec_size passed from _run (computed at write time)
+            # Use dec_size passed from _run (computed at write time)
             payload_size = out_size - dec_size
             size_label = (f"{fmt_size(out_size)}  ({fmt_size(dec_size)} decryptor + "
                           f"{fmt_size(max(0, payload_size))} data)")
@@ -1207,7 +1242,7 @@ class EncryptorApp(tk.Toplevel):
         tk.Label(ok_in,text="✓  Encrypted successfully",font=F["body_b"],bg=C["surface"],fg=C["success"]).pack(side="left")
         tk.Label(ok_in,text=size_label,font=F["caption"],bg=C["surface"],fg=C["text3"]).pack(side="right")
         tk.Label(ok,text=os.path.basename(out),font=F["mono"],bg=C["surface"],fg=C["text2"]).pack(anchor="w",padx=14,pady=(0,2))
-        # UX-12: confirm which source was encrypted
+        # Confirm which source was encrypted
         if self._path:
             src_label = (os.path.basename(self._path) + "/"
                          if self._is_folder else os.path.basename(self._path))
@@ -1217,22 +1252,22 @@ class EncryptorApp(tk.Toplevel):
             embed_lines = [
                 "Includes the decryptor — recipients can run this file directly on the same OS,",
                 "or open it via quantacrypt on any platform.",
-                # G2: recipients need execute permission
+                # Recipients need execute permission
                 f"Recipients may need to run  chmod +x {os.path.basename(out)}  before executing.",
-                # G16: OS security warnings
+                # OS security warnings
                 "If macOS blocks it, right-click → Open to bypass the security warning.",
             ]
             tk.Label(ok, text="\n".join(embed_lines),
                 font=F["caption"], bg=C["surface"], fg=C["text3"],
                 justify="left").pack(anchor="w", padx=14, pady=(0,8))
         else:
-            # Fix 13: informational note, not a warning — use text3 (gray) not warning (yellow)
+            # Informational note, not a warning — use text3 (gray) not warning (yellow)
             tk.Label(ok,text="Recipients will need the quantacrypt app to open this file.",
                 font=F["caption"],bg=C["surface"],fg=C["text3"],justify="left").pack(anchor="w",padx=14,pady=(0,8))
         btn_row=tk.Frame(ok,bg=C["surface"]); btn_row.pack(fill="x",padx=14,pady=(0,12))
         FlatButton(btn_row,"Encrypt another →",self._reset,primary=False,small=True).pack(side="left")
         FlatButton(btn_row,"Show in folder",lambda:_reveal(out),primary=False,small=True).pack(side="left",padx=(8,0))
-        # G-O: open the output file directly (mirrors G1 open-file on decrypt success)
+        # Open the output file directly (mirrors open-file on decrypt success)
         FlatButton(btn_row,"Open file",lambda:_reveal(out,open_file=True),primary=False,small=True).pack(side="left",padx=(8,0))
         if not shares:
             self.after(50, lambda: self._cv.yview_moveto(1.0))
@@ -1243,27 +1278,32 @@ class EncryptorApp(tk.Toplevel):
         self._shares_warn=tk.Frame(self._results,bg=C["surface"],highlightbackground=C["warning"],highlightthickness=1)
         warn = self._shares_warn
         warn.pack(fill="x",pady=(0,10))
-        w_in=tk.Frame(warn,bg=C["surface"]); w_in.pack(fill="x",padx=14,pady=(10,6))
-        tk.Label(w_in,text=f"Distribute all {n} shares. Any {k} can decrypt.",
-                 font=F["body_b"],bg=C["surface"],fg=C["warning"]).pack(side="left")
-        btn_grp = tk.Frame(w_in, bg=C["surface"]); btn_grp.pack(side="right")
+        # Summary text on its own row
+        tk.Label(warn, text=f"Send each person their share. Any {k} of {n} can unlock the file.",
+                 font=F["body_b"], bg=C["surface"], fg=C["warning"],
+                 anchor="w").pack(fill="x", padx=14, pady=(10,6))
+        # Buttons on a separate row so they don't overlap the text
+        btn_grp = tk.Frame(warn, bg=C["surface"]); btn_grp.pack(fill="x", padx=14, pady=(0,6))
         # Primary: save one file per person (new feature)
         FlatButton(btn_grp, "Save individual files →",
                    lambda: self._save_individual_shares(shares, os.path.basename(self._path or ""),
                                                         banner_frame=self._shares_warn),
-                   primary=True, small=True).pack(side="left")
+                   primary=True, small=False).pack(side="left")
         # Secondary: save all shares in one combined file (original behaviour)
-        FlatButton(btn_grp,"Save combined file",lambda:self._save_shares(shares,os.path.basename(self._path or "")),primary=False,small=True).pack(side="left",padx=(6,0))
-        # G-J: copy all shares to clipboard in one click
-        self._copy_all_btn = FlatButton(btn_grp,"Copy all",lambda:self._copy_all_shares(shares),primary=False,small=True)
-        self._copy_all_btn.pack(side="left",padx=(6,0))
+        FlatButton(btn_grp, "Save combined file",
+                   lambda: self._save_shares(shares, os.path.basename(self._path or "")),
+                   primary=False, small=False).pack(side="left", padx=(6,0))
+        # Copy all shares to clipboard in one click
+        self._copy_all_btn = FlatButton(btn_grp, "Copy all",
+                   lambda: self._copy_all_shares(shares), primary=False, small=True)
+        self._copy_all_btn.pack(side="left", padx=(6,0))
         # Clipboard timer label on its own row to avoid collision with share-count label
         timer_row = tk.Frame(warn, bg=C["surface"]); timer_row.pack(fill="x", padx=14, pady=(0,4))
         self._copy_all_clip_lbl = tk.Label(timer_row, text="", font=F["small"],
                                             bg=C["surface"], fg=C["text3"])
         self._copy_all_clip_lbl.pack(side="left")
         self._copy_all_timer = ClipboardTimer(self, self._copy_all_clip_lbl)
-        tk.Label(warn,text="Store your own copy somewhere safe. Recommended: test decryption before distributing.",
+        tk.Label(warn,text="Keep a backup of these shares somewhere safe. We recommend testing that you can unlock the file before sending shares to others.",
                  font=F["caption"],bg=C["surface"],fg=C["text3"],wraplength=500
                  ).pack(anchor="w",padx=14,pady=(0,10))
         try:
@@ -1271,13 +1311,35 @@ class EncryptorApp(tk.Toplevel):
             # decode_share returns {index, value, modulus} — no threshold field.
             # Without this injection, every mnemonic encodes threshold=0 and the
             # self-check in decryptor._collect_shares is always bypassed.
-            mnemonics = [cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k})
-                         for s in shares]
-        except Exception: mnemonics=[None]*len(shares)
+            mnemonics = []
+            for s in shares:
+                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
+        except Exception:
+            # Pad to full length so indexing below never fails
+            while len(mnemonics) < len(shares):
+                mnemonics.append(None)
         for i,sh in enumerate(shares,1):
             mn=mnemonics[i-1] if i-1<len(mnemonics) else None
             ShareCard(self._results,i,sh,mnemonic=mn).pack(fill="x",pady=(0,8))
-        # UX-8/9: force geometry to settle, then schedule cancellable scroll
+        # Next-steps checklist — guides non-technical users through what to do now
+        steps = tk.Frame(self._results, bg=C["surface"],
+                         highlightbackground=C["accent"], highlightthickness=1)
+        steps.pack(fill="x", pady=(4, 8))
+        tk.Label(steps, text="What to do next", font=F["body_b"],
+                 bg=C["surface"], fg=C["accent"]).pack(anchor="w", padx=14, pady=(10, 6))
+        checklist = [
+            f"1.  Save the shares using the buttons above (one file per person, or combined)",
+            f"2.  Send each person ONLY their own share — never share the others",
+            f"3.  Keep the encrypted .qcx file — it's safe to store anywhere",
+            f"4.  Test unlocking: collect {k} shares and try decrypting the file",
+            f"5.  Once confirmed, distribute shares to their holders",
+        ]
+        for line in checklist:
+            tk.Label(steps, text=line, font=F["caption"],
+                     bg=C["surface"], fg=C["text2"], anchor="w",
+                     wraplength=480, justify="left").pack(fill="x", padx=14, pady=1)
+        tk.Label(steps, text="", font=F["small"], bg=C["surface"]).pack(pady=(0, 8))
+        # Force geometry to settle, then schedule cancellable scroll
         self._body.update_idletasks()
         if self._scroll_job is not None:
             try: self.after_cancel(self._scroll_job)
@@ -1285,7 +1347,7 @@ class EncryptorApp(tk.Toplevel):
         self._scroll_job = self.after(150, lambda: self._cv.yview_moveto(1.0))
 
     def _copy_all_shares(self, shares):
-        """G-J: copy all share strings to the clipboard as one share per line."""
+        """Copy all share strings to the clipboard as one share per line."""
         try:
             self.clipboard_clear()
             self.clipboard_append("\n".join(shares))
@@ -1298,7 +1360,7 @@ class EncryptorApp(tk.Toplevel):
 
     def _reset(self):
         if not self._check_shares_saved(): return
-        # UX-9: cancel any pending scroll-to-bottom from _done
+        # Cancel any pending scroll-to-bottom from _done
         if self._scroll_job is not None:
             try: self.after_cancel(self._scroll_job)
             except Exception: pass
@@ -1311,7 +1373,7 @@ class EncryptorApp(tk.Toplevel):
         self._pw1v.set(""); self._pw2v.set("")
         self._pw1.config(show="•"); self._pw2.config(show="•")
         self._eye1_btn.config(text="Show"); self._eye2_btn.config(text="Show")
-        # G4: remember last-used mode and Shamir config across "Encrypt another"
+        # Remember last-used mode and Shamir config across "Encrypt another"
         last_mode = self._mode.get()
         last_n    = self._n.get()
         last_k    = self._k.get()
@@ -1321,26 +1383,28 @@ class EncryptorApp(tk.Toplevel):
         self._file_card.pack(fill="x", padx=self._P, after=self._src_toggle)   # ensure visible after batch mode
         self._batch_frame.pack_forget()
         if hasattr(self, "_batch_out_var"): self._batch_out_var.set("")
-        self._file_card.reset("Select a file to encrypt","Click anywhere · or drag & drop")  # A1: no destroy/recreate
+        self._file_card.reset("Select a file to encrypt","Click anywhere · or drag & drop")  # No destroy/recreate
         self._prog.pack_forget(); self._wiz.set_step(0)
         self._on_embed_toggle()
-        self.title("QuantaCrypt · Encrypt")  # U8
-        self.after(10, lambda: self._cv.yview_moveto(0))  # scroll back to top
-        # Fix 18: restore focus to file card so keyboard users have a clear starting point
+        self.title("QuantaCrypt · Encrypt")
+        self.after(10, lambda: self._cv.yview_moveto(0))  # Scroll back to top
+        # Restore focus to file card so keyboard users have a clear starting point
         self.after(20, self._file_card.focus_set)
 
     def _fail(self,msg):
         self._busy=False; self._prog.stop(); self._prog.pack_forget(); self._thaw(); self._wiz.set_step(4)
         if "No space left" in msg or "disk" in msg.lower():
-            self._err.config(text="Error: Not enough disk space to write the output file")
+            self._err.config(text="Not enough disk space. Free up some storage and try again.")
         elif "Permission" in msg or "Access is denied" in msg:
-            self._err.config(text="Error: Permission denied — cannot write to that location")
+            self._err.config(text="Can't write to that location — check permissions or choose a different output path.")
         elif "FileNotFoundError" in msg or "No such file" in msg:
-            self._err.config(text="Error: Source file not found (was it moved or deleted?)")
+            self._err.config(text="The source file was moved or deleted. Please re-select it and try again.")
+        elif "too large" in msg.lower() or "MemoryError" in msg:
+            self._err.config(text="File is too large to process. Try a smaller file or free up memory.")
         else:
-            self._err.config(text=f"Encryption failed: {msg}")
+            self._err.config(text="Something went wrong during encryption. Try a different output location or restart the app.")
         # Scroll to bottom so the error label is visible
-        self.after(50, lambda: self._cv.yview_moveto(1.0))  # UX-2: reflow delay
+        self.after(50, lambda: self._cv.yview_moveto(1.0))  # Reflow delay
 
     def _save_individual_shares(self, shares, orig, qcx_path=None, banner_frame=None):
         """Save each share as its own file in a chosen folder.
@@ -1372,16 +1436,17 @@ class EncryptorApp(tk.Toplevel):
                 with open(qcx_path, "rb") as fh:
                     fingerprint = hashlib.sha256(fh.read(65536)).hexdigest()[:12]
             except Exception: pass
-        try:
-            mnemonics = [cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k})
-                         for s in shares]
-        except Exception:
-            mnemonics = [None] * len(shares)
+        mnemonics = []
+        for s in shares:
+            try:
+                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
+            except Exception:
+                mnemonics.append(None)
         saved = []
         try:
             for i, s in enumerate(shares, 1):
                 fname = os.path.join(folder, f"{stem}.share-{i}-of-{n}.txt")
-                mn = mnemonics[i-1]
+                mn = mnemonics[i-1] if i-1 < len(mnemonics) else None
                 fp_line = (f"File fingerprint:  {fingerprint}...\n") if fingerprint else ""
                 with open(fname, "w") as f:
                     f.write(
@@ -1416,7 +1481,7 @@ class EncryptorApp(tk.Toplevel):
             if saved: self._shares_pending = False
             return
         self._shares_pending = False
-        # UX-M2: dim ShareCards (single-file mode — they live in self._results directly)
+        # Dim ShareCards (single-file mode — they live in self._results directly)
         if banner_frame is getattr(self, "_shares_warn", None):
             try:
                 for w in self._results.winfo_children():
@@ -1442,7 +1507,7 @@ class EncryptorApp(tk.Toplevel):
                          font=F["caption"], bg=C["surface"], fg=C["text3"],
                          anchor="w", justify="left").pack(fill="x", padx=14, pady=(0,10))
                 FlatButton(target, "Open folder",
-                           lambda: _reveal(saved[0]),
+                           lambda: _reveal(saved[0] if saved else folder),
                            primary=False, small=True).pack(anchor="w", padx=14, pady=(0,10))
         except Exception: pass
 
@@ -1452,9 +1517,12 @@ class EncryptorApp(tk.Toplevel):
             initialfile=os.path.splitext(orig)[0]+".shares.txt",defaultextension=".txt")
         if not p: return
         k=self._k.get(); n=self._n.get()
-        try: mnemonics=[cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k})
-                        for s in shares]
-        except Exception: mnemonics=[None]*len(shares)
+        mnemonics = []
+        for s in shares:
+            try:
+                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
+            except Exception:
+                mnemonics.append(None)
         # Compute a short fingerprint of the .qcx file to help match shares to file later
         qcx_ref = ""
         qcx_path = self._out.get().strip()
@@ -1466,12 +1534,12 @@ class EncryptorApp(tk.Toplevel):
                 qcx_ref = f"\nFile:      {os.path.basename(qcx_path)}\nFingerprint (SHA-256 prefix): {digest}..."
             except Exception:
                 qcx_ref = f"\nFile:      {os.path.basename(qcx_path)}"
-        # BUG-1: wrap the file write in try/except so a full disk or
+        # Wrap the file write in try/except so a full disk or
         # permission error doesn't leave _shares_pending=True forever, trapping
         # the user in an unsaved-shares dialog they can never clear.
         try:
             with open(p,"w") as f:
-                f.write(f"QuantaCrypt Shamir Shares\nThreshold: {k} of {n}{qcx_ref}\n{'='*60}\n\n")
+                f.write(f"QuantaCrypt Key Shares\nThreshold: {k} of {n}{qcx_ref}\n{'='*60}\n\n")
                 for i,s in enumerate(shares,1):
                     f.write(f"Share {i} — QCSHARE- code:\n{s}\n\n")
                     mn=mnemonics[i-1]
@@ -1493,7 +1561,7 @@ class EncryptorApp(tk.Toplevel):
                      bg=C["surface"], fg=C["success"]).pack(side="left")
             tk.Label(done_row, text=os.path.basename(p), font=F["caption"],
                      bg=C["surface"], fg=C["text3"]).pack(side="right")
-            # G-G: nudge the user to test decryption before distributing shares
+            # Nudge the user to test decryption before distributing shares
             tk.Label(self._shares_warn,
                      text="Recommended: test decryption with one share set before distributing.",
                      font=F["caption"], bg=C["surface"], fg=C["text3"],
