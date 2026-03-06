@@ -16,21 +16,22 @@ import base64
 import hashlib
 import hmac
 import json
-import math
 import os
+import secrets
 import time
 from typing import IO, Callable
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from argon2.low_level import hash_secret_raw, Type
-from kyber_py.kyber import Kyber768
+import math
 import shamirs
+from argon2.low_level import hash_secret_raw, Type
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from kyber_py.kyber import Kyber768
 
 KEY_BYTES          = 64
-ARGON2_TIME_COST   = 3
+ARGON2_TIME_COST = 4
 ARGON2_MEMORY_COST = 65536
 ARGON2_PARALLELISM = 1   # single lane: full 64MB per hash path (see OWASP Argon2id guidance)
 SHAMIR_PRIME       = (2 ** 521) - 1   # M521 Mersenne prime
@@ -84,7 +85,7 @@ def derive_aes_key(key_material: bytes) -> bytes:
     return hashlib.sha512(key_material).digest()[:32]
 
 def aes_gcm_encrypt(key_material: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
-    nonce = os.urandom(12)
+    nonce = secrets.token_bytes(12)
     ct    = AESGCM(derive_aes_key(key_material)).encrypt(nonce, plaintext, None)
     return nonce, ct
 
@@ -217,7 +218,7 @@ def stream_encrypt_payload(
     The plaintext hash is computed incrementally during encryption (zero extra I/O).
     dst_file must already be open and positioned correctly.
     """
-    base_nonce  = os.urandom(12)
+    base_nonce = secrets.token_bytes(12)
     aes_key     = derive_aes_key(final_key)
     cipher      = AESGCM(aes_key)
     chunk_count = 0
@@ -327,7 +328,7 @@ def encrypt_single_streaming(
     def _p(m): progress_cb and progress_cb(m)
     payload_size = os.path.getsize(src_path)
     _p("Deriving 512-bit password key (Argon2id)...")
-    argon_salt = os.urandom(16)
+    argon_salt = secrets.token_bytes(32)
     argon_key  = argon2id_derive(password.encode(), argon_salt)
     _p("Generating Kyber-768 keypair...")
     pk, sk = kyber_keygen()
@@ -382,7 +383,7 @@ def encrypt_shamir_streaming(
     def _p(m): progress_cb and progress_cb(m)
     payload_size = os.path.getsize(src_path)
     _p("Generating 512-bit random master key...")
-    master_key = os.urandom(KEY_BYTES)
+    master_key = secrets.token_bytes(KEY_BYTES)
     _p("Generating Kyber-768 keypair...")
     pk, sk = kyber_keygen()
     _p("Encapsulating + HKDF-SHA-512 expanding to 512 bits...")

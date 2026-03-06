@@ -396,7 +396,22 @@ def _codesign_app_bundle(app_path):
     """
     import glob
 
+    # TODO: Replace ad-hoc signing with Developer ID certificate for notarization.
+    #   1. Read identity from CODESIGN_IDENTITY env var (fall back to "-" for ad-hoc)
+    #   2. Add "--options runtime" flag (hardened runtime, required for notarization)
+    #   3. Add notarization + stapling steps to release.yml:
+    #        xcrun notarytool submit <dmg> --apple-id --password --team-id --wait
+    #        xcrun stapler staple <dmg>
+    #   4. GitHub secrets needed: DEVELOPER_ID_CERT_BASE64, DEVELOPER_ID_CERT_PASSWORD,
+    #      APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID
+    #   5. CI keychain setup: create temp keychain, import .p12, codesign, then clean up
+    identity = os.environ.get("CODESIGN_IDENTITY", "-")
+
     # 1. Sign all embedded .so, .dylib, and framework binaries
+    sign_cmd = ["codesign", "--force", "--sign", identity]
+    if identity != "-":
+        sign_cmd += ["--options", "runtime"]
+
     patterns = ["**/*.so", "**/*.dylib",
                 "**/*.bundle/Contents/MacOS/*",
                 "**/*.framework/Versions/*/Python",
@@ -407,7 +422,7 @@ def _codesign_app_bundle(app_path):
             if path in signed or not os.path.isfile(path):
                 continue
             subprocess.run(
-                ["codesign", "--force", "--sign", "-", path],
+                sign_cmd + [path],
                 capture_output=True, text=True,
             )
             signed.add(path)
@@ -416,17 +431,17 @@ def _codesign_app_bundle(app_path):
     main_exe = os.path.join(app_path, "Contents", "MacOS", NAME)
     if os.path.isfile(main_exe):
         subprocess.run(
-            ["codesign", "--force", "--sign", "-", main_exe],
+            sign_cmd + [main_exe],
             capture_output=True, text=True,
         )
 
     # 3. Sign the outer .app bundle
     result = subprocess.run(
-        ["codesign", "--force", "--sign", "-", app_path],
+        sign_cmd + [app_path],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
-        print("[+] Code signing succeeded")
+        print(f"[+] Code signing succeeded ({identity})")
     else:
         print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
 
