@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dnd = ["tkinterdnd2>=0.3"]
+dnd = ["tkinterdnd2-universal>=1.7"]
 strength = ["zxcvbn>=4.4"]
 build = ["pyinstaller>=6.0", "Pillow>=10.0"]
 dev = [

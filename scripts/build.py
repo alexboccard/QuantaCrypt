@@ -379,6 +379,54 @@ def _parse_args():
     return p.parse_args()
 
 
+def _codesign_app_bundle(app_path):
+    """Ad-hoc sign every binary inside the .app bundle, inside-out.
+
+    macOS requires consistent code signatures across all Mach-O binaries
+    in a bundle.  Embedded frameworks (e.g. Python.framework from
+    python.org) arrive with their own Team ID signature.  Ad-hoc re-signing
+    every binary with ``codesign --force --sign -`` strips the original
+    identity and replaces it with a uniform ad-hoc signature so macOS
+    won't reject the bundle for mismatched Team IDs.
+
+    Order matters: sign nested binaries first, then the main executable,
+    then the outer .app — otherwise the outer signature invalidates.
+    """
+    import glob
+
+    # 1. Sign all embedded .so, .dylib, and framework binaries
+    patterns = ["**/*.so", "**/*.dylib", "**/*.framework/Versions/*/Python",
+                "**/*.framework/Versions/*/*/*"]
+    signed = set()
+    for pat in patterns:
+        for path in glob.glob(os.path.join(app_path, pat), recursive=True):
+            if path in signed or not os.path.isfile(path):
+                continue
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", path],
+                capture_output=True, text=True,
+            )
+            signed.add(path)
+
+    # 2. Sign the main executable
+    main_exe = os.path.join(app_path, "Contents", "MacOS", NAME)
+    if os.path.isfile(main_exe):
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", main_exe],
+            capture_output=True, text=True,
+        )
+
+    # 3. Sign the outer .app bundle
+    result = subprocess.run(
+        ["codesign", "--force", "--sign", "-", app_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("[+] Code signing succeeded")
+    else:
+        print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
+
+
 def main():
     args = _parse_args()
     os.makedirs(DIST, exist_ok=True)
@@ -439,12 +487,14 @@ def main():
     cmd.append(os.path.join(PKG, "__main__.py"))
 
     print(f"\n{'='*60}\n  Building: {NAME}{SUF}  ({arch_label})\n{'='*60}")
-    # When cross-building x86_64 on Apple Silicon, wrap the PyInstaller
-    # subprocess with `arch -x86_64` so it and all its children run under
-    # Rosetta.  Without this, sys.executable spawns an arm64 process even
-    # if the outer script was invoked with `arch -x86_64`.
-    import platform
-    if target_arch == "x86_64" and platform.machine() == "arm64":
+    # When building for x86_64 on Apple Silicon (even under Rosetta),
+    # wrap the PyInstaller subprocess with `arch -x86_64`.  Child
+    # processes do NOT inherit the Rosetta constraint from their parent,
+    # so without this explicit wrapping PyInstaller would run as arm64.
+    # Note: we check for x86_64 target regardless of platform.machine()
+    # because under Rosetta, machine() reports "x86_64" even though the
+    # underlying hardware is arm64 and children would revert to arm64.
+    if target_arch == "x86_64":
         cmd = ["arch", "-x86_64"] + cmd
     result = subprocess.run(cmd, cwd=ROOT)
 
@@ -474,19 +524,14 @@ def main():
 
     # Ad-hoc code sign the .app bundle so macOS Gatekeeper shows the
     # standard "unidentified developer" dialog instead of "damaged".
-    # A paid Apple Developer ID would eliminate the warning entirely,
-    # but ad-hoc signing is sufficient for open-source distribution.
+    # We must sign from the inside out: first every embedded binary
+    # (frameworks, .so, .dylib), then the main executable, then the
+    # outer bundle.  Using just `--deep` is unreliable, and
+    # `--options runtime` (hardened runtime) requires matching Team IDs
+    # which breaks ad-hoc signing when embedded frameworks (like
+    # Python.framework from python.org) carry a different Team ID.
     print("[*] Ad-hoc code signing the .app bundle …")
-    sign_cmd = [
-        "codesign", "--force", "--deep", "--sign", "-",
-        "--options", "runtime",
-        out,
-    ]
-    sign_result = subprocess.run(sign_cmd, capture_output=True, text=True)
-    if sign_result.returncode == 0:
-        print("[+] Code signing succeeded")
-    else:
-        print(f"[!] Code signing failed (non-fatal): {sign_result.stderr.strip()}")
+    _codesign_app_bundle(out)
 
     # .app is a directory — report total size by walking it
     total = sum(

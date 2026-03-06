@@ -52,6 +52,12 @@ jobs:
       - name: Build .app and .dmg
         run: python scripts/build.py --arch arm64 --skip-tests
 
+      - name: Verify built binary is arm64
+        run: |
+          file dist/quantacrypt.app/Contents/MacOS/quantacrypt
+          file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "arm64" || { echo "ERROR: binary is not arm64!"; exit 1; }
+          echo "✓ Binary verified as arm64"
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -78,15 +84,43 @@ jobs:
           arch -x86_64 $PYTHON_BIN -c "import platform; assert platform.machine() == 'x86_64', f'Expected x86_64, got {platform.machine()}'"
           echo "✓ Python running as x86_64 under Rosetta"
 
-      - name: Install dependencies (x86_64)
-        run: arch -x86_64 $PYTHON_BIN -m pip install ".[dev]"
+      - name: Create x86_64 virtual environment
+        run: |
+          arch -x86_64 $PYTHON_BIN -m venv venv-x86
+          # Verify the venv Python is actually x86_64
+          arch -x86_64 venv-x86/bin/python -c "import struct; assert struct.calcsize('P') * 8 == 64; import platform; print(f'venv arch: {platform.machine()}')"
 
-      - name: Build .app and .dmg (x86_64)
-        run: arch -x86_64 $PYTHON_BIN scripts/build.py --arch x86_64 --skip-tests
+      - name: Install dependencies (x86_64)
+        run: |
+          arch -x86_64 venv-x86/bin/python -m pip install --upgrade pip
+          arch -x86_64 venv-x86/bin/python -m pip install ".[dev]"
         env:
-          # Force all child processes (PyInstaller, pip) to use x86_64
           ARCHFLAGS: "-arch x86_64"
           _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
+
+      - name: Verify C extensions are x86_64
+        run: |
+          # Confirm critical native extensions are the right architecture
+          arch -x86_64 venv-x86/bin/python -c "
+          import platform
+          assert platform.machine() == 'x86_64', f'Wrong arch: {platform.machine()}'
+          # Import all native C extensions to confirm they load under x86_64
+          from cryptography.hazmat.bindings._rust import _openssl
+          import argon2
+          print('✓ All native extensions loaded as x86_64')
+          "
+
+      - name: Build .app and .dmg (x86_64)
+        run: arch -x86_64 venv-x86/bin/python scripts/build.py --arch x86_64 --skip-tests
+        env:
+          ARCHFLAGS: "-arch x86_64"
+          _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
+
+      - name: Verify built binary is x86_64
+        run: |
+          file dist/quantacrypt.app/Contents/MacOS/quantacrypt
+          file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "x86_64" || { echo "ERROR: binary is not x86_64!"; exit 1; }
+          echo "✓ Binary verified as x86_64"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
