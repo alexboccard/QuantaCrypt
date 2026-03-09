@@ -41,6 +41,10 @@ Icon?
 .coverage.*
 htmlcov/
 
+# Claude working files (internal docs, memory, scratchpads)
+.claude/
+CLAUDE.md
+
 # Misc
 *.tmp
 BUG_REPORT.md

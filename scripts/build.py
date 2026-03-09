@@ -13,7 +13,9 @@ When encrypting with "Embed decryptor" ticked, the binary embeds itself
 into the .qcx file. No companion files needed — just the one binary.
 
 Usage:
-  python3 scripts/build.py          (from repo root)
+  python3 scripts/build.py                 (full build: tests → app → DMG)
+  python3 scripts/build.py --test-only     (run tests + coverage only)
+  python3 scripts/build.py --no-dmg        (build app bundle, skip DMG)
 """
 
 import io
@@ -378,6 +380,10 @@ def _parse_args():
                         "Intel and Apple Silicon.")
     p.add_argument("--skip-tests", action="store_true",
                    help="Skip the test suite (useful for CI split builds)")
+    p.add_argument("--test-only", action="store_true",
+                   help="Run tests and coverage only — skip the build entirely")
+    p.add_argument("--no-dmg", action="store_true",
+                   help="Build the .app bundle but skip DMG creation")
     return p.parse_args()
 
 
@@ -446,7 +452,7 @@ def _codesign_app_bundle(app_path):
         print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
 
 
-def _post_build(app_path, doc_icon_tmp, arch_label):
+def _post_build(app_path, doc_icon_tmp, arch_label, *, skip_dmg=False):
     """Install doc icon, patch plist, code-sign, create DMG, and print summary."""
     # Copy the document icon into the .app bundle's Resources directory
     # so macOS can find it for .qcx file thumbnails in Finder
@@ -483,7 +489,11 @@ def _post_build(app_path, doc_icon_tmp, arch_label):
     sz = total / 1_000_000
 
     # Create distributable DMG with drag-to-Applications layout
-    dmg_path = _create_dmg(app_path, arch_label)
+    dmg_path = None
+    if not skip_dmg:
+        dmg_path = _create_dmg(app_path, arch_label)
+    else:
+        print("[*] Skipping DMG creation (--no-dmg)")
 
     print(f"\n{'=' * 60}")
     print(f"  BUILD COMPLETE  ({arch_label})")
@@ -509,6 +519,9 @@ def main():
     # ── Gate: tests + coverage must pass before we build ──
     if not args.skip_tests:
         _run_tests()
+
+    if args.test_only:
+        return
 
     icon_args, icon_tmp = _build_icon()
     doc_icon_tmp = _build_doc_icon()
@@ -583,7 +596,8 @@ def main():
             os.remove(doc_icon_tmp)
         print("[!] Build failed"); sys.exit(1)
 
-    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label)
+    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label,
+                skip_dmg=args.no_dmg)
 
 
 if __name__ == "__main__":
