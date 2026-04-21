@@ -86,6 +86,22 @@ _JOURNAL_COMPACT_FLOOR = 8 << 20  # 8 MB
 _JOURNAL_MAX_HEADER_CT = 1 << 20  # 1 MB of encrypted header JSON is absurd
 _JOURNAL_MIN_HEADER_CT = 16       # at minimum, GCM tag
 
+def _validate_vpath(vpath: str) -> None:
+    """Reject non-absolute or traversal-containing virtual paths.
+
+    Mirrors the defensive check in :meth:`VolumeContainer.open` so that
+    direct callers (tests, scripts, future batch APIs) can't insert a
+    path into ``dir_index`` that would make the volume un-openable on
+    the next ``open()``.  Called from every mutating method and from the
+    journal replay.
+    """
+    if not isinstance(vpath, str) or not vpath.startswith("/"):
+        raise ValueError(f"vpath must be an absolute path starting with '/': {vpath!r}")
+    parts = [p for p in vpath.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError(f"vpath contains path traversal ('..'): {vpath!r}")
+
+
 # Offsets within the 512-byte header
 _OFF_MAGIC     = 0    # 6 bytes
 _OFF_VERSION   = 6    # 4 bytes (uint32 BE)
@@ -680,18 +696,12 @@ class VolumeContainer:
         # with the encrypted directory block on disk.  AES-GCM already catches
         # bit flips, but this is defense-in-depth.
         for vpath in self.dir_index:
-            if not vpath.startswith("/"):
+            try:
+                _validate_vpath(vpath)
+            except ValueError as exc:
                 raise ValueError(
-                    f"Directory entry has non-absolute path: {vpath!r} "
-                    "— the volume file may be corrupt or tampered with"
-                )
-            # Normalize and confirm no '..' segments survive
-            parts = [p for p in vpath.split("/") if p not in ("", ".")]
-            if any(p == ".." for p in parts):
-                raise ValueError(
-                    f"Directory entry contains path traversal: {vpath!r} "
-                    "— the volume file may be tampered with"
-                )
+                    f"{exc} — the volume file may be corrupt or tampered with"
+                ) from exc
 
         # Bounds-check each baseline file entry against the baseline size.
         # For v1 containers, baseline == entire data section (no journal).
@@ -759,8 +769,12 @@ class VolumeContainer:
         for header, body_offset, body_length in records:
             op_type = header.get("type")
             vpath = header.get("vpath")
-            if not isinstance(vpath, str) or not vpath.startswith("/"):
-                # Skip malformed records defensively; don't abort replay.
+            # Skip malformed records defensively; don't abort replay.
+            try:
+                if not isinstance(vpath, str):
+                    continue
+                _validate_vpath(vpath)
+            except ValueError:
                 continue
             if op_type == "write":
                 self.dir_index[vpath] = {
@@ -781,8 +795,13 @@ class VolumeContainer:
                 self.dir_index.pop(vpath, None)
             elif op_type == "rename":
                 new_vpath = header.get("new_vpath")
-                if (isinstance(new_vpath, str) and new_vpath.startswith("/")
-                        and vpath in self.dir_index):
+                if not isinstance(new_vpath, str):
+                    continue
+                try:
+                    _validate_vpath(new_vpath)
+                except ValueError:
+                    continue
+                if vpath in self.dir_index:
                     self.dir_index[new_vpath] = self.dir_index.pop(vpath)
             elif op_type == "mkdir":
                 # Directories are cheap to recreate on rmdir/mkdir cycles;
@@ -921,6 +940,7 @@ class VolumeContainer:
         The blob lives in _file_data until the next save(), which will
         append it to the journal region of the container (format v2+).
         """
+        _validate_vpath(vpath)
         nonce, blob, chunk_count, sha256_hex = encrypt_file_data(
             data, self.final_key, self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
         )
@@ -957,6 +977,7 @@ class VolumeContainer:
         """Create a virtual directory."""
         if not vpath.endswith("/"):
             vpath += "/"
+        _validate_vpath(vpath)
         if vpath in self.dir_index:
             return  # already exists
         mtime = int(time.time())
@@ -976,6 +997,7 @@ class VolumeContainer:
 
     def delete(self, vpath: str) -> None:
         """Remove a file or empty directory from the volume."""
+        _validate_vpath(vpath)
         if vpath not in self.dir_index:
             raise FileNotFoundError(f"No such entry: {vpath}")
         entry = self.dir_index[vpath]
@@ -997,6 +1019,8 @@ class VolumeContainer:
 
     def rename(self, old_path: str, new_path: str) -> None:
         """Rename a file or directory."""
+        _validate_vpath(old_path)
+        _validate_vpath(new_path)
         if old_path not in self.dir_index:
             raise FileNotFoundError(f"No such entry: {old_path}")
         if new_path in self.dir_index:
@@ -1085,54 +1109,71 @@ class VolumeContainer:
     def _coalesce_pending_ops(self) -> list[dict]:
         """Collapse redundant ops before emitting to the journal.
 
-        * If a path has multiple writes in the same session, only the last
-          write's body matters (``_file_data`` already holds only the
-          latest blob); emit a single write record.
-        * If a write is followed by a delete on the same path, drop the
-          write entirely — persisting an orphan write record with an empty
-          body would be invalid on crash-recovery (replay would see a
-          chunk_count>0 entry with a 0-byte blob).
-        * Similarly, a mkdir immediately followed by rmdir is a no-op.
+        Handles the common editor atomic-save pattern correctly:
+          * ``write /tmp`` + ``rename /tmp → /final`` → emit as a single
+            ``write /final`` (the blob is in ``_file_data['/final']`` after
+            the rename re-keyed it).  Emitting the write under ``/tmp``
+            would look up an empty blob and get silently dropped, losing
+            the data.
+          * ``write X`` + ``write X`` → keep only the last.
+          * ``write X`` + ``delete X`` → drop both.
+          * ``rename X → Y`` where ``X`` is a baseline path (not an
+            in-session write) → preserved as a rename record.
 
-        Returns the coalesced ops in the order they should be written.
-        Rename ops are preserved as-is — they're path-change edges in the
-        dependency graph, not content-change ops.
+        Returns the coalesced ops in the order they should be emitted.
         """
-        # Walk backwards: the last op for each path wins.  We track the
-        # final state per path and then replay the ops that matter.
-        last_effective: dict[str, dict] = {}
-        # Renames carry source + target; handle separately so we don't
-        # collapse /x→/y into a no-op when /y is later overwritten.
-        rename_chain: list[dict] = []
-        for op in self._pending_ops:
-            if op["type"] == "rename":
-                rename_chain.append(op)
-                continue
-            vpath = op["vpath"]
-            last_effective[vpath] = op
+        ops = self._pending_ops
+        # Map from "current effective path" → index of the in-session write
+        # op that produced that path.  Renames re-key this map; deletes
+        # remove from it.
+        current_owner: dict[str, int] = {}
+        # Indices of ops we should not emit (superseded writes, cancelled
+        # deletes, merged-away renames).
+        dropped: set[int] = set()
+        # For each write op index, its final effective vpath (may differ
+        # from the op's originally-recorded vpath if subsequent renames
+        # moved it).
+        write_final_path: dict[int, str] = {}
 
-        # Drop write+delete pairs: if the last op for a path is a delete /
-        # rmdir, and there was no rename of a different path INTO it, we
-        # can skip the delete for paths that never existed before this
-        # batch.  For simplicity we always emit the delete (it's cheap) but
-        # drop the preceding write (which would be garbage).
-        # The "last_effective" map already gives us this: we only emit the
-        # last op per path.
+        for i, op in enumerate(ops):
+            t = op["type"]
+            if t == "write":
+                vp = op["vpath"]
+                # Supersede any earlier in-session write for this path
+                if vp in current_owner:
+                    dropped.add(current_owner[vp])
+                current_owner[vp] = i
+                write_final_path[i] = vp
+            elif t == "rename":
+                old = op["vpath"]
+                new = op.get("new_vpath")
+                if old in current_owner and isinstance(new, str):
+                    # Re-key an in-session write: rewrite the write's vpath
+                    # and drop the rename record (no baseline file to move).
+                    idx = current_owner.pop(old)
+                    current_owner[new] = idx
+                    write_final_path[idx] = new
+                    dropped.add(i)
+                # else: rename operates on a baseline path — emit it as-is
+            elif t in ("delete", "rmdir"):
+                vp = op["vpath"]
+                if vp in current_owner:
+                    # Cancelling an in-session write — drop both ops.
+                    dropped.add(current_owner.pop(vp))
+                    dropped.add(i)
+                # else: delete of a baseline path — emit it as-is
+            # mkdir is emitted as-is; mkdir-then-rmdir coalescing would be
+            # a further refinement but is rarely worth complicating.
+
         coalesced: list[dict] = []
-        emitted: set[str] = set()
-        # Preserve the temporal order of rename records relative to writes /
-        # deletes: rebuild in original order, skipping ops that aren't the
-        # final effective op for their path.
-        for op in self._pending_ops:
-            if op["type"] == "rename":
-                coalesced.append(op)
+        for i, op in enumerate(ops):
+            if i in dropped:
                 continue
-            vpath = op["vpath"]
-            if vpath in emitted:
-                continue
-            if last_effective.get(vpath) is op:
-                coalesced.append(op)
-                emitted.add(vpath)
+            if op["type"] == "write" and i in write_final_path:
+                final = write_final_path[i]
+                if final != op["vpath"]:
+                    op = {**op, "vpath": final}
+            coalesced.append(op)
         return coalesced
 
     def _append_journal(self) -> None:

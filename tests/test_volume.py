@@ -844,6 +844,36 @@ class TestQuantaCryptFUSE:
         with pytest.raises(OSError):
             fuse_fs.getattr("/delete.txt")
 
+    def test_unlink_while_open_defers_delete(self, fuse_fs):
+        """POSIX unlink-while-open: the file stays accessible through
+        already-open fds until the last close, and writes on those fds
+        do NOT silently resurrect the file."""
+        fd = fuse_fs.create("/tmp.txt", 0o100644)
+        fuse_fs.write("/tmp.txt", b"initial", 0, fd)
+        fuse_fs.flush("/tmp.txt", fd)
+
+        # Unlink while still open — dir entry stays; path is in pending list.
+        fuse_fs.unlink("/tmp.txt")
+        assert "/tmp.txt" in fuse_fs._pending_unlink
+        # The file should still be openable via the original fd.
+        data = fuse_fs.read("/tmp.txt", 100, 0, fd)
+        assert data == b"initial"
+
+        # Write through the existing fd after unlink — the inode
+        # conceptually still exists, but the data must NOT persist to the
+        # volume (last close will free the inode).
+        fuse_fs.write("/tmp.txt", b"leaked", 0, fd)
+        fuse_fs.release("/tmp.txt", fd)
+
+        # Last release: the pending unlink fires.  Reopening must fail.
+        assert "/tmp.txt" not in fuse_fs._pending_unlink
+        with pytest.raises(OSError):
+            fuse_fs.open("/tmp.txt", 0)
+        # And a separate open at the original path must get ENOENT
+        # (no silent resurrection with the post-unlink write).
+        with pytest.raises(OSError):
+            fuse_fs.getattr("/tmp.txt")
+
     # ── rename ──
 
     def test_rename(self, fuse_fs):
@@ -1151,7 +1181,8 @@ class TestCheckFuseComponents:
         real_isdir = os.path.isdir
 
         def mock_isfile(p):
-            if p == "/usr/local/lib/libfuse-t.dylib":
+            if p in ("/usr/local/lib/libfuse-t.dylib",
+                     "/opt/homebrew/lib/libfuse-t.dylib"):
                 return False
             return real_isfile(p)
 
@@ -1168,14 +1199,34 @@ class TestCheckFuseComponents:
         assert result["fuse_backend"]["ok"] is True
         assert "macFUSE" in result["fuse_backend"]["detail"]
 
-    def test_fuse_backend_darwin_fuse_t(self, monkeypatch):
-        """Simulate macOS with FUSE-T installed."""
+    def test_fuse_backend_darwin_fuse_t_intel(self, monkeypatch):
+        """Simulate macOS with FUSE-T installed at the Intel Homebrew
+        prefix (/usr/local)."""
         monkeypatch.setattr("sys.platform", "darwin")
         real_isfile = os.path.isfile
 
         def mock_isfile(p):
             if p == "/usr/local/lib/libfuse-t.dylib":
                 return True
+            return real_isfile(p)
+
+        monkeypatch.setattr("os.path.isfile", mock_isfile)
+        result = check_fuse_components()
+        assert result["fuse_backend"]["ok"] is True
+        assert "FUSE-T" in result["fuse_backend"]["detail"]
+
+    def test_fuse_backend_darwin_fuse_t_apple_silicon(self, monkeypatch):
+        """Simulate macOS Apple Silicon: Homebrew installs FUSE-T at
+        /opt/homebrew/lib, not /usr/local.  Probing only /usr/local
+        previously told users on M-series Macs that FUSE-T was missing."""
+        monkeypatch.setattr("sys.platform", "darwin")
+        real_isfile = os.path.isfile
+
+        def mock_isfile(p):
+            if p == "/opt/homebrew/lib/libfuse-t.dylib":
+                return True
+            if p == "/usr/local/lib/libfuse-t.dylib":
+                return False
             return real_isfile(p)
 
         monkeypatch.setattr("os.path.isfile", mock_isfile)
@@ -1198,7 +1249,8 @@ class TestCheckFuseComponents:
         real_isdir = os.path.isdir
 
         def mock_isfile(p):
-            if p == "/usr/local/lib/libfuse-t.dylib":
+            if p in ("/usr/local/lib/libfuse-t.dylib",
+                     "/opt/homebrew/lib/libfuse-t.dylib"):
                 return False
             return real_isfile(p)
 
@@ -1455,6 +1507,49 @@ class TestMountVolumeNoFuse:
             mount_volume(path, key, mp)
 
 
+class TestMountVolumeStartup:
+    """Exercise the mount_volume startup gate: a FUSE() constructor that
+    raises must propagate synchronously instead of leaving a zombie entry
+    in _mounted_volumes that a later unmount_volume() would blindly hand
+    to diskutil/fusermount."""
+
+    def _make_key_and_path(self, tmp_dir, name):
+        path = os.path.join(tmp_dir, name)
+        pw = "mount-pw"
+        meta = vol.create_volume_single(path, pw)
+        key = vol.derive_volume_key_single(pw, meta)
+        return path, key
+
+    def test_failed_fuse_startup_does_not_register(self, tmp_dir, monkeypatch):
+        """If FUSE() raises inside the worker thread, mount_volume must
+        raise and _mounted_volumes must remain unchanged."""
+        # Pretend fusepy is importable but the FUSE constructor fails.
+        import types
+        fake_fuse_module = types.ModuleType("fuse")
+        class _FailingFuse:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("simulated FUSE startup failure")
+        fake_fuse_module.FUSE = _FailingFuse
+
+        import builtins
+        original_import = builtins.__import__
+        def mock_import(name, *args, **kwargs):
+            if name == "fuse":
+                return fake_fuse_module
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+
+        path, key = self._make_key_and_path(tmp_dir, "zombie.qcv")
+        mp = os.path.join(tmp_dir, "zmount")
+
+        before = dict(_mounted_volumes)
+        with pytest.raises(RuntimeError, match="FUSE mount failed"):
+            mount_volume(path, key, mp)
+        # No zombie entry — subsequent unmount would otherwise tear down
+        # whatever filesystem happened to be at mp.
+        assert dict(_mounted_volumes) == before
+
+
 # ── Auth params truncation tests ─────────────────────────────────────────────
 
 class TestAuthParamsTruncation:
@@ -1641,7 +1736,7 @@ class TestCorruptVolumeOpen:
         vc.compact()
 
         vc2 = vol.VolumeContainer(path, final_key)
-        with pytest.raises(ValueError, match="non-absolute path"):
+        with pytest.raises(ValueError, match="must be an absolute path"):
             vc2.open()
 
     def test_open_rejects_path_traversal_entry(self, tmp_dir):
@@ -1671,6 +1766,42 @@ class TestCorruptVolumeOpen:
         vc2 = vol.VolumeContainer(path, final_key)
         with pytest.raises(ValueError, match="path traversal"):
             vc2.open()
+
+
+class TestMutatingApiValidation:
+    """Mutating VolumeContainer APIs reject the same vpaths that open()
+    rejects — keeps writers from bricking a volume by inserting a path
+    that would fail the open()-time validation on the next mount."""
+
+    def _open(self, tmp_dir, name="val.qcv"):
+        path = os.path.join(tmp_dir, name)
+        pw = "val"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        return vc
+
+    def test_write_file_rejects_non_absolute(self, tmp_dir):
+        vc = self._open(tmp_dir, "w1.qcv")
+        with pytest.raises(ValueError, match="must be an absolute path"):
+            vc.write_file("relative/file.txt", b"x")
+
+    def test_write_file_rejects_traversal(self, tmp_dir):
+        vc = self._open(tmp_dir, "w2.qcv")
+        with pytest.raises(ValueError, match="path traversal"):
+            vc.write_file("/a/../b.txt", b"x")
+
+    def test_mkdir_rejects_traversal(self, tmp_dir):
+        vc = self._open(tmp_dir, "w3.qcv")
+        with pytest.raises(ValueError, match="path traversal"):
+            vc.mkdir("/foo/../bar")
+
+    def test_rename_rejects_traversal_in_target(self, tmp_dir):
+        vc = self._open(tmp_dir, "w4.qcv")
+        vc.write_file("/a.txt", b"x")
+        with pytest.raises(ValueError, match="path traversal"):
+            vc.rename("/a.txt", "/a/../escape.txt")
 
 
 class TestReadFileBounds:
@@ -1993,6 +2124,38 @@ class TestFormatV2Journal:
         # After compact, the volume is one big baseline with no journal.
         assert os.path.getsize(path) == vc._journal_start
         assert vc._baseline_size > (8 << 20)
+
+    def test_write_then_rename_persists_data(self, tmp_dir):
+        """Atomic-save pattern: write /tmp + rename /tmp -> /final + save
+        must leave /final readable on reopen.  Pre-fix, the rename re-keyed
+        _file_data but _pending_ops still referenced /tmp, so the journal
+        emitted an orphan write record with an empty body (skipped by the
+        guard) followed by a rename that hit a missing source (skipped in
+        replay) — silent data loss on every editor-style save."""
+        path, key = self._open(tmp_dir, "atomic.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/doc.tmp", b"precious data" * 100)
+        vc.rename("/doc.tmp", "/doc.txt")
+        vc.save()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert "/doc.tmp" not in vc2.dir_index
+        assert vc2.read_file("/doc.txt") == b"precious data" * 100
+
+    def test_write_rename_rewrite_keeps_last_content(self, tmp_dir):
+        """write A + rename A->B + write B (new content) = end state B."""
+        path, key = self._open(tmp_dir, "atomic2.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/tmp.txt", b"first")
+        vc.rename("/tmp.txt", "/final.txt")
+        vc.write_file("/final.txt", b"second")
+        vc.save()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/final.txt") == b"second"
+        assert "/tmp.txt" not in vc2.dir_index
 
     def test_replay_rejects_malformed_vpath(self, tmp_dir):
         """Replay skips records whose vpath is missing/non-absolute instead

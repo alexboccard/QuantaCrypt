@@ -72,9 +72,12 @@ def check_fuse_components() -> dict[str, dict[str, Any]]:
 
     # 2. System FUSE backend
     if sys.platform == "darwin":
-        # Check for FUSE-T (/usr/local/lib/libfuse-t.dylib) or
-        # macFUSE (/Library/Filesystems/macfuse.fs or osxfuse.fs)
-        has_fuse_t = os.path.isfile("/usr/local/lib/libfuse-t.dylib")
+        # Check for FUSE-T or macFUSE.  Homebrew installs to /opt/homebrew
+        # on Apple Silicon (M1+) and /usr/local on Intel; check both.
+        has_fuse_t = (
+            os.path.isfile("/opt/homebrew/lib/libfuse-t.dylib")
+            or os.path.isfile("/usr/local/lib/libfuse-t.dylib")
+        )
         has_macfuse = os.path.isdir("/Library/Filesystems/macfuse.fs")
         has_osxfuse = os.path.isdir("/Library/Filesystems/osxfuse.fs")
         if has_fuse_t:
@@ -172,6 +175,12 @@ class QuantaCryptFUSE:
         self._open_files: dict[int, str] = {}  # fd → vpath
         self._dirty_files: set[str] = set()
         self._file_buffers: dict[str, bytearray] = {}
+        # POSIX unlink-while-open semantics: if a path is unlinked while an
+        # fd is still open, the dir_index entry sticks around and the data
+        # stays readable via that fd until the last close.  This set tracks
+        # paths in that limbo state; release() performs the real delete
+        # when the last fd closes.
+        self._pending_unlink: set[str] = set()
 
     def _vpath(self, path: str) -> str:
         """Normalize FUSE path to volume path format."""
@@ -372,24 +381,30 @@ class QuantaCryptFUSE:
         vpath = self._vpath(path)
         with self._lock:
             if vpath in self._dirty_files:
-                buf = self._file_buffers.get(vpath, bytearray())
-                # One materialisation of the bytes — write_file takes the
-                # same object the cache gets, instead of allocating twice.
-                snapshot = bytes(buf)
-                self.volume.write_file(vpath, snapshot)
-                self.cache.put(vpath, snapshot)
+                # If the file was unlink()ed while still open, a write to
+                # its fd goes to the inode-that-no-longer-has-a-name and
+                # should NOT be persisted — the last close will drop it.
+                if vpath not in self._pending_unlink:
+                    buf = self._file_buffers.get(vpath, bytearray())
+                    # One materialisation of the bytes — write_file takes the
+                    # same object the cache gets, instead of allocating twice.
+                    snapshot = bytes(buf)
+                    self.volume.write_file(vpath, snapshot)
+                    self.cache.put(vpath, snapshot)
                 self._dirty_files.discard(vpath)
 
     def release(self, path: str, fh: int) -> None:
         """Close a file descriptor."""
         vpath = self._vpath(path)
         with self._lock:
-            # Flush if dirty
+            # Flush if dirty (but skip the persist for unlink-while-open;
+            # see flush() for why).
             if vpath in self._dirty_files:
-                buf = self._file_buffers.get(vpath, bytearray())
-                snapshot = bytes(buf)
-                self.volume.write_file(vpath, snapshot)
-                self.cache.put(vpath, snapshot)
+                if vpath not in self._pending_unlink:
+                    buf = self._file_buffers.get(vpath, bytearray())
+                    snapshot = bytes(buf)
+                    self.volume.write_file(vpath, snapshot)
+                    self.cache.put(vpath, snapshot)
                 self._dirty_files.discard(vpath)
 
             self._open_files.pop(fh, None)
@@ -401,11 +416,36 @@ class QuantaCryptFUSE:
             )
             if not still_open:
                 self._file_buffers.pop(vpath, None)
+                # If the last open fd for a deferred-unlink path just
+                # closed, perform the real delete now.
+                if vpath in self._pending_unlink:
+                    self._pending_unlink.discard(vpath)
+                    try:
+                        self.volume.delete(vpath)
+                    except FileNotFoundError:
+                        pass
+                    self.cache.invalidate(vpath)
+                    self._dirty_files.discard(vpath)
 
     def unlink(self, path: str) -> None:
-        """Delete a file."""
+        """Delete a file.
+
+        POSIX requires that an unlinked file remain accessible through any
+        still-open file descriptor until the last close ("delete on last
+        close").  Many editors and tools rely on this — they create a
+        temp file, unlink it immediately, then continue writing to the
+        fd to get automatic cleanup on crash.  If we eagerly delete on
+        every unlink we'd break that pattern AND (worse) silently
+        resurrect the file on the next release() when the still-open fd
+        flushes its buffer.
+        """
         vpath = self._vpath(path)
         with self._lock:
+            has_open_fd = any(v == vpath for v in self._open_files.values())
+            if has_open_fd:
+                # Defer — the last release() will do the actual delete.
+                self._pending_unlink.add(vpath)
+                return
             self.volume.delete(vpath)
             self._file_buffers.pop(vpath, None)
             self.cache.invalidate(vpath)
@@ -448,6 +488,15 @@ class QuantaCryptFUSE:
 # ── Mount / Unmount API ─────────────────────────────────────────────────────
 
 _mounted_volumes: dict[str, dict] = {}  # mount_point → {thread, volume, fuse_obj}
+# Serialises mount_volume() / unmount_volume() mutations of _mounted_volumes
+# so concurrent UI clicks or scripted mounts can't observe torn state.
+_mount_lock = threading.Lock()
+
+# How long mount_volume() waits for the FUSE worker to either successfully
+# start serving or fail synchronously.  If FUSE() raises (missing backend,
+# unwritable mount point, busy target) the thread dies inside this window
+# and we propagate the exception instead of registering a zombie mount.
+_FUSE_STARTUP_TIMEOUT = 2.0
 
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 
@@ -523,8 +572,12 @@ def mount_volume(
     """
     _ensure_shutdown_handlers()
 
-    # Prevent double-mounting the same volume file
     real_vol = os.path.realpath(volume_path)
+
+    # Fast-path double-mount guard (the lock-held re-check below is the
+    # race-safe guarantee).  Match the historical error order: this check
+    # runs before we touch fusepy, so a callers-reliable RuntimeError fires
+    # even in test environments where the FUSE backend isn't present.
     for mp, info in _mounted_volumes.items():
         if os.path.realpath(info["volume_path"]) == real_vol:
             raise RuntimeError(
@@ -550,13 +603,52 @@ def mount_volume(
     if foreground:
         FUSE(fuse_obj, mount_point, foreground=True, nothreads=True,
              allow_other=False, volname="QuantaCrypt")
-    else:
-        def _run():
+        return fuse_obj
+
+    # Background mount: wait for FUSE to either start serving or fail
+    # synchronously, and only register _mounted_volumes on success.
+    # Previously we registered unconditionally; a failed FUSE startup
+    # (missing FUSE-T, busy mount point, permission denied) left a zombie
+    # entry, and a later unmount_volume() would run diskutil / fusermount
+    # against a path we never actually mounted.
+    startup_error: list[BaseException] = []
+    ready = threading.Event()
+
+    def _run():
+        try:
             FUSE(fuse_obj, mount_point, foreground=True, nothreads=True,
                  allow_other=False, volname="QuantaCrypt")
+        except BaseException as exc:  # noqa: BLE001
+            startup_error.append(exc)
+        finally:
+            ready.set()
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    # A live FUSE() blocks serving requests; the thread staying alive past
+    # this window means the mount is up.  If the thread has already exited,
+    # FUSE() raised synchronously and we propagate.
+    ready.wait(timeout=_FUSE_STARTUP_TIMEOUT)
+    if not t.is_alive():
+        if startup_error:
+            raise RuntimeError(
+                f"FUSE mount failed: {startup_error[0]}"
+            ) from startup_error[0]
+        raise RuntimeError(
+            "FUSE worker thread exited before the mount was established"
+        )
+
+    # Atomic registration: re-check double-mount under the lock so two
+    # concurrent callers can't both pass the early guard and each install
+    # a tracker entry for the same volume file.
+    with _mount_lock:
+        for mp, info in _mounted_volumes.items():
+            if os.path.realpath(info["volume_path"]) == real_vol:
+                raise RuntimeError(
+                    f"Volume is already mounted at {mp}. "
+                    "Unmount it first before mounting again."
+                )
         _mounted_volumes[mount_point] = {
             "thread": t,
             "volume": vc,
@@ -579,19 +671,23 @@ def unmount_volume(mount_point: str) -> None:
     import subprocess
     import sys
 
-    info = _mounted_volumes.get(mount_point)
-    if info is None:
-        raise ValueError(
-            f"No QuantaCrypt volume is tracked at {mount_point!r} — "
-            "refusing to run unmount against a path we do not own"
-        )
+    with _mount_lock:
+        info = _mounted_volumes.get(mount_point)
+        if info is None:
+            raise ValueError(
+                f"No QuantaCrypt volume is tracked at {mount_point!r} — "
+                "refusing to run unmount against a path we do not own"
+            )
 
+    # Save state *before* removing from the dict so that if save_all_dirty()
+    # fails, _emergency_save_all can still find the volume for a retry.
     fuse_obj = info.get("fuse")
     if fuse_obj is not None:
         fuse_obj.save_all_dirty()
     elif info["volume"].is_dirty:
         info["volume"].save()
-    _mounted_volumes.pop(mount_point, None)
+    with _mount_lock:
+        _mounted_volumes.pop(mount_point, None)
 
     # Use platform-appropriate unmount
     if sys.platform == "darwin":
