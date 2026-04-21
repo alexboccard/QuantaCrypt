@@ -305,13 +305,17 @@ class QuantaCryptFUSE:
         with self._lock:
             self._open_files[fd] = vpath
 
-            # Load file data into buffer if not already cached
+            # Load file data into buffer if not already cached.
+            # Skip whole-plaintext SHA-256 on the FUSE hot path — per-chunk
+            # AES-GCM already authenticates the data.  Explicit integrity
+            # verification remains available via VolumeContainer.read_file(
+            # vpath, verify_hash=True) for callers that want it.
             if vpath not in self._file_buffers:
                 cached = self.cache.get(vpath)
                 if cached is not None:
                     self._file_buffers[vpath] = bytearray(cached)
                 else:
-                    data = self.volume.read_file(vpath)
+                    data = self.volume.read_file(vpath, verify_hash=False)
                     self._file_buffers[vpath] = bytearray(data)
                     self.cache.put(vpath, data)
 
@@ -323,8 +327,8 @@ class QuantaCryptFUSE:
         with self._lock:
             buf = self._file_buffers.get(vpath)
             if buf is None:
-                # Lazily load
-                data = self.volume.read_file(vpath)
+                # Lazy load; verify_hash=False on the hot path (see open()).
+                data = self.volume.read_file(vpath, verify_hash=False)
                 buf = bytearray(data)
                 self._file_buffers[vpath] = buf
         return bytes(buf[offset:offset + size])
@@ -352,7 +356,8 @@ class QuantaCryptFUSE:
         with self._lock:
             buf = self._file_buffers.get(vpath)
             if buf is None:
-                data = self.volume.read_file(vpath)
+                # Lazy load; verify_hash=False on the hot path (see open()).
+                data = self.volume.read_file(vpath, verify_hash=False)
                 buf = bytearray(data)
                 self._file_buffers[vpath] = buf
 

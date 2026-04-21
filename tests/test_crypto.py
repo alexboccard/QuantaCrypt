@@ -854,10 +854,20 @@ class TestMagicConstantImport:
         assert "from quantacrypt.core.crypto import" in src and "MAGIC" in src
 
     def test_quantacrypt_uses_cc_magic(self):
-        import importlib.util, pathlib
+        """__main__ inlines the .qcx magic bytes on purpose so that startup
+        can do a cheap self-payload probe WITHOUT importing core.crypto
+        (which pulls in argon2/kyber/cryptography — ~200-400 ms).
+        Verify the inlined value stays in sync with the canonical MAGIC."""
+        import importlib.util, pathlib, re
         spec = importlib.util.find_spec("quantacrypt.__main__")
         src = pathlib.Path(spec.origin).read_text()
-        assert 'MAGIC = b"QCBIN' not in src
+        match = re.search(r'_QCX_MAGIC\s*=\s*(b"[^"]*")', src)
+        assert match, "__main__.py must define _QCX_MAGIC for lazy-import probe"
+        inlined = eval(match.group(1))
+        assert inlined == cc.MAGIC, (
+            f"_QCX_MAGIC in __main__.py ({inlined!r}) is out of sync with "
+            f"cc.MAGIC ({cc.MAGIC!r}) — keep them identical."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

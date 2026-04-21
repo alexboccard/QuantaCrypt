@@ -491,11 +491,23 @@ class VolumeContainer:
         self.auth_params: dict = {}
         self.metadata: dict = {}
         self.dir_index: dict[str, dict] = {}
-        self._file_data: dict[str, bytes] = {}  # path → encrypted blob
+        # _file_data holds encrypted blobs for files that have been written
+        # (via write_file) or are pending save.  On open() we intentionally
+        # do NOT pre-load all blobs — unmodified files are read lazily from
+        # disk via _get_blob().  This keeps mount RAM bounded by the working
+        # set instead of the full container size.
+        self._file_data: dict[str, bytes] = {}
+        self._data_offset: int = 0
+        self._file_size: int = 0
         self._dirty = False
 
     def open(self) -> None:
         """Read and decrypt the volume header, metadata, and directory.
+
+        File data blobs are NOT read eagerly — they're loaded on demand by
+        read_file() so mount latency stays bounded regardless of container
+        size.  We only verify that each entry's offset+length falls within
+        the container (defense-in-depth; GCM catches the rest on read).
 
         Raises ``ValueError`` for corrupt or unreadable volumes, and
         wraps decryption failures with a user-friendly message hinting
@@ -507,9 +519,10 @@ class VolumeContainer:
             meta_ct = _read_encrypted_block(f)
             dir_ct = _read_encrypted_block(f)
             self._data_offset = f.tell()
-
-            # Read all file data blobs (rest of the file)
-            remaining = f.read()
+            # Record the container size so bounds checks don't require
+            # re-stat'ing the file on every _get_blob() call.
+            f.seek(0, 2)
+            self._file_size = f.tell()
 
         try:
             self.metadata = decrypt_metadata(
@@ -556,19 +569,47 @@ class VolumeContainer:
                     "— the volume file may be tampered with"
                 )
 
-        # Parse file data blobs by offset
+        # Bounds-check each file entry against the container size WITHOUT
+        # reading blobs.  Truncated containers are caught here; per-file
+        # corruption is caught on read by AES-GCM.
+        remaining_size = self._file_size - self._data_offset
         for vpath, entry in self.dir_index.items():
             if entry.get("type") == "dir":
                 continue
             offset = entry.get("data_offset", 0)
             length = entry.get("data_length", 0)
-            if offset + length > len(remaining):
+            if offset + length > remaining_size:
                 raise ValueError(
                     f"File data for {vpath} extends past end of volume "
-                    f"(offset {offset} + length {length} > {len(remaining)}) "
+                    f"(offset {offset} + length {length} > {remaining_size}) "
                     "— the volume file may be truncated or corrupt"
                 )
-            self._file_data[vpath] = remaining[offset:offset + length]
+
+    def _get_blob(self, vpath: str) -> bytes:
+        """Return the encrypted blob for *vpath*.
+
+        Prefers the in-memory write cache (`_file_data`) so freshly-written
+        files don't round-trip through disk, falls back to seek+read on the
+        container file for unmodified entries.  Returned bytes are NOT
+        cached — the FUSE layer maintains its own decrypted LRU, and we
+        don't want to grow _file_data unboundedly on pure-read workloads.
+        """
+        if vpath in self._file_data:
+            return self._file_data[vpath]
+        entry = self.dir_index[vpath]
+        length = entry.get("data_length", 0)
+        if length == 0:
+            return b""
+        offset = entry.get("data_offset", 0)
+        with open(self.path, "rb") as f:
+            f.seek(self._data_offset + offset)
+            blob = f.read(length)
+        if len(blob) < length:
+            raise ValueError(
+                f"File data for {vpath} is truncated on disk "
+                f"(expected {length} bytes, got {len(blob)})"
+            )
+        return blob
 
     def list_dir(self, dir_path: str = "/") -> list[str]:
         """List entries in a virtual directory."""
@@ -605,7 +646,6 @@ class VolumeContainer:
         if entry.get("type") == "dir":
             raise IsADirectoryError(f"Is a directory: {vpath}")
 
-        blob = self._file_data.get(vpath, b"")
         chunk_count = entry.get("chunk_count", 0)
         size = entry.get("size", 0)
         data_length = entry.get("data_length", 0)
@@ -626,19 +666,22 @@ class VolumeContainer:
                 f"bytes at chunk_size {chunk_size} would produce "
                 f"(max {max_expected_chunks}) — directory entry may be corrupt"
             )
-        # Declared data_length must match the on-disk blob; a mismatch
-        # indicates truncation or tampering that the hash check may miss.
+
+        if chunk_count == 0:
+            return b""
+
+        blob = self._get_blob(vpath)
+
+        # Declared data_length must match the on-disk / in-memory blob;
+        # a mismatch indicates truncation or tampering that the hash
+        # check may miss.
         if data_length != len(blob):
             raise ValueError(
                 f"data_length for {vpath} ({data_length}) does not match "
                 f"blob length ({len(blob)}) — directory entry may be corrupt"
             )
-
-        if not blob and chunk_count > 0:
+        if not blob:
             raise ValueError(f"File data missing for {vpath}")
-
-        if chunk_count == 0:
-            return b""
 
         plaintext = decrypt_file_data(
             blob, self.final_key,
@@ -727,40 +770,81 @@ class VolumeContainer:
         return self._dirty
 
     def save(self) -> None:
-        """Re-encrypt and write the entire volume back to disk."""
-        # Recompute data offsets
-        data_blobs = []
-        offset = 0
+        """Re-encrypt and write the entire volume back to disk.
+
+        Memory profile is bounded by the largest in-memory write buffer
+        (the largest blob in `_file_data`) plus a streaming copy window for
+        unmodified blobs read from the original container — NOT the total
+        container size.  Even a 10 GB volume saves with O(single-file RAM)
+        as long as recently-written files are modest.
+        """
+        # Capture OLD offsets before overwriting them in the dir_index;
+        # we need them to copy unmodified blobs from the current file.
+        old_offsets = {
+            vp: e.get("data_offset", 0)
+            for vp, e in self.dir_index.items()
+            if e.get("type") != "dir"
+        }
+        old_data_offset = self._data_offset
+
+        # Pass 1: update offsets + lengths in dir_index.  For modified files
+        # data_length is already set by write_file; for unmodified ones it
+        # was established at open() and is preserved from the current entry.
+        new_offset = 0
         for vpath in sorted(self.dir_index):
             entry = self.dir_index[vpath]
             if entry.get("type") == "dir":
                 continue
-            blob = self._file_data.get(vpath, b"")
-            entry["data_offset"] = offset
-            entry["data_length"] = len(blob)
-            data_blobs.append(blob)
-            offset += len(blob)
+            if vpath in self._file_data:
+                entry["data_length"] = len(self._file_data[vpath])
+            length = entry.get("data_length", 0)
+            entry["data_offset"] = new_offset
+            new_offset += length
 
-        # Re-encrypt metadata and directory
+        # Re-encrypt metadata and directory (cheap; ~KB of JSON)
         meta_nonce, meta_ct = encrypt_metadata(self.final_key, self.metadata)
         dir_nonce, dir_ct = encrypt_directory(self.final_key, self.dir_index)
 
-        # Write atomically: write to temp, then rename.
-        # On disk-full or I/O error the temp file is cleaned up so we
-        # never leave a partial .tmp beside the original volume.
+        # Pass 2: stream to .tmp.  On disk-full / I/O error the temp file
+        # is cleaned up so we never leave a partial .tmp beside the original.
         tmp_path = self.path + ".tmp"
+        _COPY_CHUNK = 1 << 20  # 1 MB sliding window for unmodified blobs
         try:
-            with open(tmp_path, "wb") as f:
-                write_header(f, self.header["volume_id"], meta_nonce, dir_nonce)
-                _write_auth_params(f, self.auth_params)
-                _write_encrypted_block(f, meta_ct)
-                _write_encrypted_block(f, dir_ct)
-                for blob in data_blobs:
-                    f.write(blob)
-                f.flush()
-                os.fsync(f.fileno())
+            with open(tmp_path, "wb") as tmp_f:
+                write_header(tmp_f, self.header["volume_id"], meta_nonce, dir_nonce)
+                _write_auth_params(tmp_f, self.auth_params)
+                _write_encrypted_block(tmp_f, meta_ct)
+                _write_encrypted_block(tmp_f, dir_ct)
+                new_data_offset = tmp_f.tell()
+
+                # Open the current container read-only to copy unmodified
+                # blobs.  os.replace() below atomically swaps it; any open
+                # descriptor still refers to the old inode until it closes.
+                with open(self.path, "rb") as src_f:
+                    for vpath in sorted(self.dir_index):
+                        entry = self.dir_index[vpath]
+                        if entry.get("type") == "dir":
+                            continue
+                        length = entry.get("data_length", 0)
+                        if length == 0:
+                            continue
+                        if vpath in self._file_data:
+                            tmp_f.write(self._file_data[vpath])
+                        else:
+                            src_f.seek(old_data_offset + old_offsets[vpath])
+                            remaining = length
+                            while remaining > 0:
+                                chunk = src_f.read(min(remaining, _COPY_CHUNK))
+                                if not chunk:
+                                    raise ValueError(
+                                        f"Volume file truncated while copying "
+                                        f"unmodified blob for {vpath}"
+                                    )
+                                tmp_f.write(chunk)
+                                remaining -= len(chunk)
+                tmp_f.flush()
+                os.fsync(tmp_f.fileno())
         except BaseException:
-            # Clean up partial temp file on any error (disk full, etc.)
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -769,9 +853,15 @@ class VolumeContainer:
 
         os.replace(tmp_path, self.path)
 
-        # Update header nonces for next open
+        # Update state for continued use.  _file_data is cleared because all
+        # blobs now live canonically on disk at the new offsets; future reads
+        # go through _get_blob() which will seek-read them fresh.
+        self._data_offset = new_data_offset
+        # Re-stat to pick up the new file size for bounds checks.
+        self._file_size = os.path.getsize(self.path)
         self.header["meta_nonce"] = meta_nonce
         self.header["dir_nonce"] = dir_nonce
+        self._file_data.clear()
         self._dirty = False
 
     def stat(self) -> dict:

@@ -1670,6 +1670,65 @@ class TestReadFileBounds:
             vc.read_file("/f.txt")
 
 
+class TestLazyBlobLoad:
+    """Exercise the lazy-blob path: files written, saved, then read via
+    seek-from-disk rather than _file_data cache."""
+
+    def test_reopen_reads_from_disk(self, tmp_dir):
+        path = os.path.join(tmp_dir, "lazy.qcv")
+        pw = "lazypw"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+
+        # Write two files, save, then close.
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.write_file("/a.txt", b"alpha" * 100)
+        vc.write_file("/b.txt", b"beta" * 100)
+        vc.save()
+
+        # Reopen: _file_data should be empty (lazy).
+        vc2 = vol.VolumeContainer(path, final_key)
+        vc2.open()
+        assert vc2._file_data == {}, (
+            "open() should not pre-populate _file_data — blobs are lazy-loaded"
+        )
+
+        # Reading should seek from disk and return the original plaintext.
+        assert vc2.read_file("/a.txt") == b"alpha" * 100
+        assert vc2.read_file("/b.txt") == b"beta" * 100
+
+    def test_save_copies_unmodified_blobs_from_disk(self, tmp_dir):
+        """After reopen, add one new file and save — unmodified blobs are
+        copied straight from the old container without being held in RAM."""
+        path = os.path.join(tmp_dir, "mixed.qcv")
+        pw = "mixpw"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.write_file("/old1.txt", b"OLD" * 1000)
+        vc.write_file("/old2.txt", b"OLD2" * 1000)
+        vc.save()
+
+        # Reopen and add a new file; do NOT touch the existing ones.
+        vc2 = vol.VolumeContainer(path, final_key)
+        vc2.open()
+        vc2.write_file("/new.txt", b"NEW" * 500)
+        # Only the newly-written file is in _file_data; save must stream
+        # the other two from disk.
+        assert set(vc2._file_data.keys()) == {"/new.txt"}
+        vc2.save()
+
+        # After save, _file_data is cleared and the volume still reads
+        # all three files correctly.
+        assert vc2._file_data == {}
+        assert vc2.read_file("/old1.txt") == b"OLD" * 1000
+        assert vc2.read_file("/old2.txt") == b"OLD2" * 1000
+        assert vc2.read_file("/new.txt") == b"NEW" * 500
+
+
 # ── Graceful shutdown tests ─────────────────────────────────────────────────
 
 import signal

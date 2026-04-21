@@ -291,6 +291,7 @@ def stream_decrypt_payload(
     aes_key = derive_aes_key(final_key)
     cipher  = AESGCM(aes_key)
     content_hash = hashlib.sha256()
+    last_report = 0.0
 
     with open(src_path, "rb") as src:
         src.seek(payload_offset)
@@ -320,9 +321,14 @@ def stream_decrypt_payload(
                 )
             content_hash.update(plain)
             dst_file.write(plain)
-            if progress_cb:
+            # Throttle progress callbacks to ~1% intervals to avoid
+            # flooding the Tk event queue on large files (especially
+            # volume files decrypted at 64 KB granularity).
+            if progress_cb and chunk_count:
                 pct = (i + 1) / chunk_count
-                progress_cb(f"Decrypting payload (AES-256-GCM)... {int(pct*100)}%")
+                if pct - last_report >= 0.01 or i + 1 == chunk_count:
+                    progress_cb(f"Decrypting payload (AES-256-GCM)... {int(pct*100)}%")
+                    last_report = pct
 
     return content_hash.hexdigest()
 

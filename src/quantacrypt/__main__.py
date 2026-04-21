@@ -20,13 +20,43 @@ if getattr(sys, "frozen", False):
 else:
     _base = os.path.dirname(os.path.abspath(__file__))
 
-from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
+# NOTE: we deliberately do NOT import quantacrypt.ui.decryptor at module top.
+# That import transitively pulls in core.crypto (argon2, kyber_py, cryptography),
+# ~200–400 ms of startup cost on macOS.  The common path — user launches the
+# app to open the launcher — never needs the decryptor.  Defer to the branches
+# that actually use it.
 
 # Apple Events can fire concurrently if the user drops multiple files on the
 # dock icon in quick succession.  Without a lock, two invocations can each
 # create wizards that race on the same underlying file.  The lock makes each
 # event handle its paths to completion before the next one starts.
 _open_document_lock = threading.Lock()
+
+# .qcx magic bytes — inlined so we can detect self-executing payloads
+# without importing core.crypto at startup.  Keep in sync with
+# quantacrypt.core.crypto.MAGIC.
+_QCX_MAGIC = b"QCBIN\x01"
+_QCX_TAIL_SCAN = 1 << 20  # 1 MB window at the end of the file
+
+
+def _binary_has_qcx_payload(path: str) -> bool:
+    """Cheap magic-bytes probe: does *path* look like a self-executing .qcx?
+
+    We only need to decide whether to import the heavyweight decryptor stack;
+    the full parse happens inside load_pkg() once we know it's worth it.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    tail = min(size, _QCX_TAIL_SCAN)
+    try:
+        with open(path, "rb") as f:
+            f.seek(size - tail)
+            buf = f.read(tail)
+    except OSError:
+        return False
+    return _QCX_MAGIC in buf
 
 
 def _register_open_document(root):
@@ -54,8 +84,10 @@ def _register_open_document(root):
                         # doesn't wedge; the user can retry via the launcher.
                         pass
                     continue
-                # .qcx → Decryptor
+                # .qcx → Decryptor (lazy import: first Apple Event pays the
+                # crypto-stack import cost; subsequent events are free).
                 try:
+                    from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
                     pkg = load_pkg(path)
                 except (ValueError, OSError):
                     continue
@@ -115,16 +147,20 @@ def main():
     root = _make_root()
     _register_open_document(root)
 
-    # Case 1: self-executing .qcx (binary with payload appended)
+    # Case 1: self-executing .qcx (binary with payload appended).
+    # Do a cheap magic-bytes probe first so the common (non-self-payload)
+    # binary doesn't pay the cost of importing the decryptor stack here.
     exe = sys.executable if getattr(sys, "frozen", False) else __file__
-    try:
-        self_payload = load_pkg(exe)
-    except (ValueError, OSError):
-        self_payload = None
-    if self_payload:
-        DecryptorApp(root, payload=self_payload, qcx_path=exe)
-        root.mainloop()
-        return
+    if _binary_has_qcx_payload(exe):
+        from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
+        try:
+            self_payload = load_pkg(exe)
+        except (ValueError, OSError):
+            self_payload = None
+        if self_payload:
+            DecryptorApp(root, payload=self_payload, qcx_path=exe)
+            root.mainloop()
+            return
 
     # Case 2: .qcx path passed as argument
     if len(sys.argv) > 1:
@@ -157,6 +193,7 @@ def main():
                 return
 
             # Case 2b: .qcx encrypted file → Decryptor
+            from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
             try:
                 pkg = load_pkg(arg)
             except (ValueError, OSError) as e:
