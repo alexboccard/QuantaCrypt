@@ -710,6 +710,13 @@ class DecryptorApp(tk.Toplevel):
         self._err.pack(fill="x", padx=P, pady=(0,8))
 
         self._prog = StagedProgressBar(b, [(n,w) for n,w,_ in STAGES])
+        # Cancel button row shown alongside the progress bar while busy.
+        self._cancel_row = tk.Frame(b, bg=C["bg"])
+        self._cancel_btn = FlatButton(
+            self._cancel_row, "Cancel", self._request_cancel,
+            primary=False, small=True,
+        )
+        self._cancel_btn.pack(side="right")
         self._results = tk.Frame(b, bg=C["bg"]); self._results.pack(fill="x", padx=P)
         # keyboard shortcut hint
         tk.Label(b, text="Ctrl+O  Open file  ·  Ctrl+↵  Decrypt",
@@ -1073,7 +1080,10 @@ class DecryptorApp(tk.Toplevel):
             return
         out = self._out.get().strip()
         self._err.config(text=""); self._busy=True
+        self._cancel = False
         self._prog.pack(fill="x", padx=P, pady=(0,4), before=self._results)
+        self._cancel_row.pack(fill="x", padx=P, pady=(0, 6), before=self._results)
+        self._cancel_btn.enable(True)
         self._prog.start(); self._freeze(); self._wiz.set_step(2)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -1153,8 +1163,14 @@ class DecryptorApp(tk.Toplevel):
             # Derive final_key from whichever credential mode was used
             if self._mode_val == "single":
                 self.after(0, self._prog.advance, 0, "Verifying your password...")
-                argon_key = cc.argon2id_derive(pw_captured.encode(),
-                                               _b64.b64decode(meta["argon_salt"]))
+                # Encode to bytes and drop the str reference right away.
+                # Python can't actively zero strings, but releasing the only
+                # reference lets the GC reclaim the memory; the bytes object
+                # is harder to spot in a heap dump.
+                pw_bytes = pw_captured.encode()
+                pw_captured = None  # noqa: F841 — release str reference
+                argon_key = cc.argon2id_derive(pw_bytes, _b64.b64decode(meta["argon_salt"]))
+                del pw_bytes
                 self.after(0, self._prog.advance, 1, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(argon_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
@@ -1185,12 +1201,23 @@ class DecryptorApp(tk.Toplevel):
             self.after(0, self._prog.advance, 4, "Decrypting your file...")
             with open(tmp, "wb") as f:
                 fname, sz, ts = cc.decrypt_streaming(
-                    self._qcx_path, f, meta, final_key, progress_cb=self._prog_cb)
+                    self._qcx_path, f, meta, final_key,
+                    progress_cb=self._prog_cb,
+                    cancel_check=lambda: self._cancel)
             out_size = os.path.getsize(tmp)
 
             # Build the final output path from the original filename stored in
-            # the payload.  Fall back to a generic name if fname is absent.
-            orig_basename = os.path.basename(fname) if fname else "decrypted"
+            # the payload.  basename() already blocks path traversal; also
+            # strip null bytes and control characters that would land in the
+            # filesystem as invisible / unusable filenames, and fall back to
+            # a generic name if nothing usable remains.
+            orig_basename = os.path.basename(fname) if fname else ""
+            orig_basename = "".join(
+                ch for ch in orig_basename
+                if ch.isprintable() and ch not in ("/", "\0")
+            ).strip().strip(".")
+            if not orig_basename:
+                orig_basename = "decrypted"
             out = os.path.join(out_dir, orig_basename)
             root, ext = os.path.splitext(orig_basename)
             n = 2
@@ -1202,6 +1229,10 @@ class DecryptorApp(tk.Toplevel):
             if self._mode_val == "single":
                 self.after(0, self._clear_pw)
             self.after(0, self._done, out, out_size, fname, sz, ts)
+        except cc.CancelledOperation:
+            try: os.remove(tmp)
+            except OSError: pass
+            self.after(0, self._cancelled)
         except Exception as ex:
             try: os.remove(tmp)
             except OSError: pass
@@ -1268,8 +1299,10 @@ class DecryptorApp(tk.Toplevel):
             meta = self._meta
             if self._mode_val == "single":
                 self.after(0, self._prog.advance, 0, "Verifying your password...")
-                argon_key = cc.argon2id_derive(pw_captured.encode(),
-                                               _b64.b64decode(meta["argon_salt"]))
+                pw_bytes = pw_captured.encode()
+                pw_captured = None  # noqa: F841 — release str reference
+                argon_key = cc.argon2id_derive(pw_bytes, _b64.b64decode(meta["argon_salt"]))
+                del pw_bytes
                 self.after(0, self._prog.advance, 1, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(argon_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
@@ -1361,7 +1394,7 @@ class DecryptorApp(tk.Toplevel):
             self._load_payload()
 
     def _done(self, path, size, fname="", sz=0, ts=0):
-        self._busy=False; self._prog.complete(); self._thaw()
+        self._busy=False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
         # Immediately disable the Decrypt button — _thaw() re-enables it,
         # but on success it must stay disabled until "Decrypt another" is clicked.
         # Doing this before building the card avoids a visible flash of the enabled state.
@@ -1489,9 +1522,33 @@ class DecryptorApp(tk.Toplevel):
         self.after(10, lambda: self._cv.yview_moveto(0))
         self.after(20, self._file_card.focus_set)  # Restore focus after reset
 
+    def _request_cancel(self):
+        """User hit Cancel — flag the worker; it raises CancelledOperation
+        at the next chunk boundary."""
+        if not self._busy:
+            return
+        self._cancel = True
+        try:
+            self._cancel_btn.enable(False)
+        except Exception:
+            pass
+        self._err.config(text="Cancelling — finishing the current chunk…")
+
+    def _cancelled(self):
+        """Post-cancel UI reset."""
+        self._busy = False
+        self._cancel = False
+        self._tmp_path = None
+        self._prog.stop()
+        self._prog.pack_forget()
+        self._cancel_row.pack_forget()
+        self._thaw()
+        self._wiz.set_step(2)
+        self._err.config(text="Decryption cancelled — no output was written.")
+
     def _fail(self, msg):
         self._busy=False; self._cancel=False; self._tmp_path=None
-        self._prog.stop(); self._prog.pack_forget(); self._thaw()
+        self._prog.stop(); self._prog.pack_forget(); self._cancel_row.pack_forget(); self._thaw()
         self._wiz.set_step(2)  # stay at Decrypt step — error is shown there
         if "InvalidTag" in msg:
             hint = ("Wrong password — please re-enter and try again."

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """QuantaCrypt Launcher — home screen for the combined binary."""
 import os
+import sys
 import tkinter as tk
 
 from quantacrypt import __version__
 from quantacrypt.ui.shared import (
     C, F, UI,
-    fmt_size, rule,
+    fmt_size, rule, friendly_error,
     FlatButton, RecentFiles,
 )
 
@@ -40,15 +41,31 @@ class LauncherApp(tk.Toplevel):
         # Check for updates in the background (non-blocking)
         from quantacrypt.ui.updater import check_for_update
         check_for_update(self, __version__)
-        # Keyboard shortcuts: Ctrl+E → Encrypt, Ctrl+D → Decrypt, Ctrl+I → Inspect
-        self.bind("<Control-e>", lambda e: self._open_encryptor())
-        self.bind("<Control-E>", lambda e: self._open_encryptor())
-        self.bind("<Control-d>", lambda e: self._open_decryptor())
-        self.bind("<Control-D>", lambda e: self._open_decryptor())
-        self.bind("<Control-i>", lambda e: self._inspect_file())
-        self.bind("<Control-I>", lambda e: self._inspect_file())
-        # Escape quits the app
+        # Keyboard shortcuts.  Bind both the Ctrl+ variant (Linux/Win
+        # convention) and the Cmd+ variant (macOS convention); Tk on
+        # macOS maps Cmd to Meta/Command, so binding both gives users
+        # either a platform-native or familiar shortcut.
+        _shortcuts = {
+            "e": self._open_encryptor,
+            "E": self._open_encryptor,
+            "d": self._open_decryptor,
+            "D": self._open_decryptor,
+            "i": self._inspect_file,
+            "I": self._inspect_file,
+            "v": self._open_volumes,
+            "V": self._open_volumes,
+        }
+        for key, handler in _shortcuts.items():
+            self.bind(f"<Control-{key}>", lambda e, h=handler: h())
+            if sys.platform == "darwin":
+                self.bind(f"<Command-{key}>", lambda e, h=handler: h())
+        # Escape quits the app; Cmd+W closes the window (macOS convention)
         self.bind("<Escape>", lambda e: self.master.destroy())
+        if sys.platform == "darwin":
+            self.bind("<Command-w>", lambda e: self.master.destroy())
+            self.bind("<Command-W>", lambda e: self.master.destroy())
+            self.bind("<Command-q>", lambda e: self.master.destroy())
+            self.bind("<Command-Q>", lambda e: self.master.destroy())
         self.protocol("WM_DELETE_WINDOW", self.master.destroy)
         # Drag-and-drop: drop a .qcx → open decryptor
         if _DND_FILES:
@@ -66,8 +83,36 @@ class LauncherApp(tk.Toplevel):
             raw = event.data.strip()
             if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
             paths = [raw.split("} {")[0]]
-        if paths and os.path.isfile(paths[0]):
-            self._open_qcx(paths[0])
+        # Accept any combination of .qcx / .qcv files dropped together.
+        # Previously we only honoured paths[0] and silently lost the rest;
+        # for multi-file drops this looked like an app bug.  We only open
+        # one wizard window at a time (the remaining paths queue behind
+        # the first on the Tk event loop via after()).
+        accepted = [
+            p for p in paths
+            if os.path.isfile(p)
+            and os.path.splitext(p)[1].lower() in (".qcx", ".qcv")
+        ]
+        if not accepted:
+            return
+
+        def _dispatch(path: str):
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".qcv":
+                self._open_volumes(volume_path=path)
+            else:
+                self._open_qcx(path)
+
+        # Multi-drop policy: every accepted path opens its own wizard
+        # window (same pattern as Finder's "Open With..." on multi-select).
+        # The after(1, ...) just yields back to the Tk event loop between
+        # dispatches so constructors don't all fire in one tick — it does
+        # NOT wait for the first wizard to close.  If a future release
+        # wants a true serial queue (open-then-close-then-next), thread
+        # the chain through each wizard's on_close callback.
+        _dispatch(accepted[0])
+        for extra in accepted[1:]:
+            self.after(1, lambda p=extra: _dispatch(p))
 
     def _center(self):
         self.update_idletasks()
@@ -118,13 +163,28 @@ class LauncherApp(tk.Toplevel):
         cards.columnconfigure(0, weight=1, minsize=220)
         cards.columnconfigure(1, weight=1, minsize=220)
 
+        # ── Volumes card ───────────────────────────────────────────────────────
+        vol_row = tk.Frame(self, bg=C["bg"])
+        vol_row.pack(padx=P, pady=(10, 0))
+        self._vol_card = self._make_card(
+            vol_row,
+            icon="💾",
+            title="Volumes",
+            body="Create or mount encrypted\nvirtual drives (.qcv files).",
+            btn_text="Manage volumes →",
+            command=self._open_volumes,
+            accent=False,
+        )
+        self._vol_card.pack(fill="x")
+
         # ── Drop hint ─────────────────────────────────────────────────────────
         rule(self, pady=20, padx=P)
 
         drop_hint = (
-            "You can also drag a .qcx file onto this window to decrypt it directly."
+            "You can also drag a .qcx or .qcv file onto this window."
             if _DND_FILES else
-            "You can also open a .qcx file via the Decrypt button above."
+            "You can also open a .qcx file via the Decrypt button above, "
+            "or manage .qcv volumes via the Volumes card."
         )
         tk.Label(self, text=drop_hint,
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
@@ -147,7 +207,7 @@ class LauncherApp(tk.Toplevel):
                  font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(0, 4))
 
         # Discoverable keyboard shortcut hint
-        tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+I  Inspect",
+        tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+V  Volumes  ·  Ctrl+I  Inspect",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
                  wraplength=420).pack(pady=(0, 6))
 
@@ -283,12 +343,46 @@ class LauncherApp(tk.Toplevel):
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
+    def _safe_open_wizard(self, build_wizard):
+        """Withdraw the launcher, construct a wizard, recover on failure.
+
+        Previously the launcher called self.withdraw() *before* the wizard's
+        import/constructor ran.  If construction raised (missing optional
+        dependency, disk error, etc.), the launcher stayed hidden and the
+        user saw a running process with no visible window.  This wrapper
+        re-shows the launcher and surfaces the error in a dialog so the
+        user can recover without force-quitting.
+        """
+        from tkinter import messagebox
+        self.withdraw()
+        try:
+            build_wizard()
+        except Exception as exc:
+            self.deiconify()
+            messagebox.showerror(
+                "Cannot open window",
+                f"Something went wrong opening that screen.\n\n{friendly_error(exc)}",
+                parent=self,
+            )
+
+    def _open_volumes(self, volume_path: str | None = None):
+        cx = self.winfo_x() + self.winfo_width() // 2
+        cy = self.winfo_y() + self.winfo_height() // 2
+        def _build():
+            from quantacrypt.ui.volume_manager import VolumeManagerApp
+            VolumeManagerApp(
+                self.master, on_close=self.deiconify, center_at=(cx, cy),
+                volume_path=volume_path,
+            )
+        self._safe_open_wizard(_build)
+
     def _open_encryptor(self):
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        from quantacrypt.ui.encryptor import EncryptorApp
-        EncryptorApp(self.master, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            from quantacrypt.ui.encryptor import EncryptorApp
+            EncryptorApp(self.master, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
     def _open_decryptor(self):
         """Trigger a file picker immediately so the Decrypt card does what it says.
@@ -307,14 +401,15 @@ class LauncherApp(tk.Toplevel):
             from tkinter import messagebox
             messagebox.showerror(
                 "Cannot open file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        from quantacrypt.ui.decryptor import DecryptorApp
-        DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            from quantacrypt.ui.decryptor import DecryptorApp
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
     def _open_qcx(self, path):
         """Open a specific .qcx file directly in the decryptor."""
@@ -325,13 +420,14 @@ class LauncherApp(tk.Toplevel):
             from tkinter import messagebox
             messagebox.showerror(
                 "Cannot open file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
 
     def _inspect_file(self):
@@ -345,8 +441,9 @@ class LauncherApp(tk.Toplevel):
         try:
             pkg = load_pkg(path)
         except Exception as e:
-            messagebox.showerror("Cannot read file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+            messagebox.showerror(
+                "Cannot read file",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         meta = pkg["meta"]

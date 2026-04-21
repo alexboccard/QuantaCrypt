@@ -214,6 +214,61 @@ def fmt_size(n: int) -> str:
     return f"{n/1_073_741_824:.1f} GB"
 
 
+def friendly_error(exc: BaseException) -> str:
+    """Translate a raw exception into a user-facing, actionable message.
+
+    Error dialogs get populated by `f"...\n\n{exc}"` in several places, which
+    leaks Python-specific jargon (`InvalidTag`, `[Errno 13]`, `NoneType`...)
+    to end users.  Mapping known exception shapes into plain-English hints
+    keeps the useful detail while dropping the noise.
+
+    Returns the mapped message when a known shape is recognised; otherwise
+    falls back to `str(exc)`.
+    """
+    # Order matters: more specific patterns first.
+    import errno as _errno
+
+    # Path-not-found / permission issues on file I/O
+    if isinstance(exc, FileNotFoundError):
+        return "File not found — it may have been moved or deleted."
+    if isinstance(exc, PermissionError):
+        return ("Access denied — check you have permission to read / write "
+                "this file, and that it isn't open in another app.")
+    if isinstance(exc, IsADirectoryError):
+        return "That path is a folder, not a file."
+    if isinstance(exc, OSError):
+        # Disk full, I/O error, etc.
+        if exc.errno == _errno.ENOSPC:
+            return "Disk is full — free up space and try again."
+        if exc.errno == _errno.EIO:
+            return "Disk read / write error — the drive may be failing."
+        if exc.errno == _errno.EROFS:
+            return "Destination is read-only."
+
+    # ValueErrors from our own crypto / format code already carry good
+    # messages; pass the message through but filter InvalidTag jargon.
+    msg = str(exc)
+    lower = msg.lower()
+    if "invalidtag" in lower or "authentication" in lower:
+        return ("The password or shares are incorrect, or the file has been "
+                "modified since it was encrypted.")
+    if "unsupported" in lower and "version" in lower:
+        return ("This file was created with a newer version of QuantaCrypt. "
+                "Please update the app.")
+    if "older" in lower and "version" in lower:
+        return ("This file uses an older format. Decrypt it with the "
+                "original app version, then re-encrypt with this one.")
+    if "truncat" in lower or "appears truncated" in lower:
+        return ("The file appears to be truncated or incomplete — "
+                "re-download or restore from backup.")
+    if "hmac" in lower:
+        return ("The file's integrity check failed — the file may be "
+                "corrupt or tampered with.")
+    if not msg:
+        return f"{type(exc).__name__} (no additional detail)"
+    return msg
+
+
 def rule(parent, color=None, pady=12, padx=0):
     f = tk.Frame(parent, bg=color or C["border"], height=1)
     f.pack(fill="x", pady=pady, padx=padx)

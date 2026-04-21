@@ -71,6 +71,7 @@ __all__ = [
 
 
 def argon2id_derive(password: bytes, salt: bytes) -> bytes:
+    _reject_empty_secret(password)
     return hash_secret_raw(
         secret=password, salt=salt,
         time_cost=ARGON2_TIME_COST, memory_cost=ARGON2_MEMORY_COST,
@@ -97,6 +98,17 @@ def xor_bytes(a: bytes, b: bytes) -> bytes:
         raise ValueError(f"xor_bytes: length mismatch {len(a)} vs {len(b)}")
     return bytes(x ^ y for x, y in zip(a, b))
 
+
+def _reject_empty_secret(secret: bytes) -> None:
+    """Defense in depth: the UI already blocks empty passwords, but refuse
+    them in the crypto layer too so a regression can't quietly derive a
+    trivially-bruteforceable key."""
+    if not secret:
+        raise ValueError(
+            "Password / secret cannot be empty — refusing to derive a "
+            "trivially-guessable key"
+        )
+
 def _meta_hmac(key_material: bytes, meta_fields: dict) -> str:
     """Compute HMAC-SHA256 over a canonical encoding of authenticated metadata fields.
     Protects argon_salt, kyber_kem_ct, kyber_sk_enc_nonce, kyber_sk_enc, nonce
@@ -115,7 +127,10 @@ def _verify_meta_hmac(key_material: bytes, meta: dict) -> bool:
     stored   = meta["hmac"]
     # Exclude structural/display fields that are present in meta at decryption time
     # but were NOT in auth_fields when the HMAC was computed at encryption time.
-    _EXCLUDED = {"hmac", "version", "mode", "key_bits", "threshold", "total",
+    # "format_version" and "created_at" are .qcv-only fields — excluding them is a
+    # no-op for .qcx metadata (which uses "version" and lacks "created_at").
+    _EXCLUDED = {"hmac", "version", "format_version", "created_at",
+                 "mode", "key_bits", "threshold", "total",
                  "chunk_size", "payload_offset"}
     fields   = {k: v for k, v in meta.items() if k not in _EXCLUDED}
     expected = _meta_hmac(key_material, fields)
@@ -136,6 +151,10 @@ def kyber_decaps(sk: bytes, kem_ct: bytes) -> bytes:
 
 
 def shamir_split(secret_bytes: bytes, n: int, k: int) -> list[dict]:
+    if not (2 <= k <= n <= 255):
+        raise ValueError(
+            f"Invalid Shamir parameters: need 2 <= k <= n <= 255 (got k={k}, n={n})"
+        )
     secret_int = int.from_bytes(secret_bytes, "big")
     if secret_int >= SHAMIR_PRIME:
         raise ValueError(f"Secret ({len(secret_bytes)*8} bits) exceeds M521 prime — cannot split safely")
@@ -144,6 +163,29 @@ def shamir_split(secret_bytes: bytes, n: int, k: int) -> list[dict]:
              "threshold": k} for s in shares]
 
 def shamir_recover(share_dicts: list[dict]) -> bytes:
+    if not share_dicts:
+        raise ValueError("Cannot recover from an empty share list")
+    # Reject duplicate indices: entering the same share twice would leave the
+    # effective quorum one share short, so the library would silently compute
+    # the wrong secret.  Better to fail early with a clear message.
+    indices = [s.get("index") for s in share_dicts]
+    if len(set(indices)) != len(indices):
+        raise ValueError(
+            "Duplicate share detected — each share must be unique. "
+            "Check you haven't pasted the same share more than once."
+        )
+    # If every share carries a threshold, reject obviously-insufficient sets
+    # before asking the library to do something undefined.  A stored threshold
+    # is advisory: the library will still attempt recovery with fewer, but the
+    # result would be garbage rather than an error.
+    thresholds = {s.get("threshold") for s in share_dicts if "threshold" in s}
+    if thresholds and all(t is not None for t in thresholds):
+        min_threshold = min(thresholds)  # be lenient if shares disagree
+        if len(share_dicts) < min_threshold:
+            raise ValueError(
+                f"Not enough shares to recover the secret "
+                f"(have {len(share_dicts)}, need at least {min_threshold})"
+            )
     objs       = [shamirs.shamirs.share(s["index"], s["value"], s["modulus"]) for s in share_dicts]
     secret_int = shamirs.recover(objs)
     if secret_int < 0 or secret_int >= (1 << (KEY_BYTES * 8)):
@@ -197,6 +239,16 @@ def decode_share(share_str: str) -> dict:
 #   • chunk_count in metadata + HMAC gives a second truncation guard.
 #   • On-disk layout: [uint32_be(ct_len)][ciphertext+tag] repeated, then metadata.
 
+
+class CancelledOperation(Exception):
+    """Raised from inside stream_encrypt/decrypt when cancel_check returns True.
+
+    The UI passes a callable that reads a threading.Event; when the user
+    hits Cancel, the next chunk boundary raises this exception and callers
+    clean up (delete the partial output).
+    """
+
+
 def _chunk_nonce(base_nonce: bytes, chunk_idx: int) -> bytes:
     idx_bytes = chunk_idx.to_bytes(12, "big")
     return bytes(b ^ n for b, n in zip(base_nonce, idx_bytes))
@@ -210,6 +262,7 @@ def stream_encrypt_payload(
     final_key: bytes,
     payload_size: int,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[bytes, int, int, str]:
     """
     Stream-encrypt src_path into dst_file using chunked AES-GCM.
@@ -217,6 +270,10 @@ def stream_encrypt_payload(
     Returns (base_nonce, chunk_count, bytes_written, plaintext_sha256_hex).
     The plaintext hash is computed incrementally during encryption (zero extra I/O).
     dst_file must already be open and positioned correctly.
+
+    If *cancel_check* is given and returns True at a chunk boundary, the
+    function raises :class:`CancelledOperation` so the caller can clean up
+    the partial output before re-raising or swallowing.
     """
     base_nonce = secrets.token_bytes(12)
     aes_key     = derive_aes_key(final_key)
@@ -230,6 +287,8 @@ def stream_encrypt_payload(
         # Read ahead by one chunk to know when we're at the last one
         buf = src.read(CHUNK_SIZE)
         while buf:
+            if cancel_check and cancel_check():
+                raise CancelledOperation("Encryption cancelled")
             content_hash.update(buf)
             nxt = src.read(CHUNK_SIZE)
             is_last = (not nxt)
@@ -260,6 +319,7 @@ def stream_decrypt_payload(
     chunk_count: int,
     base_nonce: bytes,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> str:
     """
     Stream-decrypt chunked payload from src_path (starting at payload_offset)
@@ -270,10 +330,13 @@ def stream_decrypt_payload(
     aes_key = derive_aes_key(final_key)
     cipher  = AESGCM(aes_key)
     content_hash = hashlib.sha256()
+    last_report = 0.0
 
     with open(src_path, "rb") as src:
         src.seek(payload_offset)
         for i in range(chunk_count):
+            if cancel_check and cancel_check():
+                raise CancelledOperation("Decryption cancelled")
             is_last  = (i == chunk_count - 1)
             seq_raw  = src.read(4)
             if len(seq_raw) < 4:
@@ -299,9 +362,14 @@ def stream_decrypt_payload(
                 )
             content_hash.update(plain)
             dst_file.write(plain)
-            if progress_cb:
+            # Throttle progress callbacks to ~1% intervals to avoid
+            # flooding the Tk event queue on large files (especially
+            # volume files decrypted at 64 KB granularity).
+            if progress_cb and chunk_count:
                 pct = (i + 1) / chunk_count
-                progress_cb(f"Decrypting payload (AES-256-GCM)... {int(pct*100)}%")
+                if pct - last_report >= 0.01 or i + 1 == chunk_count:
+                    progress_cb(f"Decrypting payload (AES-256-GCM)... {int(pct*100)}%")
+                    last_report = pct
 
     return content_hash.hexdigest()
 
@@ -319,6 +387,7 @@ def encrypt_single_streaming(
     password: str,
     filename: str = "",
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """
     v1: Stream-encrypt src_path into dst_file (already open, positioned after
@@ -329,7 +398,13 @@ def encrypt_single_streaming(
     payload_size = os.path.getsize(src_path)
     _p("Deriving 512-bit password key (Argon2id)...")
     argon_salt = secrets.token_bytes(32)
-    argon_key  = argon2id_derive(password.encode(), argon_salt)
+    # Encode + drop the str reference so it's not a named local for the
+    # remainder of this (slow) function.  Doesn't zero the heap, but
+    # shortens the window a heap dump would have to catch.
+    pw_bytes = password.encode()
+    password = None  # noqa: F841
+    argon_key  = argon2id_derive(pw_bytes, argon_salt)
+    del pw_bytes
     _p("Generating Kyber-768 keypair...")
     pk, sk = kyber_keygen()
     _p("Encapsulating + HKDF-SHA-512 expanding to 512 bits...")
@@ -341,7 +416,8 @@ def encrypt_single_streaming(
     # Stream the payload as chunks (also computes plaintext SHA-256 incrementally)
     _p("Encrypting payload (AES-256-GCM, 512-bit key material)...")
     base_nonce, chunk_count, _, content_sha256 = stream_encrypt_payload(
-        src_path, dst_file, final_key, payload_size, progress_cb)
+        src_path, dst_file, final_key, payload_size, progress_cb,
+        cancel_check=cancel_check)
 
     # Encrypt filename + metadata separately (tiny, in-memory) so it's authenticated.
     # The content hash is stored here so it's only revealed after successful decryption.
@@ -375,6 +451,7 @@ def encrypt_shamir_streaming(
     k: int,
     filename: str = "",
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict, list[str]]:
     """
     v1: Stream-encrypt src_path into dst_file using Shamir key split.
@@ -395,7 +472,8 @@ def encrypt_shamir_streaming(
     # Stream the payload as chunks (also computes plaintext SHA-256 incrementally)
     _p("Encrypting payload (AES-256-GCM, 512-bit key material)...")
     base_nonce, chunk_count, _, content_sha256 = stream_encrypt_payload(
-        src_path, dst_file, final_key, payload_size, progress_cb)
+        src_path, dst_file, final_key, payload_size, progress_cb,
+        cancel_check=cancel_check)
 
     # Encrypt filename + metadata separately (tiny, in-memory) so it's authenticated.
     # The content hash is stored here so it's only revealed after successful decryption.
@@ -431,6 +509,7 @@ def decrypt_streaming(
     meta: dict,
     final_key: bytes,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[str, int, int]:
     """
     v1: Stream-decrypt chunked payload from src_path into dst_file.
@@ -448,7 +527,8 @@ def decrypt_streaming(
     _p("Decrypting payload (AES-256-GCM)...")
     decrypted_sha256 = stream_decrypt_payload(
         src_path, dst_file, final_key,
-        payload_offset, chunk_count, base_nonce, progress_cb)
+        payload_offset, chunk_count, base_nonce, progress_cb,
+        cancel_check=cancel_check)
 
     # Decrypt the filename/size/ts/sha256 envelope
     fname_plain = aes_gcm_decrypt(final_key, d64("filename_nonce"), d64("filename_enc"))

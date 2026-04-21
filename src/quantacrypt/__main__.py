@@ -9,6 +9,7 @@ Launch behaviour:
 
 import os
 import sys
+import threading
 
 # When running as a frozen PyInstaller bundle, _MEIPASS is the temp dir
 # containing unpacked resources.  Add it to sys.path so that bundled
@@ -19,29 +20,84 @@ if getattr(sys, "frozen", False):
 else:
     _base = os.path.dirname(os.path.abspath(__file__))
 
-from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
+# NOTE: we deliberately do NOT import quantacrypt.ui.decryptor at module top.
+# That import transitively pulls in core.crypto (argon2, kyber_py, cryptography),
+# ~200–400 ms of startup cost on macOS.  The common path — user launches the
+# app to open the launcher — never needs the decryptor.  Defer to the branches
+# that actually use it.
+
+# Apple Events can fire concurrently if the user drops multiple files on the
+# dock icon in quick succession.  Without a lock, two invocations can each
+# create wizards that race on the same underlying file.  The lock makes each
+# event handle its paths to completion before the next one starts.
+_open_document_lock = threading.Lock()
+
+# .qcx magic bytes — inlined so we can detect self-executing payloads
+# without importing core.crypto at startup.  Keep in sync with
+# quantacrypt.core.crypto.MAGIC.
+_QCX_MAGIC = b"QCBIN\x01"
+_QCX_TAIL_SCAN = 1 << 20  # 1 MB window at the end of the file
+
+
+def _binary_has_qcx_payload(path: str) -> bool:
+    """Cheap magic-bytes probe: does *path* look like a self-executing .qcx?
+
+    We only need to decide whether to import the heavyweight decryptor stack;
+    the full parse happens inside load_pkg() once we know it's worth it.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    tail = min(size, _QCX_TAIL_SCAN)
+    try:
+        with open(path, "rb") as f:
+            f.seek(size - tail)
+            buf = f.read(tail)
+    except OSError:
+        return False
+    return _QCX_MAGIC in buf
 
 
 def _register_open_document(root):
-    """Register a macOS Apple Event handler for opening .qcx files.
+    """Register a macOS Apple Event handler for opening .qcx/.qcv files.
 
-    When a user double-clicks a .qcx file while the app is already running,
-    macOS sends an ``kAEOpenDocuments`` event.  Tk on macOS exposes this via
-    the ``::tk::mac::OpenDocument`` Tcl command.  We register a callback so
-    those files are routed to the decryptor automatically.
+    When a user double-clicks a .qcx or .qcv file while the app is already
+    running, macOS sends an ``kAEOpenDocuments`` event.  Tk on macOS exposes
+    this via the ``::tk::mac::OpenDocument`` Tcl command.  We register a
+    callback so those files are routed to the appropriate screen automatically.
     """
     def _open_document(*paths):
-        for path in paths:
-            if not os.path.isfile(path):
-                continue
-            try:
-                pkg = load_pkg(path)
-            except (ValueError, OSError):
-                continue
-            # Provide on_close so closing this window doesn't leave
-            # the app running with no visible windows
-            DecryptorApp(root, payload=pkg, qcx_path=path,
-                         on_close=lambda: None)
+        # Serialize handler invocations so multiple files dropped on the
+        # dock icon don't spawn racing wizards.
+        with _open_document_lock:
+            for path in paths:
+                if not os.path.isfile(path):
+                    continue
+                # .qcv → Volume Manager (mount mode)
+                if path.lower().endswith(".qcv"):
+                    try:
+                        from quantacrypt.ui.volume_manager import VolumeManagerApp
+                        VolumeManagerApp(root, volume_path=path)
+                    except Exception:
+                        # Swallow import/ctor errors so the Apple Event loop
+                        # doesn't wedge; the user can retry via the launcher.
+                        pass
+                    continue
+                # .qcx → Decryptor (lazy import: first Apple Event pays the
+                # crypto-stack import cost; subsequent events are free).
+                try:
+                    from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
+                    pkg = load_pkg(path)
+                except (ValueError, OSError):
+                    continue
+                # Provide on_close so closing this window doesn't leave
+                # the app running with no visible windows
+                try:
+                    DecryptorApp(root, payload=pkg, qcx_path=path,
+                                 on_close=lambda: None)
+                except Exception:
+                    pass
 
     try:
         root.createcommand("::tk::mac::OpenDocument", _open_document)
@@ -91,29 +147,62 @@ def main():
     root = _make_root()
     _register_open_document(root)
 
-    # Case 1: self-executing .qcx (binary with payload appended)
+    # Case 1: self-executing .qcx (binary with payload appended).
+    # Do a cheap magic-bytes probe first so the common (non-self-payload)
+    # binary doesn't pay the cost of importing the decryptor stack here.
     exe = sys.executable if getattr(sys, "frozen", False) else __file__
-    try:
-        self_payload = load_pkg(exe)
-    except (ValueError, OSError):
-        self_payload = None
-    if self_payload:
-        DecryptorApp(root, payload=self_payload, qcx_path=exe)
-        root.mainloop()
-        return
+    if _binary_has_qcx_payload(exe):
+        from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
+        try:
+            self_payload = load_pkg(exe)
+        except (ValueError, OSError):
+            self_payload = None
+        if self_payload:
+            DecryptorApp(root, payload=self_payload, qcx_path=exe)
+            root.mainloop()
+            return
 
     # Case 2: .qcx path passed as argument
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if os.path.isfile(arg):
+            # Case 2a: .qcv volume → open Volume Manager in mount mode
+            if arg.lower().endswith(".qcv"):
+                from quantacrypt.ui.launcher import LauncherApp
+                launcher = LauncherApp(root)
+                # Defer volume open until after mainloop starts.  Wrap in a
+                # try/except so that a failed import or constructor (e.g.
+                # missing fusepy) doesn't leave the launcher withdrawn with
+                # no visible window — the user sees an error dialog instead.
+                def _deferred_open():
+                    try:
+                        launcher._open_volumes(volume_path=arg)
+                    except Exception as exc:
+                        from tkinter import messagebox
+                        from quantacrypt.ui.shared import friendly_error
+                        try:
+                            launcher.deiconify()
+                        except Exception:
+                            pass
+                        messagebox.showerror(
+                            "Cannot open volume",
+                            f"{os.path.basename(arg)}\n\n{friendly_error(exc)}",
+                            parent=launcher,
+                        )
+                root.after(100, _deferred_open)
+                root.mainloop()
+                return
+
+            # Case 2b: .qcx encrypted file → Decryptor
+            from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
             try:
                 pkg = load_pkg(arg)
             except (ValueError, OSError) as e:
                 from tkinter import messagebox
+                from quantacrypt.ui.shared import friendly_error
                 messagebox.showerror(
                     "Cannot open file",
-                    f"{os.path.basename(arg)} is not a valid"
-                    f" QuantaCrypt file.\n\n{e}",
+                    f"{os.path.basename(arg)}\n\n{friendly_error(e)}",
                     parent=root,
                 )
                 root.destroy()

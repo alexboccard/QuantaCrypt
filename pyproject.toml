@@ -20,20 +20,36 @@ classifiers = [
 ]
 
 dependencies = [
-    "cryptography>=41.0",
+    # cryptography < 44 has two Dependabot-flagged CVEs:
+    #   - GHSA-h4gh-qq45-vh27 (buffer overflow on non-contiguous buffers,
+    #     fixed in 43.0.1)
+    #   - GHSA-pq5q-pcp9-gmvx (incomplete DNS name-constraint enforcement
+    #     on peer names, fixed in 42.0.4)
+    # 44.0 covers both.
+    "cryptography>=44.0",
     "argon2-cffi>=23.1",
     "kyber-py>=0.8",
     "shamirs>=1.0",
-    "mnemonic>=0.20",
+    "mnemonic>=0.21",
 ]
 
 [project.optional-dependencies]
 dnd = ["tkinterdnd2-universal>=1.7"]
 strength = ["zxcvbn>=4.4"]
-build = ["pyinstaller>=6.0", "Pillow>=10.0"]
+volumes = ["fusepy>=3.0"]
+# Pillow < 11.3 has the FITS GZIP decompression-bomb advisory (High,
+# GHSA-gg2v-6j66-8q5j); the build only uses Pillow to encode icns
+# slices, but the floor still has to cover the patched release.
+build = ["pyinstaller>=6.10", "Pillow>=11.3"]
 dev = [
-    "pytest>=7.0",
+    # pytest < 8.3.4 has GHSA-7g38-3x9v-v7vp (vulnerable tmpdir handling,
+    # Moderate); Pygments < 2.15 has GHSA-mrwq-x4v8-fh7p (ReDoS on the
+    # GUID regex, Low).  Pygments is pulled transitively by pytest's
+    # error-formatting, but pin it explicitly so Dependabot can see the
+    # floor directly.
+    "pytest>=8.3.4",
     "pytest-cov>=4.0",
+    "pygments>=2.15",
     "quantacrypt[dnd,strength,build]",
 ]
 

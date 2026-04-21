@@ -16,7 +16,7 @@ import zipfile
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.conftest import MAGIC, make_pkg_bytes, load_pkg
+from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, requires_tkinter
 
 
 
@@ -180,6 +180,7 @@ class TestClipboardTimer:
             root.destroy()
 
 
+@requires_tkinter
 class TestVerifyKeyMethod:
     """Verify the structural correctness of the verify-without-decrypt feature."""
 
@@ -432,6 +433,7 @@ class TestFolderEncryptionRoundTrip:
             assert any(n.endswith("data.bin")  for n in names)
             assert any(n.endswith("logo.png")  for n in names)
 
+    @requires_tkinter
     def test_validate_accepts_folder(self, tmp_path):
         """_validate should return None for a valid folder + output path."""
         (tmp_path / "source").mkdir()
@@ -452,6 +454,7 @@ class TestFolderEncryptionRoundTrip:
         result = EncryptorApp._validate(obj)
         assert result is None, f"Expected None, got: {result}"
 
+    @requires_tkinter
     def test_validate_rejects_missing_folder(self, tmp_path):
         import types
         from quantacrypt.ui.encryptor import EncryptorApp
@@ -576,6 +579,7 @@ class TestRecentFiles:
         assert len(items) <= 3
 
 
+@requires_tkinter
 class TestBatchEncryption:
 
     def test_validate_batch_no_files(self):
@@ -684,6 +688,7 @@ class TestBatchEncryption:
 
 class TestFileInspection:
 
+    @requires_tkinter
     def test_inspect_method_exists(self):
         from quantacrypt.ui.launcher import LauncherApp
         assert hasattr(LauncherApp, "_inspect_file")
@@ -833,6 +838,7 @@ class TestFolderEncryption:
         assert len(calls) == 5
 
 
+@requires_tkinter
 class TestBatchEncryptionLogic:
     """_validate_batch rejects bad inputs cleanly."""
 
@@ -890,6 +896,7 @@ class TestBatchEncryptionLogic:
         assert obj._validate_batch() is None
 
 
+@requires_tkinter
 class TestInspectFeature:
     """Structural checks for the inspect-without-decrypting popup."""
 

@@ -13,7 +13,9 @@ When encrypting with "Embed decryptor" ticked, the binary embeds itself
 into the .qcx file. No companion files needed — just the one binary.
 
 Usage:
-  python3 scripts/build.py          (from repo root)
+  python3 scripts/build.py                 (full build: tests → app → DMG)
+  python3 scripts/build.py --test-only     (run tests + coverage only)
+  python3 scripts/build.py --no-dmg        (build app bundle, skip DMG)
 """
 
 import io
@@ -33,14 +35,18 @@ WORK = os.path.join(ROOT, "build")
 NAME = "quantacrypt"
 BUNDLE_ID = "com.alexboccard.quantacrypt"
 QCX_UTI   = "com.alexboccard.quantacrypt.qcx"
+QCV_UTI   = "com.alexboccard.quantacrypt.qcv"
 DOC_ICON_NAME = "doc_icon.icns"
+VOL_ICON_NAME = "vol_icon.icns"
 
 SUF = ".app"
 
 HIDDEN = [
     "quantacrypt", "quantacrypt.core", "quantacrypt.core.crypto",
+    "quantacrypt.core.volume", "quantacrypt.core.fuse_ops",
     "quantacrypt.ui", "quantacrypt.ui.shared", "quantacrypt.ui.launcher",
     "quantacrypt.ui.encryptor", "quantacrypt.ui.decryptor", "quantacrypt.ui.updater",
+    "quantacrypt.ui.volume_manager",
     "cryptography", "cryptography.hazmat.primitives.ciphers.aead",
     "argon2", "argon2.low_level",
     "kyber_py", "kyber_py.kyber",
@@ -128,6 +134,27 @@ def _build_doc_icon():
         return None
 
 
+def _build_vol_icon():
+    """Generate a .icns for the .qcv volume type icon.
+
+    Returns the path to the generated file, or None if vol_icon.png is missing.
+    The .icns is copied into the .app bundle's Resources/ directory after build.
+    """
+    png = os.path.join(PKG, "assets", "vol_icon.png")
+    if not os.path.isfile(png):
+        print("[!] vol_icon.png not found — .qcv files will use a generic icon")
+        return None
+
+    out = os.path.join(ROOT, VOL_ICON_NAME)
+    try:
+        _make_icns(png, out)
+        print(f"[+] Generated {out}")
+        return out
+    except Exception as e:
+        print(f"[!] Could not generate vol .icns ({e}) — skipping volume icon")
+        return None
+
+
 def _find_tkinterdnd2():
     """Return the tkinterdnd2 package directory, or None if not installed.
     Needed to add the native tkdnd shared-library tree via --add-data so that
@@ -153,7 +180,7 @@ def _read_version():
     return cfg["project"]["version"]
 
 
-def _patch_plist(app_path, icon_name):
+def _patch_plist(app_path, icon_name, vol_icon_name=None):
     """Patch the Info.plist inside a built .app bundle.
 
     Sets the version strings, adds CFBundleDocumentTypes, and exports
@@ -169,7 +196,7 @@ def _patch_plist(app_path, icon_name):
     plist["CFBundleShortVersionString"] = version   # user-facing "1.0.0"
     plist["CFBundleVersion"] = version               # build number
 
-    # Declare that we handle .qcx documents
+    # Declare that we handle .qcx and .qcv documents
     plist["CFBundleDocumentTypes"] = [
         {
             "CFBundleTypeName": "QuantaCrypt Encrypted File",
@@ -179,9 +206,20 @@ def _patch_plist(app_path, icon_name):
             "CFBundleTypeExtensions": ["qcx"],
             **({"CFBundleTypeIconFile": icon_name} if icon_name else {}),
         },
+        {
+            "CFBundleTypeName": "QuantaCrypt Encrypted Volume",
+            "CFBundleTypeRole": "Editor",
+            "LSHandlerRank": "Owner",
+            "LSItemContentTypes": [QCV_UTI],
+            "CFBundleTypeExtensions": ["qcv"],
+            # Only attach the .qcv icon when we actually generated one — do
+            # NOT silently fall back to the .qcx doc icon, which would make
+            # the two file types visually indistinguishable in Finder.
+            **({"CFBundleTypeIconFile": vol_icon_name} if vol_icon_name else {}),
+        },
     ]
 
-    # Export the UTI so macOS knows what .qcx means even before
+    # Export UTIs so macOS knows what .qcx and .qcv mean even before
     # the user has ever opened one
     plist["UTExportedTypeDeclarations"] = [
         {
@@ -194,6 +232,18 @@ def _patch_plist(app_path, icon_name):
             },
             **({"UTTypeIconFile": icon_name} if icon_name else {}),
         },
+        {
+            "UTTypeIdentifier": QCV_UTI,
+            "UTTypeDescription": "QuantaCrypt Encrypted Volume",
+            "UTTypeConformsTo": ["public.data"],
+            "UTTypeTagSpecification": {
+                "public.filename-extension": ["qcv"],
+                "public.mime-type": "application/x-quantacrypt-volume",
+            },
+            # As above: only attach a per-UTI icon when we have a real .qcv
+            # icon; avoid the .qcx icon masquerading as the .qcv icon.
+            **({"UTTypeIconFile": vol_icon_name} if vol_icon_name else {}),
+        },
     ]
 
     with open(plist_path, "wb") as f:
@@ -203,6 +253,7 @@ def _patch_plist(app_path, icon_name):
     print(f"    Version:       {version}")
     print(f"    Bundle ID:     {BUNDLE_ID}")
     print(f"    Document type: .qcx → {QCX_UTI}")
+    print(f"    Document type: .qcv → {QCV_UTI}")
 
 
 def _create_dmg(app_path, arch_label=""):
@@ -378,6 +429,10 @@ def _parse_args():
                         "Intel and Apple Silicon.")
     p.add_argument("--skip-tests", action="store_true",
                    help="Skip the test suite (useful for CI split builds)")
+    p.add_argument("--test-only", action="store_true",
+                   help="Run tests and coverage only — skip the build entirely")
+    p.add_argument("--no-dmg", action="store_true",
+                   help="Build the .app bundle but skip DMG creation")
     return p.parse_args()
 
 
@@ -446,22 +501,32 @@ def _codesign_app_bundle(app_path):
         print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
 
 
-def _post_build(app_path, doc_icon_tmp, arch_label):
-    """Install doc icon, patch plist, code-sign, create DMG, and print summary."""
-    # Copy the document icon into the .app bundle's Resources directory
-    # so macOS can find it for .qcx file thumbnails in Finder
+def _post_build(app_path, doc_icon_tmp, arch_label, *,
+                skip_dmg=False, vol_icon_tmp=None):
+    """Install doc/vol icons, patch plist, code-sign, create DMG, and print summary."""
+    resources_dir = os.path.join(app_path, "Contents", "Resources")
+    os.makedirs(resources_dir, exist_ok=True)
+
+    # Copy the document icon (.qcx) into the .app bundle's Resources directory
     doc_icon_name = None
     if doc_icon_tmp and os.path.isfile(doc_icon_tmp):
-        resources_dir = os.path.join(app_path, "Contents", "Resources")
-        os.makedirs(resources_dir, exist_ok=True)
         dest = os.path.join(resources_dir, DOC_ICON_NAME)
         shutil.copy2(doc_icon_tmp, dest)
         os.remove(doc_icon_tmp)
         doc_icon_name = DOC_ICON_NAME
         print(f"[+] Installed {dest}")
 
-    # Patch Info.plist with .qcx file-association metadata
-    _patch_plist(app_path, doc_icon_name)
+    # Copy the volume icon (.qcv) into Resources
+    vol_icon_name = None
+    if vol_icon_tmp and os.path.isfile(vol_icon_tmp):
+        dest = os.path.join(resources_dir, VOL_ICON_NAME)
+        shutil.copy2(vol_icon_tmp, dest)
+        os.remove(vol_icon_tmp)
+        vol_icon_name = VOL_ICON_NAME
+        print(f"[+] Installed {dest}")
+
+    # Patch Info.plist with .qcx and .qcv file-association metadata
+    _patch_plist(app_path, doc_icon_name, vol_icon_name=vol_icon_name)
 
     # Ad-hoc code sign the .app bundle so macOS Gatekeeper shows the
     # standard "unidentified developer" dialog instead of "damaged".
@@ -483,7 +548,11 @@ def _post_build(app_path, doc_icon_tmp, arch_label):
     sz = total / 1_000_000
 
     # Create distributable DMG with drag-to-Applications layout
-    dmg_path = _create_dmg(app_path, arch_label)
+    dmg_path = None
+    if not skip_dmg:
+        dmg_path = _create_dmg(app_path, arch_label)
+    else:
+        print("[*] Skipping DMG creation (--no-dmg)")
 
     print(f"\n{'=' * 60}")
     print(f"  BUILD COMPLETE  ({arch_label})")
@@ -510,8 +579,30 @@ def main():
     if not args.skip_tests:
         _run_tests()
 
+    if args.test_only:
+        return
+
+    # ── Gate: the optional `strength` extra must be installed so the shipped
+    # binary has working password-strength feedback.  zxcvbn is listed in
+    # HIDDEN above, but PyInstaller silently drops unresolved hidden imports
+    # — the resulting app would fall back to a much weaker built-in estimator
+    # without any indication to the user.  Refuse to build rather than ship
+    # a quietly-degraded binary.
+    try:
+        import zxcvbn  # noqa: F401
+    except ImportError:
+        print(
+            "\n[!] zxcvbn is not installed in this environment.\n"
+            "    The password-strength meter and weak-password warning "
+            "would silently degrade in the built binary.\n"
+            "    Install it with:\n"
+            "        pip install -e \".[dev,dnd,strength]\"\n"
+        )
+        sys.exit(1)
+
     icon_args, icon_tmp = _build_icon()
     doc_icon_tmp = _build_doc_icon()
+    vol_icon_tmp = _build_vol_icon()
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -578,12 +669,14 @@ def main():
         os.remove(icon_tmp)
 
     if result.returncode != 0:
-        # Clean up doc icon temp file on failure (success path handles it in _post_build)
-        if doc_icon_tmp and os.path.isfile(doc_icon_tmp):
-            os.remove(doc_icon_tmp)
+        # Clean up icon temp files on failure (success path handles it in _post_build)
+        for tmp in (doc_icon_tmp, vol_icon_tmp):
+            if tmp and os.path.isfile(tmp):
+                os.remove(tmp)
         print("[!] Build failed"); sys.exit(1)
 
-    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label)
+    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label,
+                skip_dmg=args.no_dmg, vol_icon_tmp=vol_icon_tmp)
 
 
 if __name__ == "__main__":
