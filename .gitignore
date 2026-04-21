@@ -43,7 +43,12 @@ htmlcov/
 
 # Claude working files (internal docs, memory, scratchpads)
 .claude/
+.claudeignore
 CLAUDE.md
+TASKS.md
+Profile/
+memory/
+weekly-audit-*.md
 
 # Misc
 *.tmp

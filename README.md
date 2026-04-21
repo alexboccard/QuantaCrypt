@@ -14,7 +14,8 @@ Post-quantum file encryption for macOS. Protect files with a password or split t
 - **File inspector** — view encryption details (mode, format version, fingerprint) without needing the password
 - **Password strength meter** — real-time feedback while typing, powered by zxcvbn pattern matching
 - **Drag-and-drop** — drop files onto any window to encrypt or decrypt them instantly
-- **macOS integration** — double-click `.qcx` files in Finder, custom document icon, DMG installer
+- **Encrypted virtual drives** — create `.qcv` container files that mount as real volumes via FUSE; drag files in/out through Finder with on-the-fly encryption
+- **macOS integration** — double-click `.qcx` or `.qcv` files in Finder, custom document icon, DMG installer
 - **Dark native UI** — Tkinter-based interface with keyboard shortcuts and a guided wizard flow
 - **Cross-platform foundations** — core crypto works on macOS, Windows, and Linux; the UI is macOS-primary with platform-aware fallbacks
 
@@ -32,6 +33,7 @@ python -m quantacrypt
 
 > `tkinterdnd2` is optional — enables drag-and-drop. Everything works without it.
 > `zxcvbn` is optional — enables the password strength estimator. A built-in fallback is used without it.
+> `fusepy` is optional — enables encrypted volume mounting. Install with `pip install fusepy` plus a FUSE backend (macOS: `brew install --cask macfuse`).
 
 ---
 
@@ -56,9 +58,10 @@ python -m quantacrypt
 
 | Command | Result |
 |---------|--------|
-| `python -m quantacrypt` | Home screen (Encrypt or Decrypt) |
+| `python -m quantacrypt` | Home screen (Encrypt, Decrypt, or Volumes) |
 | `python -m quantacrypt myfile.qcx` | Opens that file directly in the decryptor |
-| Double-click `myfile.qcx` in Finder | Opens in QuantaCrypt (after build + install) |
+| `python -m quantacrypt vault.qcv` | Opens the volume manager in mount mode |
+| Double-click `.qcx` or `.qcv` in Finder | Opens in QuantaCrypt (after build + install) |
 | `./myfile.qcx` *(after build + embed)* | Self-opening — runs its own decryptor |
 
 ---
@@ -79,13 +82,16 @@ quantacrypt/
 │       ├── __main__.py             # CLI entry point — launch mode detection
 │       ├── core/
 │       │   ├── __init__.py         # Re-exports key constants
-│       │   └── crypto.py           # Cryptographic primitives (KEM, AES-GCM, Argon2id, Shamir)
+│       │   ├── crypto.py           # Cryptographic primitives (KEM, AES-GCM, Argon2id, Shamir)
+│       │   ├── volume.py           # Encrypted volume container (.qcv) crypto
+│       │   └── fuse_ops.py         # FUSE filesystem operations + mount/unmount API
 │       ├── ui/
 │       │   ├── __init__.py
 │       │   ├── shared.py           # Design system and shared widgets
 │       │   ├── launcher.py         # Home screen with recent files
 │       │   ├── encryptor.py        # Encryption wizard
-│       │   └── decryptor.py        # Decryption wizard with file inspector
+│       │   ├── decryptor.py        # Decryption wizard with file inspector
+│       │   └── volume_manager.py   # Volume creation wizard + mount panel
 │       └── assets/
 │           ├── icon.png            # App icon
 │           └── doc_icon.png        # .qcx document icon (Finder)
@@ -93,6 +99,7 @@ quantacrypt/
 ├── tests/
 │   ├── conftest.py                 # Shared fixtures and helpers
 │   ├── test_crypto.py              # Crypto primitive tests
+│   ├── test_volume.py              # Volume crypto + FUSE tests
 │   ├── test_gui_logic.py           # GUI validation / logic tests
 │   └── test_integration.py         # Streaming, folder, batch tests
 └── scripts/
@@ -151,6 +158,7 @@ open htmlcov/index.html
 |----------|--------|
 | `Ctrl+E` | Open Encryptor |
 | `Ctrl+D` | Open Decryptor |
+| `Ctrl+V` | Open Volume Manager |
 | `Ctrl+I` | Inspect a .qcx file |
 | `Ctrl+O` | Browse for a file |
 | `Ctrl+Return` | Start encryption / decryption |
@@ -169,6 +177,24 @@ open htmlcov/index.html
 **Public metadata** (viewable via Inspect, no password needed): format version, encryption mode, password-hardening salt or public key, payload offset, file fingerprint.
 
 **Encrypted metadata** (revealed only after decryption): original filename, file size, encryption timestamp, content SHA-256 hash (verified after decryption to confirm the output matches the original byte-for-byte).
+
+---
+
+## .qcv Volume Format
+
+Encrypted virtual drives that mount as real volumes via FUSE. Each file inside the volume is independently encrypted (Cryptomator-style architecture).
+
+```
+[ 512-byte header: magic + version + volume UUID + nonces                ]
+[ cleartext auth params: Argon2 salt, KEM ciphertext (for key derivation)]
+[ encrypted metadata block (AES-256-GCM)                                 ]
+[ encrypted directory index (AES-256-GCM) — file tree with inodes        ]
+[ file data section — per-file chunked AES-256-GCM (64 KB chunks)        ]
+```
+
+The container grows dynamically as files are added — no pre-allocation needed. Key derivation uses the same Argon2id + Kyber-768 scheme as `.qcx` files. Both password and split-key (Shamir) authentication modes are supported.
+
+**Requirements:** A FUSE backend is needed to mount volumes. On macOS, install [macFUSE](https://osxfuse.github.io/) or FUSE-T via Homebrew. The Python `fusepy` package provides the bindings.
 
 ---
 

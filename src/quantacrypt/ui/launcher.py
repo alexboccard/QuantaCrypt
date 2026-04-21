@@ -40,13 +40,15 @@ class LauncherApp(tk.Toplevel):
         # Check for updates in the background (non-blocking)
         from quantacrypt.ui.updater import check_for_update
         check_for_update(self, __version__)
-        # Keyboard shortcuts: Ctrl+E → Encrypt, Ctrl+D → Decrypt, Ctrl+I → Inspect
+        # Keyboard shortcuts: Ctrl+E → Encrypt, Ctrl+D → Decrypt, Ctrl+I → Inspect, Ctrl+V → Volumes
         self.bind("<Control-e>", lambda e: self._open_encryptor())
         self.bind("<Control-E>", lambda e: self._open_encryptor())
         self.bind("<Control-d>", lambda e: self._open_decryptor())
         self.bind("<Control-D>", lambda e: self._open_decryptor())
         self.bind("<Control-i>", lambda e: self._inspect_file())
         self.bind("<Control-I>", lambda e: self._inspect_file())
+        self.bind("<Control-v>", lambda e: self._open_volumes())
+        self.bind("<Control-V>", lambda e: self._open_volumes())
         # Escape quits the app
         self.bind("<Escape>", lambda e: self.master.destroy())
         self.protocol("WM_DELETE_WINDOW", self.master.destroy)
@@ -67,7 +69,11 @@ class LauncherApp(tk.Toplevel):
             if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
             paths = [raw.split("} {")[0]]
         if paths and os.path.isfile(paths[0]):
-            self._open_qcx(paths[0])
+            path = paths[0]
+            if path.lower().endswith(".qcv"):
+                self._open_volumes(volume_path=path)
+            else:
+                self._open_qcx(path)
 
     def _center(self):
         self.update_idletasks()
@@ -118,13 +124,28 @@ class LauncherApp(tk.Toplevel):
         cards.columnconfigure(0, weight=1, minsize=220)
         cards.columnconfigure(1, weight=1, minsize=220)
 
+        # ── Volumes card ───────────────────────────────────────────────────────
+        vol_row = tk.Frame(self, bg=C["bg"])
+        vol_row.pack(padx=P, pady=(10, 0))
+        self._vol_card = self._make_card(
+            vol_row,
+            icon="💾",
+            title="Volumes",
+            body="Create or mount encrypted\nvirtual drives (.qcv files).",
+            btn_text="Manage volumes →",
+            command=self._open_volumes,
+            accent=False,
+        )
+        self._vol_card.pack(fill="x")
+
         # ── Drop hint ─────────────────────────────────────────────────────────
         rule(self, pady=20, padx=P)
 
         drop_hint = (
-            "You can also drag a .qcx file onto this window to decrypt it directly."
+            "You can also drag a .qcx or .qcv file onto this window."
             if _DND_FILES else
-            "You can also open a .qcx file via the Decrypt button above."
+            "You can also open a .qcx file via the Decrypt button above, "
+            "or manage .qcv volumes via the Volumes card."
         )
         tk.Label(self, text=drop_hint,
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
@@ -147,7 +168,7 @@ class LauncherApp(tk.Toplevel):
                  font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(0, 4))
 
         # Discoverable keyboard shortcut hint
-        tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+I  Inspect",
+        tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+V  Volumes  ·  Ctrl+I  Inspect",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
                  wraplength=420).pack(pady=(0, 6))
 
@@ -282,6 +303,16 @@ class LauncherApp(tk.Toplevel):
         return card
 
     # ── Navigation ────────────────────────────────────────────────────────────
+
+    def _open_volumes(self, volume_path: str | None = None):
+        cx = self.winfo_x() + self.winfo_width() // 2
+        cy = self.winfo_y() + self.winfo_height() // 2
+        self.withdraw()
+        from quantacrypt.ui.volume_manager import VolumeManagerApp
+        VolumeManagerApp(
+            self.master, on_close=self.deiconify, center_at=(cx, cy),
+            volume_path=volume_path,
+        )
 
     def _open_encryptor(self):
         cx = self.winfo_x() + self.winfo_width() // 2

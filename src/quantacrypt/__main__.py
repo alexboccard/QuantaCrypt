@@ -23,17 +23,23 @@ from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
 
 
 def _register_open_document(root):
-    """Register a macOS Apple Event handler for opening .qcx files.
+    """Register a macOS Apple Event handler for opening .qcx/.qcv files.
 
-    When a user double-clicks a .qcx file while the app is already running,
-    macOS sends an ``kAEOpenDocuments`` event.  Tk on macOS exposes this via
-    the ``::tk::mac::OpenDocument`` Tcl command.  We register a callback so
-    those files are routed to the decryptor automatically.
+    When a user double-clicks a .qcx or .qcv file while the app is already
+    running, macOS sends an ``kAEOpenDocuments`` event.  Tk on macOS exposes
+    this via the ``::tk::mac::OpenDocument`` Tcl command.  We register a
+    callback so those files are routed to the appropriate screen automatically.
     """
     def _open_document(*paths):
         for path in paths:
             if not os.path.isfile(path):
                 continue
+            # .qcv → Volume Manager (mount mode)
+            if path.lower().endswith(".qcv"):
+                from quantacrypt.ui.volume_manager import VolumeManagerApp
+                VolumeManagerApp(root, volume_path=path)
+                continue
+            # .qcx → Decryptor
             try:
                 pkg = load_pkg(path)
             except (ValueError, OSError):
@@ -106,6 +112,16 @@ def main():
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if os.path.isfile(arg):
+            # Case 2a: .qcv volume → open Volume Manager in mount mode
+            if arg.lower().endswith(".qcv"):
+                from quantacrypt.ui.launcher import LauncherApp
+                launcher = LauncherApp(root)
+                # Defer volume open until after mainloop starts
+                root.after(100, lambda: launcher._open_volumes(volume_path=arg))
+                root.mainloop()
+                return
+
+            # Case 2b: .qcx encrypted file → Decryptor
             try:
                 pkg = load_pkg(arg)
             except (ValueError, OSError) as e:

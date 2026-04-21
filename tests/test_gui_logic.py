@@ -17,7 +17,7 @@ import types
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, _make_qcx, _decrypt_qcx
+from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, _make_qcx, _decrypt_qcx, requires_tkinter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # A4: GUI-layer tests
@@ -26,6 +26,7 @@ from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, _make_qcx, _decrypt_
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@requires_tkinter
 class TestEncryptorValidate:
     """Test encryptor._validate logic without opening a window."""
 
@@ -338,6 +339,7 @@ class TestRevealHelper:
         _reveal("/tmp/nonexistent_xyz_path")  # Should silently swallow error
 
 
+@requires_tkinter
 class TestFileInfoCard:
     """Test U3: FileInfoCard shows sz/ts when provided."""
 
@@ -382,6 +384,7 @@ class TestHardFileSizeLimit:
         assert (cc.CHUNK_SIZE & (cc.CHUNK_SIZE - 1)) == 0  # power of two
 
 
+@requires_tkinter
 class TestSharesPendingGuard:
     """Fix 6: Unsaved Shamir shares warn before navigating away."""
 
@@ -404,6 +407,7 @@ class TestSharesPendingGuard:
         assert "_shares_pending" in src and "False" in src
 
 
+@requires_tkinter
 class TestWizardStepDuringEncryption:
     """Fix 8: set_step(4) during encryption, not set_step(3)."""
 
@@ -415,6 +419,7 @@ class TestWizardStepDuringEncryption:
         assert "set_step(3)" not in src, "_start should not set wizard to step 3 (Output)"
 
 
+@requires_tkinter
 class TestDecryptorFailStep:
     """Fix 7: _fail stays at step 2 (Decrypt), not retreats to step 1."""
 
@@ -426,6 +431,7 @@ class TestDecryptorFailStep:
         assert "set_step(1)" not in src, "_fail should not retreat to step 1"
 
 
+@requires_tkinter
 class TestFileCardKeyboard:
     """Fix 4: FileCard is keyboard accessible."""
 
@@ -448,6 +454,7 @@ class TestFileCardKeyboard:
         assert "<space>" in src, "FileCard should bind <space> to _pick"
 
 
+@requires_tkinter
 class TestSegmentedControlKeyboard:
     """Fix 17: SegmentedControl keyboard navigation."""
 
@@ -471,6 +478,7 @@ class TestSegmentedControlKeyboard:
         assert "takefocus" in src, "SegmentedControl should be focusable"
 
 
+@requires_tkinter
 class TestFlatButtonHoverOnEnable:
     """Fix 22: FlatButton checks hover state when re-enabled."""
 
@@ -481,6 +489,7 @@ class TestFlatButtonHoverOnEnable:
         assert "winfo_pointerxy" in src, "enable(True) should check if mouse is already hovering"
 
 
+@requires_tkinter
 class TestOutputPathPreservation:
     """Fix 13: _load_payload only sets suggested path if field is empty."""
 
@@ -492,6 +501,7 @@ class TestOutputPathPreservation:
             "_load_payload should check if output field is empty before overwriting"
 
 
+@requires_tkinter
 class TestFnameSanitization:
     """Fix 15: fname from metadata is sanitized with os.path.basename."""
 
@@ -512,6 +522,7 @@ class TestFnameSanitization:
         assert os.path.basename("document.pdf") == "document.pdf"
 
 
+@requires_tkinter
 class TestShareChecksumError:
     """Fix 16: Share checksum error shows sanitized message."""
 
@@ -531,6 +542,7 @@ class TestShareChecksumError:
                 break
 
 
+@requires_tkinter
 class TestMatchLblClearedOnDone:
     """Fix 20: _match_lbl cleared on successful encryption."""
 
@@ -542,6 +554,7 @@ class TestMatchLblClearedOnDone:
         assert 'text=""' in src or "text='')" in src or 'config(text="")' in src
 
 
+@requires_tkinter
 class TestWizardStepsLabelTruncation:
     """Fix 21: WizardSteps truncates long step labels."""
 
@@ -553,6 +566,7 @@ class TestWizardStepsLabelTruncation:
             "WizardSteps._draw should truncate long labels with ellipsis"
 
 
+@requires_tkinter
 class TestFreezeThaw:
     """Fix 18: All controls frozen during encryption."""
 
@@ -577,6 +591,7 @@ class TestFreezeThaw:
         assert "_pw1" in src or "normal" in src, "_thaw should re-enable fields"
 
 
+@requires_tkinter
 class TestShamirKClamp:
     """Fix 12: K is clamped to N in real time."""
 
@@ -597,6 +612,7 @@ class TestShamirKClamp:
         assert "self._n.get(" in do_clamp_src
 
 
+@requires_tkinter
 class TestDropHintConditional:
     """Fix 9: Drop hint only mentions drag-and-drop if tkinterdnd2 is available."""
 
@@ -608,6 +624,7 @@ class TestDropHintConditional:
             "Launcher drop hint should be conditional on _DND_FILES being available"
 
 
+@requires_tkinter
 class TestSelfExecutingSection:
     """Fix 11: SELF-EXECUTING section hidden when no binary found."""
 
@@ -631,6 +648,7 @@ class TestSelfExecutingSection:
         assert "if " in preceding, "SELF-EXECUTING section should be inside an if block"
 
 
+@requires_tkinter
 class TestSizeAnnotation:
     """Fix 19: Success card annotates decryptor overhead in size label."""
 
@@ -1104,6 +1122,7 @@ class TestLoadPkgValidation:
         assert pkg["meta"]["threshold"] == 2
 
 
+@requires_tkinter
 class TestEncryptorDecSizeGuard:
     """BUG-A: dec_size getsize must not propagate OSError."""
 

@@ -5,9 +5,27 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 
 import pytest
+
+# Stub tkinter on headless systems so tests that import UI modules don't fail.
+# This must run before any test module triggers `import tkinter`.
+HAS_TKINTER = False
+try:
+    import tkinter  # noqa: F401
+    HAS_TKINTER = True
+except (ImportError, ModuleNotFoundError):
+    from unittest.mock import MagicMock
+    for _mod in ("tkinter", "tkinter.ttk", "tkinter.filedialog",
+                 "tkinter.messagebox", "tkinterdnd2"):
+        sys.modules.setdefault(_mod, MagicMock())
+
+requires_tkinter = pytest.mark.skipif(
+    not HAS_TKINTER,
+    reason="Needs real tkinter (UI classes are MagicMock on headless systems)",
+)
 
 from quantacrypt.core import crypto as cc
 

@@ -845,16 +845,18 @@ class TestMagicConstantImport:
 
     def test_decryptor_uses_cc_magic(self):
         """Ensure decryptor.py imports MAGIC rather than defining its own."""
-        import quantacrypt.ui.decryptor as _dec_mod
-        src = open(_dec_mod.__file__).read()
+        import importlib.util, pathlib
+        spec = importlib.util.find_spec("quantacrypt.ui.decryptor")
+        src = pathlib.Path(spec.origin).read_text()
         # Must not have a raw bytes definition
         assert 'MAGIC = b"QCBIN' not in src
         # Must import from quantacrypt.core.crypto
         assert "from quantacrypt.core.crypto import" in src and "MAGIC" in src
 
     def test_quantacrypt_uses_cc_magic(self):
-        import quantacrypt.__main__ as _main_mod
-        src = open(_main_mod.__file__).read()
+        import importlib.util, pathlib
+        spec = importlib.util.find_spec("quantacrypt.__main__")
+        src = pathlib.Path(spec.origin).read_text()
         assert 'MAGIC = b"QCBIN' not in src
 
 
