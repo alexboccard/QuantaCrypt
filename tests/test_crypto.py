@@ -57,10 +57,12 @@ class TestArgon2Derive:
         k = cc.argon2id_derive(b"pw", os.urandom(16))
         assert len(k) == cc.KEY_BYTES  # 64
 
-    def test_empty_password(self):
-        # Should not crash — empty password is a valid (weak) input
-        k = cc.argon2id_derive(b"", os.urandom(16))
-        assert len(k) == cc.KEY_BYTES
+    def test_empty_password_rejected(self):
+        # Defense in depth: the UI blocks empty passwords, but the crypto
+        # layer also refuses them so a regression can't quietly derive a
+        # trivially-guessable key.
+        with pytest.raises(ValueError, match="cannot be empty"):
+            cc.argon2id_derive(b"", os.urandom(16))
 
 
 class TestAesGcm:
@@ -388,10 +390,10 @@ class TestEncryptSingle:
         result, *_ = _decrypt_qcx(enc, meta, fk)
         assert result == b"secret"
 
-    def test_empty_password(self, tmp_path):
-        enc, meta, _, fk = _make_qcx(tmp_path, b"secret", password="")
-        result, *_ = _decrypt_qcx(enc, meta, fk)
-        assert result == b"secret"
+    def test_empty_password_rejected_at_encrypt(self, tmp_path):
+        # End-to-end: the encrypt helper must refuse an empty password.
+        with pytest.raises(ValueError, match="cannot be empty"):
+            _make_qcx(tmp_path, b"secret", password="")
 
     def test_meta_fields(self, tmp_path):
         _, meta, _, _ = _make_qcx(tmp_path, b"x")
@@ -892,6 +894,60 @@ class TestVerifyMetaHmac:
             cc._verify_meta_hmac(key_material, meta)
 
 
+class TestCancelledOperation:
+    """Cooperative-cancel support on stream_encrypt / stream_decrypt."""
+
+    def test_encrypt_cancel_mid_stream(self, tmp_path):
+        """cancel_check returning True mid-stream raises CancelledOperation."""
+        # 5 MB input → several chunks at 4 MB each.
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"A" * (5 * cc.CHUNK_SIZE))
+        dst = tmp_path / "dst.bin"
+        # Cancel immediately.
+        calls = {"n": 0}
+        def _cancel():
+            calls["n"] += 1
+            return True  # cancel on the very first check
+        with pytest.raises(cc.CancelledOperation):
+            with open(dst, "wb") as f:
+                cc.stream_encrypt_payload(
+                    str(src), f, os.urandom(64), src.stat().st_size,
+                    cancel_check=_cancel,
+                )
+        assert calls["n"] >= 1
+
+    def test_encrypt_cancel_check_false_runs_to_completion(self, tmp_path):
+        """A cancel_check that always returns False is a no-op."""
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"A" * 1024)
+        dst = tmp_path / "dst.bin"
+        with open(dst, "wb") as f:
+            nonce, chunks, _, _ = cc.stream_encrypt_payload(
+                str(src), f, os.urandom(64), src.stat().st_size,
+                cancel_check=lambda: False,
+            )
+        assert chunks >= 1
+
+    def test_decrypt_cancel_mid_stream(self, tmp_path):
+        """Cancelling during decrypt cleans up without raising InvalidTag."""
+        key = os.urandom(64)
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"Z" * (5 * cc.CHUNK_SIZE))
+        payload = tmp_path / "payload.bin"
+        with open(payload, "wb") as f:
+            nonce, chunks, _, _ = cc.stream_encrypt_payload(
+                str(src), f, key, src.stat().st_size,
+            )
+        out = tmp_path / "out.bin"
+        with pytest.raises(cc.CancelledOperation):
+            with open(out, "wb") as f:
+                cc.stream_decrypt_payload(
+                    str(payload), f, key,
+                    payload_offset=0, chunk_count=chunks, base_nonce=nonce,
+                    cancel_check=lambda: True,
+                )
+
+
 class TestShamirSplitEdge:
     """Cover shamir_split overflow guard (line 140)."""
 
@@ -926,6 +982,14 @@ class TestShamirRecoverValidation:
         shares = cc.shamir_split(b"\x01" * 32, n=5, k=3)
         with pytest.raises(ValueError, match="Not enough shares"):
             cc.shamir_recover(shares[:2])
+
+    def test_recover_duplicate_shares_raises(self):
+        # Hand back the same share twice — the quorum is effectively one
+        # share short, so the library would compute a wrong secret.  Our
+        # wrapper refuses instead.
+        shares = cc.shamir_split(b"\x01" * 32, n=5, k=3)
+        with pytest.raises(ValueError, match="Duplicate share"):
+            cc.shamir_recover([shares[0], shares[0], shares[1]])
 
 
 class TestDecodeShareEdgeCases:

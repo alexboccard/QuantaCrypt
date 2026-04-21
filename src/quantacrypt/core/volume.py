@@ -74,6 +74,12 @@ VOLUME_CHUNK_SIZE = 64 * 1024  # 64 KB
 # instead of appending.  See docs/design/volumes-delta-save.md.
 _JOURNAL_COMPACT_RATIO = 0.3
 
+# Minimum journal size before the ratio-based compact trigger fires, and
+# minimum total journal size for the empty-baseline guard.  Raised from
+# 1 MB to 8 MB so small / freshly-created volumes don't rewrite the whole
+# container every few edits.
+_JOURNAL_COMPACT_FLOOR = 8 << 20  # 8 MB
+
 # Guard rails for journal record sizes — prevent a malicious or truncated
 # file from directing us to allocate gigabytes before we detect corruption.
 # (These are "obviously too big" bounds, not tight limits.)
@@ -233,17 +239,24 @@ def _write_journal_record(
 ) -> int:
     """Append one journal record at current position. Returns body offset
     (absolute file offset where the body bytes start).  The caller should
-    use this to update dir_index entries for "write" ops."""
+    use this to update dir_index entries for "write" ops.
+
+    The AAD binds each record to its byte offset in the container, so an
+    attacker with file-access cannot reorder records (e.g. truncate newer
+    records and re-shuffle older ones into their slots).  Each record's
+    ciphertext is only valid at the position where it was written.
+    """
     header_dict = {k: v for k, v in op.items() if k not in ("blob",)}
     header_dict["body_length"] = len(body)
     header_plain = json.dumps(
         header_dict, sort_keys=True, separators=(",", ":")
     ).encode()
     header_nonce = secrets.token_bytes(12)
-    header_ct = AESGCM(derive_aes_key(final_key)).encrypt(
-        header_nonce, header_plain, b""
-    )
     start = f.tell()
+    aad = start.to_bytes(8, "big")
+    header_ct = AESGCM(derive_aes_key(final_key)).encrypt(
+        header_nonce, header_plain, aad
+    )
     f.write(header_nonce)
     f.write(struct.pack(">I", len(header_ct)))
     f.write(header_ct)
@@ -283,12 +296,14 @@ def _read_journal_records(
             ct = f.read(ct_len)
             if len(ct) < ct_len:
                 break
+            aad = pos.to_bytes(8, "big")
             try:
-                header_plain = aes.decrypt(nonce, ct, b"")
+                header_plain = aes.decrypt(nonce, ct, aad)
                 header = json.loads(header_plain)
             except Exception:
-                # Truncated / corrupt / wrong-key.  The last successful record
-                # is the effective end of the journal.
+                # Truncated / corrupt / wrong-key / record-at-wrong-offset.
+                # The last successful record is the effective end of the
+                # journal; replay stops here.
                 break
             if not isinstance(header, dict):
                 break
@@ -1049,25 +1064,93 @@ class VolumeContainer:
         # toward compacting more eagerly, which is fine.
         pending_overhead = len(self._pending_ops) * 300
         total_journal = existing_journal + pending_overhead + pending_body_bytes
-        if self._baseline_size > 0 and total_journal > self._baseline_size * _JOURNAL_COMPACT_RATIO:
+        # Only compact if the ratio AND the absolute floor are both exceeded
+        # — otherwise small volumes would rewrite themselves on almost every
+        # save, which defeats the delta-save win.
+        ratio_exceeded = (
+            self._baseline_size > 0
+            and total_journal > self._baseline_size * _JOURNAL_COMPACT_RATIO
+        )
+        if ratio_exceeded and total_journal > _JOURNAL_COMPACT_FLOOR:
             self.compact()
             return
-        # Tiny / empty baseline: avoid unbounded-ratio divide; just compact
-        # if the journal is already bigger than the baseline.
-        if self._baseline_size == 0 and total_journal > 1 << 20:  # >1 MB
+        # Empty baseline: compact only when the journal itself is large
+        # enough to care about (same floor).
+        if self._baseline_size == 0 and total_journal > _JOURNAL_COMPACT_FLOOR:
             self.compact()
             return
 
         self._append_journal()
 
+    def _coalesce_pending_ops(self) -> list[dict]:
+        """Collapse redundant ops before emitting to the journal.
+
+        * If a path has multiple writes in the same session, only the last
+          write's body matters (``_file_data`` already holds only the
+          latest blob); emit a single write record.
+        * If a write is followed by a delete on the same path, drop the
+          write entirely — persisting an orphan write record with an empty
+          body would be invalid on crash-recovery (replay would see a
+          chunk_count>0 entry with a 0-byte blob).
+        * Similarly, a mkdir immediately followed by rmdir is a no-op.
+
+        Returns the coalesced ops in the order they should be written.
+        Rename ops are preserved as-is — they're path-change edges in the
+        dependency graph, not content-change ops.
+        """
+        # Walk backwards: the last op for each path wins.  We track the
+        # final state per path and then replay the ops that matter.
+        last_effective: dict[str, dict] = {}
+        # Renames carry source + target; handle separately so we don't
+        # collapse /x→/y into a no-op when /y is later overwritten.
+        rename_chain: list[dict] = []
+        for op in self._pending_ops:
+            if op["type"] == "rename":
+                rename_chain.append(op)
+                continue
+            vpath = op["vpath"]
+            last_effective[vpath] = op
+
+        # Drop write+delete pairs: if the last op for a path is a delete /
+        # rmdir, and there was no rename of a different path INTO it, we
+        # can skip the delete for paths that never existed before this
+        # batch.  For simplicity we always emit the delete (it's cheap) but
+        # drop the preceding write (which would be garbage).
+        # The "last_effective" map already gives us this: we only emit the
+        # last op per path.
+        coalesced: list[dict] = []
+        emitted: set[str] = set()
+        # Preserve the temporal order of rename records relative to writes /
+        # deletes: rebuild in original order, skipping ops that aren't the
+        # final effective op for their path.
+        for op in self._pending_ops:
+            if op["type"] == "rename":
+                coalesced.append(op)
+                continue
+            vpath = op["vpath"]
+            if vpath in emitted:
+                continue
+            if last_effective.get(vpath) is op:
+                coalesced.append(op)
+                emitted.add(vpath)
+        return coalesced
+
     def _append_journal(self) -> None:
         """Append pending ops as journal records at end-of-file (v2)."""
+        ops = self._coalesce_pending_ops()
         with open(self.path, "r+b") as f:
             f.seek(0, 2)  # SEEK_END
-            for op in self._pending_ops:
+            for op in ops:
                 body = b""
                 if op["type"] == "write":
                     body = self._file_data.get(op["vpath"], b"")
+                    # Sanity: a write op whose blob was later popped (by a
+                    # delete on the same path) should have been coalesced
+                    # away.  If we still see an empty body with chunk_count
+                    # > 0, something slipped through — skip to avoid
+                    # persisting a broken record.
+                    if not body and op.get("chunk_count", 0) > 0:
+                        continue
                 body_offset = _write_journal_record(f, self.final_key, op, body)
                 if op["type"] == "write" and op["vpath"] in self.dir_index:
                     entry = self.dir_index[op["vpath"]]

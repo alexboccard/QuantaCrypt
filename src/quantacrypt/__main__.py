@@ -179,13 +179,14 @@ def main():
                         launcher._open_volumes(volume_path=arg)
                     except Exception as exc:
                         from tkinter import messagebox
+                        from quantacrypt.ui.shared import friendly_error
                         try:
                             launcher.deiconify()
                         except Exception:
                             pass
                         messagebox.showerror(
                             "Cannot open volume",
-                            f"{os.path.basename(arg)} could not be opened.\n\n{exc}",
+                            f"{os.path.basename(arg)}\n\n{friendly_error(exc)}",
                             parent=launcher,
                         )
                 root.after(100, _deferred_open)
@@ -198,10 +199,10 @@ def main():
                 pkg = load_pkg(arg)
             except (ValueError, OSError) as e:
                 from tkinter import messagebox
+                from quantacrypt.ui.shared import friendly_error
                 messagebox.showerror(
                     "Cannot open file",
-                    f"{os.path.basename(arg)} is not a valid"
-                    f" QuantaCrypt file.\n\n{e}",
+                    f"{os.path.basename(arg)}\n\n{friendly_error(e)}",
                     parent=root,
                 )
                 root.destroy()

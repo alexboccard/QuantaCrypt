@@ -183,6 +183,11 @@ class EncryptorApp(tk.Toplevel):
         self._pending_shares=[]
         self._scroll_job=None  # Track pending scroll so _reset can cancel it
         self._busy=False; self._on_close=on_close
+        # Cancel support: set by the Cancel button on the progress UI; the
+        # crypto stream checks this at chunk boundaries and raises
+        # CancelledOperation so the worker can delete the partial output.
+        import threading as _th
+        self._cancel_event = _th.Event()
         self._out_auto=False  # True when output path was auto-generated
         # Always wire WM_DELETE_WINDOW through _close so share guard fires
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -410,6 +415,13 @@ class EncryptorApp(tk.Toplevel):
         self._err.pack(fill="x",padx=P,pady=(0,8))
 
         self._prog=StagedProgressBar(b,[(n,w) for n,w,_ in STAGES])
+        # Cancel button row shown alongside the progress bar while busy.
+        self._cancel_row = tk.Frame(b, bg=C["bg"])
+        self._cancel_btn = FlatButton(
+            self._cancel_row, "Cancel", self._request_cancel,
+            primary=False, small=True,
+        )
+        self._cancel_btn.pack(side="right")
         self._results=tk.Frame(b,bg=C["bg"]); self._results.pack(fill="x",padx=P,pady=(0,12))
         # Keyboard shortcut hint
         tk.Label(b, text="Ctrl+O  Open file  ·  Ctrl+↵  Encrypt",
@@ -935,7 +947,10 @@ class EncryptorApp(tk.Toplevel):
                     f"{os.path.basename(out)} already exists. Overwrite it?",icon="warning"):
                 return
         self._err.config(text=""); self._busy=True
+        self._cancel_event.clear()
         self._prog.pack(fill="x",padx=self._P,pady=(0,4),before=self._results)
+        self._cancel_row.pack(fill="x", padx=self._P, pady=(0, 6), before=self._results)
+        self._cancel_btn.enable(True)
         self._prog.start(); self._freeze(); self._wiz.set_step(4)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
@@ -1168,14 +1183,16 @@ class EncryptorApp(tk.Toplevel):
                 payload_offset = f.tell()
 
                 # Stream-encrypt the source (file or zip) into the output file
+                _cancel_check = self._cancel_event.is_set
                 if p["mode"] == "single":
                     meta = cc.encrypt_single_streaming(
-                        src_path, f, p["pw"], filename=orig, progress_cb=self._prog_cb)
+                        src_path, f, p["pw"], filename=orig,
+                        progress_cb=self._prog_cb, cancel_check=_cancel_check)
                     shares = []
                 else:
                     meta, shares = cc.encrypt_shamir_streaming(
                         src_path, f, p["n"], p["k"], filename=orig,
-                        progress_cb=self._prog_cb)
+                        progress_cb=self._prog_cb, cancel_check=_cancel_check)
 
                 # Store payload_offset so decryptor can seek directly to chunks
                 meta["payload_offset"] = payload_offset
@@ -1195,6 +1212,10 @@ class EncryptorApp(tk.Toplevel):
             except OSError:
                 dec_size = 0
             self.after(0, self._done, out, shares, bool(dec), dec_size)
+        except cc.CancelledOperation:
+            try: os.remove(tmp)
+            except OSError: pass
+            self.after(0, self._cancelled)
         except Exception as ex:
             try: os.remove(tmp)
             except OSError: pass
@@ -1217,7 +1238,7 @@ class EncryptorApp(tk.Toplevel):
         return None
 
     def _done(self,out,shares,embedded=True,dec_size=0):
-        self._busy=False; self._prog.complete(); self._thaw()
+        self._busy=False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
         # set_step past the last step index → all circles show ✓ (complete state)
         self._wiz.set_step(len(self.STEPS))
         self._err.config(text="")                # Clear any stale busy/error message
@@ -1391,8 +1412,30 @@ class EncryptorApp(tk.Toplevel):
         # Restore focus to file card so keyboard users have a clear starting point
         self.after(20, self._file_card.focus_set)
 
+    def _request_cancel(self):
+        """Set the cancel flag; the worker's next chunk-boundary check
+        raises CancelledOperation and cleans up the partial output."""
+        if not self._busy:
+            return
+        self._cancel_event.set()
+        try:
+            self._cancel_btn.enable(False)
+        except Exception:
+            pass
+        self._err.config(text="Cancelling — finishing the current chunk…")
+
+    def _cancelled(self):
+        """Post-cancel UI reset."""
+        self._busy = False
+        self._prog.stop()
+        self._prog.pack_forget()
+        self._cancel_row.pack_forget()
+        self._thaw()
+        self._wiz.set_step(0)
+        self._err.config(text="Encryption cancelled — no output was written.")
+
     def _fail(self,msg):
-        self._busy=False; self._prog.stop(); self._prog.pack_forget(); self._thaw(); self._wiz.set_step(4)
+        self._busy=False; self._prog.stop(); self._prog.pack_forget(); self._cancel_row.pack_forget(); self._thaw(); self._wiz.set_step(4)
         if "No space left" in msg or "disk" in msg.lower():
             self._err.config(text="Not enough disk space. Free up some storage and try again.")
         elif "Permission" in msg or "Access is denied" in msg:

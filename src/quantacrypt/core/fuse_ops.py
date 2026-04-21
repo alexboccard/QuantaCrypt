@@ -373,8 +373,11 @@ class QuantaCryptFUSE:
         with self._lock:
             if vpath in self._dirty_files:
                 buf = self._file_buffers.get(vpath, bytearray())
-                self.volume.write_file(vpath, bytes(buf))
-                self.cache.put(vpath, bytes(buf))
+                # One materialisation of the bytes — write_file takes the
+                # same object the cache gets, instead of allocating twice.
+                snapshot = bytes(buf)
+                self.volume.write_file(vpath, snapshot)
+                self.cache.put(vpath, snapshot)
                 self._dirty_files.discard(vpath)
 
     def release(self, path: str, fh: int) -> None:
@@ -384,8 +387,9 @@ class QuantaCryptFUSE:
             # Flush if dirty
             if vpath in self._dirty_files:
                 buf = self._file_buffers.get(vpath, bytearray())
-                self.volume.write_file(vpath, bytes(buf))
-                self.cache.put(vpath, bytes(buf))
+                snapshot = bytes(buf)
+                self.volume.write_file(vpath, snapshot)
+                self.cache.put(vpath, snapshot)
                 self._dirty_files.discard(vpath)
 
             self._open_files.pop(fh, None)
@@ -433,8 +437,9 @@ class QuantaCryptFUSE:
         with self._lock:
             for vpath in list(self._dirty_files):
                 buf = self._file_buffers.get(vpath, bytearray())
-                self.volume.write_file(vpath, bytes(buf))
-                self.cache.put(vpath, bytes(buf))
+                snapshot = bytes(buf)
+                self.volume.write_file(vpath, snapshot)
+                self.cache.put(vpath, snapshot)
             self._dirty_files.clear()
             if self.volume.is_dirty:
                 self.volume.save()

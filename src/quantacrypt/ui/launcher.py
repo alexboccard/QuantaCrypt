@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """QuantaCrypt Launcher — home screen for the combined binary."""
 import os
+import sys
 import tkinter as tk
 
 from quantacrypt import __version__
 from quantacrypt.ui.shared import (
     C, F, UI,
-    fmt_size, rule,
+    fmt_size, rule, friendly_error,
     FlatButton, RecentFiles,
 )
 
@@ -40,17 +41,31 @@ class LauncherApp(tk.Toplevel):
         # Check for updates in the background (non-blocking)
         from quantacrypt.ui.updater import check_for_update
         check_for_update(self, __version__)
-        # Keyboard shortcuts: Ctrl+E → Encrypt, Ctrl+D → Decrypt, Ctrl+I → Inspect, Ctrl+V → Volumes
-        self.bind("<Control-e>", lambda e: self._open_encryptor())
-        self.bind("<Control-E>", lambda e: self._open_encryptor())
-        self.bind("<Control-d>", lambda e: self._open_decryptor())
-        self.bind("<Control-D>", lambda e: self._open_decryptor())
-        self.bind("<Control-i>", lambda e: self._inspect_file())
-        self.bind("<Control-I>", lambda e: self._inspect_file())
-        self.bind("<Control-v>", lambda e: self._open_volumes())
-        self.bind("<Control-V>", lambda e: self._open_volumes())
-        # Escape quits the app
+        # Keyboard shortcuts.  Bind both the Ctrl+ variant (Linux/Win
+        # convention) and the Cmd+ variant (macOS convention); Tk on
+        # macOS maps Cmd to Meta/Command, so binding both gives users
+        # either a platform-native or familiar shortcut.
+        _shortcuts = {
+            "e": self._open_encryptor,
+            "E": self._open_encryptor,
+            "d": self._open_decryptor,
+            "D": self._open_decryptor,
+            "i": self._inspect_file,
+            "I": self._inspect_file,
+            "v": self._open_volumes,
+            "V": self._open_volumes,
+        }
+        for key, handler in _shortcuts.items():
+            self.bind(f"<Control-{key}>", lambda e, h=handler: h())
+            if sys.platform == "darwin":
+                self.bind(f"<Command-{key}>", lambda e, h=handler: h())
+        # Escape quits the app; Cmd+W closes the window (macOS convention)
         self.bind("<Escape>", lambda e: self.master.destroy())
+        if sys.platform == "darwin":
+            self.bind("<Command-w>", lambda e: self.master.destroy())
+            self.bind("<Command-W>", lambda e: self.master.destroy())
+            self.bind("<Command-q>", lambda e: self.master.destroy())
+            self.bind("<Command-Q>", lambda e: self.master.destroy())
         self.protocol("WM_DELETE_WINDOW", self.master.destroy)
         # Drag-and-drop: drop a .qcx → open decryptor
         if _DND_FILES:
@@ -68,19 +83,31 @@ class LauncherApp(tk.Toplevel):
             raw = event.data.strip()
             if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
             paths = [raw.split("} {")[0]]
-        if not paths or not os.path.isfile(paths[0]):
+        # Accept any combination of .qcx / .qcv files dropped together.
+        # Previously we only honoured paths[0] and silently lost the rest;
+        # for multi-file drops this looked like an app bug.  We only open
+        # one wizard window at a time (the remaining paths queue behind
+        # the first on the Tk event loop via after()).
+        accepted = [
+            p for p in paths
+            if os.path.isfile(p)
+            and os.path.splitext(p)[1].lower() in (".qcx", ".qcv")
+        ]
+        if not accepted:
             return
-        path = paths[0]
-        # Strict extension check: only accept paths whose final extension
-        # is exactly .qcx or .qcv.  Guards against .qcv.bak / .qcv.tmp
-        # landing in the volume manager (which would just fail late).
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".qcv":
-            self._open_volumes(volume_path=path)
-        elif ext == ".qcx":
-            self._open_qcx(path)
-        # Silently ignore other extensions — the hint already tells the user
-        # which file types the launcher accepts.
+
+        def _dispatch(path: str):
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".qcv":
+                self._open_volumes(volume_path=path)
+            else:
+                self._open_qcx(path)
+
+        # First file opens immediately; any additional files open after
+        # the current wizard closes (they queue as after() callbacks).
+        _dispatch(accepted[0])
+        for extra in accepted[1:]:
+            self.after(1, lambda p=extra: _dispatch(p))
 
     def _center(self):
         self.update_idletasks()
@@ -329,7 +356,7 @@ class LauncherApp(tk.Toplevel):
             self.deiconify()
             messagebox.showerror(
                 "Cannot open window",
-                f"Something went wrong opening that screen.\n\n{exc}",
+                f"Something went wrong opening that screen.\n\n{friendly_error(exc)}",
                 parent=self,
             )
 
@@ -369,7 +396,7 @@ class LauncherApp(tk.Toplevel):
             from tkinter import messagebox
             messagebox.showerror(
                 "Cannot open file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         cx = self.winfo_x() + self.winfo_width() // 2
@@ -388,7 +415,7 @@ class LauncherApp(tk.Toplevel):
             from tkinter import messagebox
             messagebox.showerror(
                 "Cannot open file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         cx = self.winfo_x() + self.winfo_width() // 2
@@ -409,8 +436,9 @@ class LauncherApp(tk.Toplevel):
         try:
             pkg = load_pkg(path)
         except Exception as e:
-            messagebox.showerror("Cannot read file",
-                f"{os.path.basename(path)} is not a valid QuantaCrypt file.\n\n{e}",
+            messagebox.showerror(
+                "Cannot read file",
+                f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
         meta = pkg["meta"]

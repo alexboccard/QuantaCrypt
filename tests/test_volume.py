@@ -1832,28 +1832,30 @@ class TestFormatV2Journal:
         assert vc2.dir_index["/docs/"].get("type") == "dir"
 
     def test_auto_compact_when_journal_exceeds_ratio(self, tmp_dir):
-        """Heuristic: once the journal grows past 30% of the baseline,
-        save() performs a full compact instead of appending."""
+        """Heuristic: once the journal grows past 30% of the baseline AND
+        exceeds the absolute floor, save() performs a full compact instead
+        of appending."""
         path, key = self._open(tmp_dir, "autocompact.qcv")
         vc = vol.VolumeContainer(path, key)
         vc.open()
-        # 1 MB baseline → 30% threshold ≈ 307 KB.
-        vc.write_file("/baseline.bin", b"B" * (1 << 20))
+        # 64 MB baseline → 30% ratio threshold ≈ 19.6 MB; floor is 8 MB.
+        # Use a deterministic, compressible pattern so the encrypted blob
+        # is close to the plaintext size plus per-chunk GCM overhead.
+        baseline_bytes = 64 << 20
+        vc.write_file("/baseline.bin", b"B" * baseline_bytes)
         vc.compact()
         baseline_size = vc._baseline_size
-        threshold = int(baseline_size * 0.3)
 
-        # First small write (~100 KB) appends — well under the threshold.
-        vc.write_file("/x.bin", b"X" * (100 * 1024))
+        # First small write (~1 MB) appends — well under both the ratio
+        # and the 8 MB floor.
+        vc.write_file("/x.bin", b"X" * (1 << 20))
         vc.save()
         journal_after_append = os.path.getsize(path) - vc._journal_start
-        assert 0 < journal_after_append < threshold, (
-            f"expected small journal ({journal_after_append} < {threshold})"
-        )
+        assert 0 < journal_after_append < (8 << 20)
 
-        # Next write (~400 KB) would push the journal past 30% of baseline,
-        # so save() rolls into a compact instead of appending.
-        vc.write_file("/y.bin", b"Y" * (400 * 1024))
+        # Next write (~25 MB) pushes the journal past both the ratio
+        # threshold and the 8 MB floor, so save() rolls into a compact.
+        vc.write_file("/y.bin", b"Y" * (25 << 20))
         vc.save()
 
         assert vc._pending_ops == []
@@ -1978,18 +1980,19 @@ class TestFormatV2Journal:
 
     def test_small_baseline_compact_when_journal_big(self, tmp_dir):
         """Volumes with an empty/tiny baseline still auto-compact once the
-        journal exceeds 1 MB — covers the "avoid unbounded-ratio divide"
-        branch in save()."""
+        journal exceeds the 8 MB floor — covers the "avoid unbounded-ratio
+        divide" branch in save()."""
         path, key = self._open(tmp_dir, "tiny.qcv")
         vc = vol.VolumeContainer(path, key)
         vc.open()
         assert vc._baseline_size == 0
-        # A single 1.5 MB write trips the empty-baseline compact guard.
-        vc.write_file("/big.bin", b"Q" * (int(1.5 * (1 << 20))))
+        # A single 10 MB write trips the empty-baseline compact guard
+        # (8 MB floor).
+        vc.write_file("/big.bin", b"Q" * (10 << 20))
         vc.save()
         # After compact, the volume is one big baseline with no journal.
         assert os.path.getsize(path) == vc._journal_start
-        assert vc._baseline_size > 1 << 20
+        assert vc._baseline_size > (8 << 20)
 
     def test_replay_rejects_malformed_vpath(self, tmp_dir):
         """Replay skips records whose vpath is missing/non-absolute instead

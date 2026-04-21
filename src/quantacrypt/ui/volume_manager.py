@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 from quantacrypt.core import volume as vol
 from quantacrypt.ui.shared import (
     C, F, UI,
-    styled_entry, bind_context_menu, fmt_size, rule,
+    styled_entry, bind_context_menu, fmt_size, rule, friendly_error,
     FlatButton, SegmentedControl, StagedProgressBar,
     PasswordStrengthBar, WizardSteps, ClipboardTimer,
     notify,
@@ -266,7 +266,7 @@ class VolumeManagerApp(tk.Toplevel):
                     self.after(0, lambda: self._on_create_done(
                         path, meta, shares=shares))
             except Exception as e:
-                self.after(0, lambda: self._on_create_error(str(e)))
+                self.after(0, lambda exc=e: self._on_create_error(exc))
 
         def _progress(msg):
             idx, label = _find_stage(msg)
@@ -292,11 +292,16 @@ class VolumeManagerApp(tk.Toplevel):
             )
         self._create_btn.enable(True)
 
-    def _on_create_error(self, err: str):
+    def _on_create_error(self, err):
         self._progress.stop()
         self._create_btn.enable(True)
-        messagebox.showerror("Error", f"Failed to create volume:\n{err}",
-                             parent=self)
+        # Accept either an exception or a raw string; translate to a
+        # user-friendly message before displaying.
+        if isinstance(err, BaseException):
+            msg = friendly_error(err)
+        else:
+            msg = str(err)
+        messagebox.showerror("Volume creation failed", msg, parent=self)
 
     def _show_shares_dialog(self, shares: list[str], meta: dict):
         win = tk.Toplevel(self)
@@ -764,7 +769,7 @@ class VolumeManagerApp(tk.Toplevel):
                 self.after(0, lambda: self._on_mount_done(mount_point))
 
             except Exception as e:
-                self.after(0, lambda: self._mount_error(str(e)))
+                self.after(0, lambda exc=e: self._mount_error(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -776,10 +781,12 @@ class VolumeManagerApp(tk.Toplevel):
                f"Encrypted volume mounted at {mount_point}")
         self._refresh_mounted_list()
 
-    def _mount_error(self, msg: str):
+    def _mount_error(self, msg):
         self._mount_btn.enable(True)
         self._mount_status.config(text="", fg=C["text3"])
-        messagebox.showerror("Mount Error", msg, parent=self)
+        if isinstance(msg, BaseException):
+            msg = friendly_error(msg)
+        messagebox.showerror("Mount failed", msg, parent=self)
 
     def _do_unmount(self, mount_point: str):
         """Unmount a specific volume and refresh the list."""
@@ -789,7 +796,7 @@ class VolumeManagerApp(tk.Toplevel):
             self._mount_status.config(
                 text=f"Unmounted {mount_point}", fg=C["success"])
         except Exception as e:
-            messagebox.showerror("Unmount Error", str(e), parent=self)
+            messagebox.showerror("Unmount failed", friendly_error(e), parent=self)
         self._refresh_mounted_list()
 
     @staticmethod
