@@ -212,7 +212,10 @@ def _patch_plist(app_path, icon_name, vol_icon_name=None):
             "LSHandlerRank": "Owner",
             "LSItemContentTypes": [QCV_UTI],
             "CFBundleTypeExtensions": ["qcv"],
-            **({"CFBundleTypeIconFile": vol_icon_name or icon_name} if (vol_icon_name or icon_name) else {}),
+            # Only attach the .qcv icon when we actually generated one — do
+            # NOT silently fall back to the .qcx doc icon, which would make
+            # the two file types visually indistinguishable in Finder.
+            **({"CFBundleTypeIconFile": vol_icon_name} if vol_icon_name else {}),
         },
     ]
 
@@ -237,7 +240,9 @@ def _patch_plist(app_path, icon_name, vol_icon_name=None):
                 "public.filename-extension": ["qcv"],
                 "public.mime-type": "application/x-quantacrypt-volume",
             },
-            **({"UTTypeIconFile": vol_icon_name or icon_name} if (vol_icon_name or icon_name) else {}),
+            # As above: only attach a per-UTI icon when we have a real .qcv
+            # icon; avoid the .qcx icon masquerading as the .qcv icon.
+            **({"UTTypeIconFile": vol_icon_name} if vol_icon_name else {}),
         },
     ]
 
@@ -576,6 +581,24 @@ def main():
 
     if args.test_only:
         return
+
+    # ── Gate: the optional `strength` extra must be installed so the shipped
+    # binary has working password-strength feedback.  zxcvbn is listed in
+    # HIDDEN above, but PyInstaller silently drops unresolved hidden imports
+    # — the resulting app would fall back to a much weaker built-in estimator
+    # without any indication to the user.  Refuse to build rather than ship
+    # a quietly-degraded binary.
+    try:
+        import zxcvbn  # noqa: F401
+    except ImportError:
+        print(
+            "\n[!] zxcvbn is not installed in this environment.\n"
+            "    The password-strength meter and weak-password warning "
+            "would silently degrade in the built binary.\n"
+            "    Install it with:\n"
+            "        pip install -e \".[dev,dnd,strength]\"\n"
+        )
+        sys.exit(1)
 
     icon_args, icon_tmp = _build_icon()
     doc_icon_tmp = _build_doc_icon()

@@ -68,12 +68,19 @@ class LauncherApp(tk.Toplevel):
             raw = event.data.strip()
             if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
             paths = [raw.split("} {")[0]]
-        if paths and os.path.isfile(paths[0]):
-            path = paths[0]
-            if path.lower().endswith(".qcv"):
-                self._open_volumes(volume_path=path)
-            else:
-                self._open_qcx(path)
+        if not paths or not os.path.isfile(paths[0]):
+            return
+        path = paths[0]
+        # Strict extension check: only accept paths whose final extension
+        # is exactly .qcx or .qcv.  Guards against .qcv.bak / .qcv.tmp
+        # landing in the volume manager (which would just fail late).
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".qcv":
+            self._open_volumes(volume_path=path)
+        elif ext == ".qcx":
+            self._open_qcx(path)
+        # Silently ignore other extensions — the hint already tells the user
+        # which file types the launcher accepts.
 
     def _center(self):
         self.update_idletasks()
@@ -304,22 +311,46 @@ class LauncherApp(tk.Toplevel):
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
+    def _safe_open_wizard(self, build_wizard):
+        """Withdraw the launcher, construct a wizard, recover on failure.
+
+        Previously the launcher called self.withdraw() *before* the wizard's
+        import/constructor ran.  If construction raised (missing optional
+        dependency, disk error, etc.), the launcher stayed hidden and the
+        user saw a running process with no visible window.  This wrapper
+        re-shows the launcher and surfaces the error in a dialog so the
+        user can recover without force-quitting.
+        """
+        from tkinter import messagebox
+        self.withdraw()
+        try:
+            build_wizard()
+        except Exception as exc:
+            self.deiconify()
+            messagebox.showerror(
+                "Cannot open window",
+                f"Something went wrong opening that screen.\n\n{exc}",
+                parent=self,
+            )
+
     def _open_volumes(self, volume_path: str | None = None):
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        from quantacrypt.ui.volume_manager import VolumeManagerApp
-        VolumeManagerApp(
-            self.master, on_close=self.deiconify, center_at=(cx, cy),
-            volume_path=volume_path,
-        )
+        def _build():
+            from quantacrypt.ui.volume_manager import VolumeManagerApp
+            VolumeManagerApp(
+                self.master, on_close=self.deiconify, center_at=(cx, cy),
+                volume_path=volume_path,
+            )
+        self._safe_open_wizard(_build)
 
     def _open_encryptor(self):
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        from quantacrypt.ui.encryptor import EncryptorApp
-        EncryptorApp(self.master, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            from quantacrypt.ui.encryptor import EncryptorApp
+            EncryptorApp(self.master, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
     def _open_decryptor(self):
         """Trigger a file picker immediately so the Decrypt card does what it says.
@@ -343,9 +374,10 @@ class LauncherApp(tk.Toplevel):
             return
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        from quantacrypt.ui.decryptor import DecryptorApp
-        DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            from quantacrypt.ui.decryptor import DecryptorApp
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
     def _open_qcx(self, path):
         """Open a specific .qcx file directly in the decryptor."""
@@ -361,8 +393,9 @@ class LauncherApp(tk.Toplevel):
             return
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
-        self.withdraw()
-        DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        def _build():
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+        self._safe_open_wizard(_build)
 
 
     def _inspect_file(self):

@@ -9,6 +9,7 @@ Launch behaviour:
 
 import os
 import sys
+import threading
 
 # When running as a frozen PyInstaller bundle, _MEIPASS is the temp dir
 # containing unpacked resources.  Add it to sys.path so that bundled
@@ -21,6 +22,12 @@ else:
 
 from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
 
+# Apple Events can fire concurrently if the user drops multiple files on the
+# dock icon in quick succession.  Without a lock, two invocations can each
+# create wizards that race on the same underlying file.  The lock makes each
+# event handle its paths to completion before the next one starts.
+_open_document_lock = threading.Lock()
+
 
 def _register_open_document(root):
     """Register a macOS Apple Event handler for opening .qcx/.qcv files.
@@ -31,23 +38,34 @@ def _register_open_document(root):
     callback so those files are routed to the appropriate screen automatically.
     """
     def _open_document(*paths):
-        for path in paths:
-            if not os.path.isfile(path):
-                continue
-            # .qcv → Volume Manager (mount mode)
-            if path.lower().endswith(".qcv"):
-                from quantacrypt.ui.volume_manager import VolumeManagerApp
-                VolumeManagerApp(root, volume_path=path)
-                continue
-            # .qcx → Decryptor
-            try:
-                pkg = load_pkg(path)
-            except (ValueError, OSError):
-                continue
-            # Provide on_close so closing this window doesn't leave
-            # the app running with no visible windows
-            DecryptorApp(root, payload=pkg, qcx_path=path,
-                         on_close=lambda: None)
+        # Serialize handler invocations so multiple files dropped on the
+        # dock icon don't spawn racing wizards.
+        with _open_document_lock:
+            for path in paths:
+                if not os.path.isfile(path):
+                    continue
+                # .qcv → Volume Manager (mount mode)
+                if path.lower().endswith(".qcv"):
+                    try:
+                        from quantacrypt.ui.volume_manager import VolumeManagerApp
+                        VolumeManagerApp(root, volume_path=path)
+                    except Exception:
+                        # Swallow import/ctor errors so the Apple Event loop
+                        # doesn't wedge; the user can retry via the launcher.
+                        pass
+                    continue
+                # .qcx → Decryptor
+                try:
+                    pkg = load_pkg(path)
+                except (ValueError, OSError):
+                    continue
+                # Provide on_close so closing this window doesn't leave
+                # the app running with no visible windows
+                try:
+                    DecryptorApp(root, payload=pkg, qcx_path=path,
+                                 on_close=lambda: None)
+                except Exception:
+                    pass
 
     try:
         root.createcommand("::tk::mac::OpenDocument", _open_document)
@@ -116,8 +134,25 @@ def main():
             if arg.lower().endswith(".qcv"):
                 from quantacrypt.ui.launcher import LauncherApp
                 launcher = LauncherApp(root)
-                # Defer volume open until after mainloop starts
-                root.after(100, lambda: launcher._open_volumes(volume_path=arg))
+                # Defer volume open until after mainloop starts.  Wrap in a
+                # try/except so that a failed import or constructor (e.g.
+                # missing fusepy) doesn't leave the launcher withdrawn with
+                # no visible window — the user sees an error dialog instead.
+                def _deferred_open():
+                    try:
+                        launcher._open_volumes(volume_path=arg)
+                    except Exception as exc:
+                        from tkinter import messagebox
+                        try:
+                            launcher.deiconify()
+                        except Exception:
+                            pass
+                        messagebox.showerror(
+                            "Cannot open volume",
+                            f"{os.path.basename(arg)} could not be opened.\n\n{exc}",
+                            parent=launcher,
+                        )
+                root.after(100, _deferred_open)
                 root.mainloop()
                 return
 

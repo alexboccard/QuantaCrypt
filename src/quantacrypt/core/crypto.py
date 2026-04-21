@@ -115,7 +115,10 @@ def _verify_meta_hmac(key_material: bytes, meta: dict) -> bool:
     stored   = meta["hmac"]
     # Exclude structural/display fields that are present in meta at decryption time
     # but were NOT in auth_fields when the HMAC was computed at encryption time.
-    _EXCLUDED = {"hmac", "version", "mode", "key_bits", "threshold", "total",
+    # "format_version" and "created_at" are .qcv-only fields — excluding them is a
+    # no-op for .qcx metadata (which uses "version" and lacks "created_at").
+    _EXCLUDED = {"hmac", "version", "format_version", "created_at",
+                 "mode", "key_bits", "threshold", "total",
                  "chunk_size", "payload_offset"}
     fields   = {k: v for k, v in meta.items() if k not in _EXCLUDED}
     expected = _meta_hmac(key_material, fields)
@@ -136,6 +139,10 @@ def kyber_decaps(sk: bytes, kem_ct: bytes) -> bytes:
 
 
 def shamir_split(secret_bytes: bytes, n: int, k: int) -> list[dict]:
+    if not (2 <= k <= n <= 255):
+        raise ValueError(
+            f"Invalid Shamir parameters: need 2 <= k <= n <= 255 (got k={k}, n={n})"
+        )
     secret_int = int.from_bytes(secret_bytes, "big")
     if secret_int >= SHAMIR_PRIME:
         raise ValueError(f"Secret ({len(secret_bytes)*8} bits) exceeds M521 prime — cannot split safely")
@@ -144,6 +151,20 @@ def shamir_split(secret_bytes: bytes, n: int, k: int) -> list[dict]:
              "threshold": k} for s in shares]
 
 def shamir_recover(share_dicts: list[dict]) -> bytes:
+    if not share_dicts:
+        raise ValueError("Cannot recover from an empty share list")
+    # If every share carries a threshold, reject obviously-insufficient sets
+    # before asking the library to do something undefined.  A stored threshold
+    # is advisory: the library will still attempt recovery with fewer, but the
+    # result would be garbage rather than an error.
+    thresholds = {s.get("threshold") for s in share_dicts if "threshold" in s}
+    if thresholds and all(t is not None for t in thresholds):
+        min_threshold = min(thresholds)  # be lenient if shares disagree
+        if len(share_dicts) < min_threshold:
+            raise ValueError(
+                f"Not enough shares to recover the secret "
+                f"(have {len(share_dicts)}, need at least {min_threshold})"
+            )
     objs       = [shamirs.shamirs.share(s["index"], s["value"], s["modulus"]) for s in share_dicts]
     secret_int = shamirs.recover(objs)
     if secret_int < 0 or secret_int >= (1 << (KEY_BYTES * 8)):

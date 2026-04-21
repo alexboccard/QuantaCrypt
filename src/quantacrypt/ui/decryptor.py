@@ -1189,8 +1189,17 @@ class DecryptorApp(tk.Toplevel):
             out_size = os.path.getsize(tmp)
 
             # Build the final output path from the original filename stored in
-            # the payload.  Fall back to a generic name if fname is absent.
-            orig_basename = os.path.basename(fname) if fname else "decrypted"
+            # the payload.  basename() already blocks path traversal; also
+            # strip null bytes and control characters that would land in the
+            # filesystem as invisible / unusable filenames, and fall back to
+            # a generic name if nothing usable remains.
+            orig_basename = os.path.basename(fname) if fname else ""
+            orig_basename = "".join(
+                ch for ch in orig_basename
+                if ch.isprintable() and ch not in ("/", "\0")
+            ).strip().strip(".")
+            if not orig_basename:
+                orig_basename = "decrypted"
             out = os.path.join(out_dir, orig_basename)
             root, ext = os.path.splitext(orig_basename)
             n = 2

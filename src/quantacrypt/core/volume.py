@@ -454,7 +454,9 @@ def create_volume_shamir(
         "created_at": int(time.time()),
         **auth_fields,
     }
-    metadata["hmac"] = _meta_hmac(master_key, auth_fields)
+    # HMAC under final_key (not master_key) so that VolumeContainer.open()
+    # can verify it without having to plumb master_key through the mount API.
+    metadata["hmac"] = _meta_hmac(final_key, auth_fields)
 
     dir_index: dict[str, Any] = {}
 
@@ -520,6 +522,12 @@ class VolumeContainer:
                 "or the volume file is corrupt"
             ) from exc
 
+        # Verify metadata HMAC to detect tampering with the auth fields
+        # (argon_salt, kyber_kem_ct, kyber_sk_enc_nonce, kyber_sk_enc).  Both
+        # volume modes now HMAC under final_key, so this works for single and
+        # shamir without additional plumbing.
+        _verify_meta_hmac(self.final_key, self.metadata)
+
         try:
             self.dir_index = decrypt_directory(
                 self.final_key, self.header["dir_nonce"], dir_ct
@@ -529,6 +537,24 @@ class VolumeContainer:
                 "Could not decrypt volume directory index — "
                 "the volume file may be corrupt"
             ) from exc
+
+        # Validate directory index keys: reject absolute-escape, traversal,
+        # and non-absolute entries that an attacker could inject by tampering
+        # with the encrypted directory block on disk.  AES-GCM already catches
+        # bit flips, but this is defense-in-depth.
+        for vpath in self.dir_index:
+            if not vpath.startswith("/"):
+                raise ValueError(
+                    f"Directory entry has non-absolute path: {vpath!r} "
+                    "— the volume file may be corrupt or tampered with"
+                )
+            # Normalize and confirm no '..' segments survive
+            parts = [p for p in vpath.split("/") if p not in ("", ".")]
+            if any(p == ".." for p in parts):
+                raise ValueError(
+                    f"Directory entry contains path traversal: {vpath!r} "
+                    "— the volume file may be tampered with"
+                )
 
         # Parse file data blobs by offset
         for vpath, entry in self.dir_index.items():
@@ -580,16 +606,44 @@ class VolumeContainer:
             raise IsADirectoryError(f"Is a directory: {vpath}")
 
         blob = self._file_data.get(vpath, b"")
-        if not blob and entry.get("chunk_count", 0) > 0:
+        chunk_count = entry.get("chunk_count", 0)
+        size = entry.get("size", 0)
+        data_length = entry.get("data_length", 0)
+        chunk_size = self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
+
+        # Defense-in-depth bounds check: reject absurd chunk_count /
+        # data_length that a tampered directory entry could inject.  Without
+        # this, a malformed entry with chunk_count = 2**32 - 1 would loop
+        # forever or OOM before AES-GCM authentication could catch it.
+        if not isinstance(chunk_count, int) or chunk_count < 0:
+            raise ValueError(f"Invalid chunk_count for {vpath}: {chunk_count!r}")
+        # Expected max chunks given the declared plaintext size; allow a small
+        # slop factor for the final partial chunk.
+        max_expected_chunks = max(1, (size + chunk_size - 1) // chunk_size) if size else 1
+        if chunk_count > max_expected_chunks:
+            raise ValueError(
+                f"chunk_count for {vpath} ({chunk_count}) exceeds what {size} "
+                f"bytes at chunk_size {chunk_size} would produce "
+                f"(max {max_expected_chunks}) — directory entry may be corrupt"
+            )
+        # Declared data_length must match the on-disk blob; a mismatch
+        # indicates truncation or tampering that the hash check may miss.
+        if data_length != len(blob):
+            raise ValueError(
+                f"data_length for {vpath} ({data_length}) does not match "
+                f"blob length ({len(blob)}) — directory entry may be corrupt"
+            )
+
+        if not blob and chunk_count > 0:
             raise ValueError(f"File data missing for {vpath}")
 
-        if entry.get("chunk_count", 0) == 0:
+        if chunk_count == 0:
             return b""
 
         plaintext = decrypt_file_data(
             blob, self.final_key,
             base64.b64decode(entry["nonce"]),
-            entry["chunk_count"],
+            chunk_count,
         )
 
         if verify_hash and "content_hash" in entry:

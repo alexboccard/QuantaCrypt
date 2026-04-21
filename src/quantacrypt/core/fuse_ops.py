@@ -415,6 +415,25 @@ class QuantaCryptFUSE:
                 self._dirty_files.discard(old_vp)
                 self._dirty_files.add(new_vp)
 
+    def save_all_dirty(self) -> None:
+        """Flush all dirty FUSE buffers to the volume, then persist the volume.
+
+        Acquires the FUSE ops lock so this cannot race with an in-flight
+        flush(), release(), write(), or other FS operation.  Used by
+        unmount_volume() and _emergency_save_all() to ensure the volume on
+        disk reflects the latest buffered writes.  Without this, an unmount
+        or signal-driven shutdown could persist stale volume data even though
+        the user's writes had already been accepted.
+        """
+        with self._lock:
+            for vpath in list(self._dirty_files):
+                buf = self._file_buffers.get(vpath, bytearray())
+                self.volume.write_file(vpath, bytes(buf))
+                self.cache.put(vpath, bytes(buf))
+            self._dirty_files.clear()
+            if self.volume.is_dirty:
+                self.volume.save()
+
 
 # ── Mount / Unmount API ─────────────────────────────────────────────────────
 
@@ -430,18 +449,24 @@ def _emergency_save_all() -> None:
     """Save all dirty mounted volumes.
 
     Called by atexit and signal handlers to prevent data loss on
-    app exit or crash.  Errors are logged but never raised so that
-    the shutdown sequence is not interrupted.
+    app exit or crash.  Routes through QuantaCryptFUSE.save_all_dirty()
+    so that buffered writes not yet flushed are still persisted.
+    Errors are logged but never raised so that the shutdown sequence
+    is not interrupted.
     """
     for mp in list(_mounted_volumes):
         info = _mounted_volumes.get(mp)
         if info is None:
             continue
         try:
-            vc = info["volume"]
-            if vc.is_dirty:
-                logger.info("Shutdown: saving dirty volume at %s", mp)
-                vc.save()
+            fuse_obj = info.get("fuse")
+            if fuse_obj is not None:
+                logger.info("Shutdown: saving dirty state for volume at %s", mp)
+                fuse_obj.save_all_dirty()
+            else:
+                vc = info["volume"]
+                if vc.is_dirty:
+                    vc.save()
         except Exception:
             logger.exception("Shutdown: failed to save volume at %s", mp)
 
@@ -535,17 +560,28 @@ def mount_volume(
 def unmount_volume(mount_point: str) -> None:
     """Unmount a volume and save any pending changes.
 
-    Saves dirty data **before** removing from the tracking dict so that
-    ``_emergency_save_all`` can still reach the volume if save() fails.
+    Saves dirty data (including buffered FUSE writes) **before** removing
+    from the tracking dict so that ``_emergency_save_all`` can still reach
+    the volume if save() fails.  The external unmount subprocess is only
+    invoked for paths we actually own — we do not run diskutil/fusermount
+    against an arbitrary path passed in by a caller.
     """
     import subprocess
     import sys
 
     info = _mounted_volumes.get(mount_point)
-    if info is not None:
-        if info["volume"].is_dirty:
-            info["volume"].save()
-        _mounted_volumes.pop(mount_point, None)
+    if info is None:
+        raise ValueError(
+            f"No QuantaCrypt volume is tracked at {mount_point!r} — "
+            "refusing to run unmount against a path we do not own"
+        )
+
+    fuse_obj = info.get("fuse")
+    if fuse_obj is not None:
+        fuse_obj.save_all_dirty()
+    elif info["volume"].is_dirty:
+        info["volume"].save()
+    _mounted_volumes.pop(mount_point, None)
 
     # Use platform-appropriate unmount
     if sys.platform == "darwin":

@@ -1382,9 +1382,14 @@ class TestUnmountVolume:
         assert mp not in _mounted_volumes
 
     def test_unmount_unknown_mount_point(self, tmp_dir):
-        """unmount_volume handles unknown mount points gracefully."""
-        # Should not raise
-        unmount_volume("/nonexistent/mount/point")
+        """unmount_volume refuses to operate on untracked mount points.
+
+        Running diskutil/fusermount against an arbitrary path would risk
+        tearing down another app's FUSE mount, so unmount_volume now raises
+        ValueError when the caller passes a path we do not own.
+        """
+        with pytest.raises(ValueError, match="No QuantaCrypt volume is tracked"):
+            unmount_volume("/nonexistent/mount/point")
 
     def test_unmount_clean_volume(self, tmp_dir):
         """unmount_volume works for clean (non-dirty) volumes."""
@@ -1534,6 +1539,135 @@ class TestCorruptVolumeOpen:
         # Verify .tmp doesn't linger after successful save
         vc.save()
         assert not os.path.exists(path + ".tmp")
+
+    def test_open_rejects_missing_hmac(self, tmp_dir):
+        """Volume whose metadata HMAC has been stripped fails to open.
+
+        Regression guard: VolumeContainer.open() must call _verify_meta_hmac
+        after decrypting metadata.  If it skips verification, stripping the
+        HMAC field would silently open with undetected tampered auth fields.
+        """
+        path = os.path.join(tmp_dir, "no_hmac.qcv")
+        password = "hmacpw"
+        meta = vol.create_volume_single(path, password)
+        final_key = vol.derive_volume_key_single(password, meta)
+
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.metadata.pop("hmac", None)
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, final_key)
+        with pytest.raises(ValueError, match="HMAC"):
+            vc2.open()
+
+    def test_open_rejects_tampered_hmac(self, tmp_dir):
+        """Flipping the stored HMAC byte-for-byte causes open() to fail."""
+        path = os.path.join(tmp_dir, "bad_hmac.qcv")
+        password = "hmacpw2"
+        meta = vol.create_volume_single(path, password)
+        final_key = vol.derive_volume_key_single(password, meta)
+
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.metadata["hmac"] = "A" * len(vc.metadata["hmac"])
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, final_key)
+        with pytest.raises(ValueError, match="authentication failed"):
+            vc2.open()
+
+    def test_open_rejects_non_absolute_dir_entry(self, tmp_dir):
+        """Directory index with a non-absolute path is rejected."""
+        path = os.path.join(tmp_dir, "nonabs.qcv")
+        password = "pathpw"
+        meta = vol.create_volume_single(path, password)
+        final_key = vol.derive_volume_key_single(password, meta)
+
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.dir_index["relative/path.txt"] = {
+            "type": "file",
+            "size": 0,
+            "mode": 0o100644,
+            "mtime": 0,
+            "nonce": base64.b64encode(b"\x00" * 12).decode(),
+            "chunk_count": 0,
+            "data_offset": 0,
+            "data_length": 0,
+        }
+        vc._dirty = True
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, final_key)
+        with pytest.raises(ValueError, match="non-absolute path"):
+            vc2.open()
+
+    def test_open_rejects_path_traversal_entry(self, tmp_dir):
+        """Directory index containing a '..' segment is rejected."""
+        path = os.path.join(tmp_dir, "traversal.qcv")
+        password = "pathpw"
+        meta = vol.create_volume_single(path, password)
+        final_key = vol.derive_volume_key_single(password, meta)
+
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.dir_index["/legit/../escape.txt"] = {
+            "type": "file",
+            "size": 0,
+            "mode": 0o100644,
+            "mtime": 0,
+            "nonce": base64.b64encode(b"\x00" * 12).decode(),
+            "chunk_count": 0,
+            "data_offset": 0,
+            "data_length": 0,
+        }
+        vc._dirty = True
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, final_key)
+        with pytest.raises(ValueError, match="path traversal"):
+            vc2.open()
+
+
+class TestReadFileBounds:
+    """Defensive bounds checks in VolumeContainer.read_file()."""
+
+    def test_read_rejects_negative_chunk_count(self, tmp_dir):
+        path = os.path.join(tmp_dir, "neg.qcv")
+        pw = "x"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.write_file("/f.txt", b"data")
+        vc.dir_index["/f.txt"]["chunk_count"] = -1
+        with pytest.raises(ValueError, match="Invalid chunk_count"):
+            vc.read_file("/f.txt")
+
+    def test_read_rejects_oversized_chunk_count(self, tmp_dir):
+        path = os.path.join(tmp_dir, "over.qcv")
+        pw = "x"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.write_file("/f.txt", b"data")  # 1 chunk expected
+        vc.dir_index["/f.txt"]["chunk_count"] = 1_000_000
+        with pytest.raises(ValueError, match="exceeds what"):
+            vc.read_file("/f.txt")
+
+    def test_read_rejects_data_length_mismatch(self, tmp_dir):
+        path = os.path.join(tmp_dir, "dlen.qcv")
+        pw = "x"
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        vc = vol.VolumeContainer(path, final_key)
+        vc.open()
+        vc.write_file("/f.txt", b"data")
+        vc.dir_index["/f.txt"]["data_length"] = 999999
+        with pytest.raises(ValueError, match="data_length"):
+            vc.read_file("/f.txt")
 
 
 # ── Graceful shutdown tests ─────────────────────────────────────────────────

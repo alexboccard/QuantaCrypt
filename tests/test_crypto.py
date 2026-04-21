@@ -891,6 +891,32 @@ class TestShamirSplitEdge:
         with pytest.raises(ValueError, match="exceeds M521"):
             cc.shamir_split(huge, n=3, k=2)
 
+    def test_split_rejects_k_below_two(self):
+        with pytest.raises(ValueError, match="need 2 <= k <= n <= 255"):
+            cc.shamir_split(b"\x00" * 32, n=3, k=1)
+
+    def test_split_rejects_k_greater_than_n(self):
+        with pytest.raises(ValueError, match="need 2 <= k <= n <= 255"):
+            cc.shamir_split(b"\x00" * 32, n=2, k=3)
+
+    def test_split_rejects_n_above_255(self):
+        with pytest.raises(ValueError, match="need 2 <= k <= n <= 255"):
+            cc.shamir_split(b"\x00" * 32, n=256, k=2)
+
+
+class TestShamirRecoverValidation:
+    """Cover shamir_recover empty-list and insufficient-shares guards."""
+
+    def test_recover_empty_list_raises(self):
+        with pytest.raises(ValueError, match="empty share list"):
+            cc.shamir_recover([])
+
+    def test_recover_insufficient_shares_raises(self):
+        # Split 3-of-5; hand back only 2 — threshold-aware guard rejects.
+        shares = cc.shamir_split(b"\x01" * 32, n=5, k=3)
+        with pytest.raises(ValueError, match="Not enough shares"):
+            cc.shamir_recover(shares[:2])
+
 
 class TestDecodeShareEdgeCases:
     """Cover decode_share validation branches (lines 163-182)."""
