@@ -241,6 +241,14 @@ class QuantaCryptFUSE:
                 "st_ctime": now,
             }
 
+        # POSIX: once a file has been unlinked, the pathname is no longer
+        # resolvable even if fds remain open on it.  The still-open fd can
+        # access data via its fh (FUSE read/write), but a fresh getattr
+        # against the name must fail.
+        with self._lock:
+            if vpath in self._pending_unlink:
+                raise OSError(errno.ENOENT, "No such file or directory", path)
+
         # Check as file first, then as directory
         entry = self.volume.get_entry(vpath)
         if entry is None:
@@ -271,10 +279,23 @@ class QuantaCryptFUSE:
     # ── Directory operations ────────────────────────────────────────────
 
     def readdir(self, path: str, fh: int | None = None) -> list[str]:
-        """List directory contents."""
+        """List directory contents.
+
+        Filters out paths that have been unlinked-with-fds-still-open —
+        POSIX says they must not show up in the namespace, even though
+        dir_index still carries the entry until the last close.
+        """
         vpath = self._vpath(path)
         entries = [".", ".."]
-        entries.extend(self.volume.list_dir(vpath))
+        raw = self.volume.list_dir(vpath)
+        with self._lock:
+            pending = set(self._pending_unlink)
+        if pending:
+            prefix = vpath if vpath.endswith("/") else vpath + "/"
+            if vpath == "/":
+                prefix = "/"
+            raw = [n for n in raw if (prefix + n) not in pending]
+        entries.extend(raw)
         return entries
 
     def mkdir(self, path: str, mode: int) -> None:
@@ -294,9 +315,23 @@ class QuantaCryptFUSE:
     # ── File operations ─────────────────────────────────────────────────
 
     def create(self, path: str, mode: int, fi: Any = None) -> int:
-        """Create a new file and return a file descriptor."""
+        """Create a new file and return a file descriptor.
+
+        If the path is still in ``_pending_unlink`` (unlinked while other
+        fds remain open), refuse with EEXIST: our buffers are vpath-keyed,
+        so allowing the create would corrupt the old fds' view.  The POSIX-
+        correct alternative (per-fd buffers as separate inodes) is a bigger
+        refactor; for our use case (editor swap, tempfile) it's safer to
+        ask the caller to wait for the old fds to close.
+        """
         vpath = self._vpath(path)
         with self._lock:
+            if vpath in self._pending_unlink:
+                raise OSError(
+                    errno.EEXIST,
+                    "Path was unlinked but still has open fds",
+                    path,
+                )
             self.volume.write_file(vpath, b"")
             self._file_buffers[vpath] = bytearray()
             fd = self._next_fd()
@@ -306,6 +341,14 @@ class QuantaCryptFUSE:
     def open(self, path: str, flags: int) -> int:
         """Open a file and return a file descriptor."""
         vpath = self._vpath(path)
+        # POSIX: after unlink(), the pathname is unusable even for new
+        # opens — the existing fds keep their view of the inode via fh,
+        # but a fresh open(path) must fail.  Without this guard a second
+        # open() aliases the same vpath-keyed _file_buffers and the final
+        # release() would discard the new fd's writes under volume.delete.
+        with self._lock:
+            if vpath in self._pending_unlink:
+                raise OSError(errno.ENOENT, "No such file or directory", path)
         entry = self.volume.get_entry(vpath)
         if entry is None:
             raise OSError(errno.ENOENT, "No such file", path)
@@ -456,6 +499,11 @@ class QuantaCryptFUSE:
         old_vp = self._vpath(old)
         new_vp = self._vpath(new)
         with self._lock:
+            # POSIX: the source pathname is unusable after unlink().
+            # Rename of an unlinked-but-open path must behave like the
+            # source doesn't exist.
+            if old_vp in self._pending_unlink:
+                raise OSError(errno.ENOENT, "No such file or directory", old)
             self.volume.rename(old_vp, new_vp)
             if old_vp in self._file_buffers:
                 self._file_buffers[new_vp] = self._file_buffers.pop(old_vp)
@@ -473,14 +521,36 @@ class QuantaCryptFUSE:
         disk reflects the latest buffered writes.  Without this, an unmount
         or signal-driven shutdown could persist stale volume data even though
         the user's writes had already been accepted.
+
+        Mirrors flush() / release(): writes to a path in ``_pending_unlink``
+        are intentionally NOT persisted — the unlink-while-open semantics
+        require the data to vanish on last close, and shutdown happens
+        before release() has a chance to run the deferred delete.  Without
+        this guard an editor's swap file (classic create + unlink + keep
+        writing pattern) would be silently resurrected in the encrypted
+        container on the next mount.
         """
         with self._lock:
             for vpath in list(self._dirty_files):
+                if vpath in self._pending_unlink:
+                    continue
                 buf = self._file_buffers.get(vpath, bytearray())
                 snapshot = bytes(buf)
                 self.volume.write_file(vpath, snapshot)
                 self.cache.put(vpath, snapshot)
             self._dirty_files.clear()
+            # Also proactively apply any pending unlinks whose fds won't
+            # get their release() called (e.g. SIGKILL / forced shutdown
+            # paths).  The volume.delete() here is safe: if the path still
+            # has open fds, the kernel's subsequent release() will be a
+            # no-op for the delete (vpath already gone from dir_index).
+            for vpath in list(self._pending_unlink):
+                try:
+                    self.volume.delete(vpath)
+                except FileNotFoundError:
+                    pass
+                self.cache.invalidate(vpath)
+            self._pending_unlink.clear()
             if self.volume.is_dirty:
                 self.volume.save()
 
@@ -574,11 +644,14 @@ def mount_volume(
 
     real_vol = os.path.realpath(volume_path)
 
-    # Fast-path double-mount guard (the lock-held re-check below is the
-    # race-safe guarantee).  Match the historical error order: this check
-    # runs before we touch fusepy, so a callers-reliable RuntimeError fires
-    # even in test environments where the FUSE backend isn't present.
-    for mp, info in _mounted_volumes.items():
+    # Fast-path double-mount guard.  Snapshot the dict under the lock so
+    # we never iterate a dict that a concurrent mount / unmount might
+    # resize ("RuntimeError: dictionary changed size during iteration").
+    # The lock-held re-check below is the race-safe guarantee against
+    # double-registration; this snapshot is just for the fast error.
+    with _mount_lock:
+        _mounted_snapshot = list(_mounted_volumes.items())
+    for mp, info in _mounted_snapshot:
         if os.path.realpath(info["volume_path"]) == real_vol:
             raise RuntimeError(
                 f"Volume is already mounted at {mp}. "
@@ -667,6 +740,14 @@ def unmount_volume(mount_point: str) -> None:
     the volume if save() fails.  The external unmount subprocess is only
     invoked for paths we actually own — we do not run diskutil/fusermount
     against an arbitrary path passed in by a caller.
+
+    The whole body runs under ``_mount_lock``.  If we dropped the lock
+    between ``pop`` and the ``diskutil`` / ``fusermount`` subprocess, a
+    concurrent ``mount_volume()`` for a different volume at the same
+    mount_point could slot in its fresh mount — and our still-in-flight
+    subprocess would then tear down the new one.  Holding the lock makes
+    mount/unmount fully serialised, which matches the UI's
+    single-user-at-a-time intent.
     """
     import subprocess
     import sys
@@ -679,23 +760,25 @@ def unmount_volume(mount_point: str) -> None:
                 "refusing to run unmount against a path we do not own"
             )
 
-    # Save state *before* removing from the dict so that if save_all_dirty()
-    # fails, _emergency_save_all can still find the volume for a retry.
-    fuse_obj = info.get("fuse")
-    if fuse_obj is not None:
-        fuse_obj.save_all_dirty()
-    elif info["volume"].is_dirty:
-        info["volume"].save()
-    with _mount_lock:
+        # Save state *before* removing from the dict so that if
+        # save_all_dirty() fails, _emergency_save_all can still find the
+        # volume for a retry.
+        fuse_obj = info.get("fuse")
+        if fuse_obj is not None:
+            fuse_obj.save_all_dirty()
+        elif info["volume"].is_dirty:
+            info["volume"].save()
         _mounted_volumes.pop(mount_point, None)
 
-    # Use platform-appropriate unmount
-    if sys.platform == "darwin":
-        subprocess.run(["diskutil", "unmount", mount_point],
-                       capture_output=True)
-    else:
-        subprocess.run(["fusermount", "-u", mount_point],
-                       capture_output=True)
+        # Use platform-appropriate unmount.  Still under the lock so a
+        # concurrent remount at the same mount_point can't race our
+        # subprocess into tearing down the new mount.
+        if sys.platform == "darwin":
+            subprocess.run(["diskutil", "unmount", mount_point],
+                           capture_output=True)
+        else:
+            subprocess.run(["fusermount", "-u", mount_point],
+                           capture_output=True)
 
 
 def get_mounted_volumes() -> dict[str, dict]:

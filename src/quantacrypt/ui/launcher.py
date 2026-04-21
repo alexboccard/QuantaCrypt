@@ -103,8 +103,13 @@ class LauncherApp(tk.Toplevel):
             else:
                 self._open_qcx(path)
 
-        # First file opens immediately; any additional files open after
-        # the current wizard closes (they queue as after() callbacks).
+        # Multi-drop policy: every accepted path opens its own wizard
+        # window (same pattern as Finder's "Open With..." on multi-select).
+        # The after(1, ...) just yields back to the Tk event loop between
+        # dispatches so constructors don't all fire in one tick — it does
+        # NOT wait for the first wizard to close.  If a future release
+        # wants a true serial queue (open-then-close-then-next), thread
+        # the chain through each wizard's on_close callback.
         _dispatch(accepted[0])
         for extra in accepted[1:]:
             self.after(1, lambda p=extra: _dispatch(p))

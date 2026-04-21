@@ -1,6 +1,7 @@
 """Tests for QuantaCrypt encrypted volume (.qcv) feature."""
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -843,6 +844,73 @@ class TestQuantaCryptFUSE:
         fuse_fs.unlink("/delete.txt")
         with pytest.raises(OSError):
             fuse_fs.getattr("/delete.txt")
+
+    def test_unlink_while_open_open_returns_enoent(self, fuse_fs):
+        """Opening an unlinked-but-still-open path must fail with ENOENT.
+        Without this, a second open() would alias the first fd's buffer
+        and the final release() would silently discard the new fd's writes
+        when it ran the deferred delete."""
+        fd = fuse_fs.create("/t.txt", 0o100644)
+        fuse_fs.write("/t.txt", b"hi", 0, fd)
+        fuse_fs.unlink("/t.txt")
+        with pytest.raises(OSError) as exc_info:
+            fuse_fs.open("/t.txt", 0)
+        assert exc_info.value.errno == errno.ENOENT
+        fuse_fs.release("/t.txt", fd)
+
+    def test_unlink_while_open_getattr_returns_enoent(self, fuse_fs):
+        fd = fuse_fs.create("/g.txt", 0o100644)
+        fuse_fs.unlink("/g.txt")
+        with pytest.raises(OSError) as exc_info:
+            fuse_fs.getattr("/g.txt")
+        assert exc_info.value.errno == errno.ENOENT
+        fuse_fs.release("/g.txt", fd)
+
+    def test_unlink_while_open_readdir_filters(self, fuse_fs):
+        fd = fuse_fs.create("/listed.txt", 0o100644)
+        fuse_fs.create("/kept.txt", 0o100644)
+        fuse_fs.unlink("/listed.txt")
+        entries = fuse_fs.readdir("/")
+        assert "listed.txt" not in entries
+        assert "kept.txt" in entries
+        fuse_fs.release("/listed.txt", fd)
+
+    def test_unlink_while_open_create_rejects(self, fuse_fs):
+        """create() on a path still in _pending_unlink refuses with EEXIST;
+        our buffers are vpath-keyed, so accepting the create would corrupt
+        the surviving fd's view."""
+        fd = fuse_fs.create("/r.txt", 0o100644)
+        fuse_fs.unlink("/r.txt")
+        with pytest.raises(OSError) as exc_info:
+            fuse_fs.create("/r.txt", 0o100644)
+        assert exc_info.value.errno == errno.EEXIST
+        fuse_fs.release("/r.txt", fd)
+
+    def test_unlink_while_open_rename_rejects(self, fuse_fs):
+        fd = fuse_fs.create("/src.txt", 0o100644)
+        fuse_fs.unlink("/src.txt")
+        with pytest.raises(OSError) as exc_info:
+            fuse_fs.rename("/src.txt", "/dst.txt")
+        assert exc_info.value.errno == errno.ENOENT
+        fuse_fs.release("/src.txt", fd)
+
+    def test_save_all_dirty_does_not_resurrect_unlinked(self, fuse_fs):
+        """Regression test for the save_all_dirty() resurrection bug:
+        unlink + dirty write + save_all_dirty must NOT persist the file.
+        This is the shutdown / unmount / emergency-save path — release()
+        may never fire for the still-open fd, so the guard must live in
+        save_all_dirty too."""
+        fd = fuse_fs.create("/swap.txt", 0o100644)
+        fuse_fs.write("/swap.txt", b"secret-swap-data", 0, fd)
+        fuse_fs.unlink("/swap.txt")
+        # Simulate a shutdown save while the fd is still open.
+        fuse_fs.save_all_dirty()
+        # After save_all_dirty the pending unlink should have been
+        # applied as a real delete (for SIGKILL safety), and the volume
+        # must not contain the file.
+        assert fuse_fs.volume.get_entry("/swap.txt") is None
+        # Closing the now-orphaned fd is a no-op and must not throw.
+        fuse_fs.release("/swap.txt", fd)
 
     def test_unlink_while_open_defers_delete(self, fuse_fs):
         """POSIX unlink-while-open: the file stays accessible through
