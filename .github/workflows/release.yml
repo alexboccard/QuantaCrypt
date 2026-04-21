@@ -71,7 +71,7 @@ jobs:
           echo "✓ Binary verified as arm64"
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: quantacrypt-arm64
           path: dist/quantacrypt-arm64.dmg
@@ -143,7 +143,7 @@ jobs:
           echo "✓ Binary verified as x86_64"
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: quantacrypt-x86_64
           path: dist/quantacrypt-x86_64.dmg
