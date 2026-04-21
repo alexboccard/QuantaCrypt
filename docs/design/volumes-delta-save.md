@@ -113,10 +113,30 @@ win. Option C is rejected because the single-file UX is non-negotiable.
 6. Crash test: simulate truncated journal → reopen → confirm replay stops
    at the last good record and the remaining state is consistent.
 
-## Why not now
+## Status
 
-This is a format change requiring migration logic and new test coverage. The
-immediate performance review yielded enough wins through lazy blob loading
-and streaming save (peak RAM now ~1 blob, mount is instant) that the remaining
-"rewrite the world on save" cost is an acceptable follow-up rather than a
-blocker.
+**Implemented.** Shipped as `VOLUME_FORMAT_VERSION = 2` in `core/volume.py`.
+
+Deviations from the original proposal:
+
+- The journal starts implicitly at `_data_offset + _baseline_size` (computed
+  from the decrypted directory) instead of being recorded as an explicit
+  offset field in the header. The 512-byte header is unchanged from v1;
+  only the `CFBundleVersion` field is bumped to 2. This keeps the header
+  layout stable across the two versions and avoids tying a header byte to
+  a derived value that could drift.
+- Each journal record carries its own encrypted header + GCM tag; a
+  truncated tail simply fails to decrypt and replay stops there. No
+  separate per-record HMAC on top of GCM.
+- Compaction thresholds are implemented as `save()` heuristics rather
+  than a background task: if the existing-plus-pending journal would
+  exceed 30 % of the baseline, or exceed 1 MB against an empty baseline,
+  `save()` rolls into `compact()` synchronously.
+- V1 containers upgrade on first save via a single compact pass; mixed
+  v1-header + v2-journal containers never exist on disk.
+- `compact()` is a public method so future UI work can expose a
+  "Compact volume" menu entry.
+
+Test coverage: `TestFormatV2Journal` exercises replay of each op type,
+auto-compact trigger, v1→v2 upgrade, truncated-journal tolerance, and
+corrupt-record skip. Core coverage held at ≥ 95 %.

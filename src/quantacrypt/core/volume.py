@@ -62,12 +62,23 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # ── Volume constants ────────────────────────────────────────────────────────
 
 VOLUME_MAGIC = b"QCVOL\x01"
-VOLUME_FORMAT_VERSION = 1
+VOLUME_FORMAT_VERSION = 2
 HEADER_SIZE = 512
 
 # Volume uses smaller chunks than .qcx for better random-access performance.
 # 64 KB balances GCM overhead (~0.025%) against seek granularity.
 VOLUME_CHUNK_SIZE = 64 * 1024  # 64 KB
+
+# Format v2: append-only journal after the baseline blobs.  When the journal
+# exceeds this ratio of the baseline size, save() performs a full compact
+# instead of appending.  See docs/design/volumes-delta-save.md.
+_JOURNAL_COMPACT_RATIO = 0.3
+
+# Guard rails for journal record sizes — prevent a malicious or truncated
+# file from directing us to allocate gigabytes before we detect corruption.
+# (These are "obviously too big" bounds, not tight limits.)
+_JOURNAL_MAX_HEADER_CT = 1 << 20  # 1 MB of encrypted header JSON is absurd
+_JOURNAL_MIN_HEADER_CT = 16       # at minimum, GCM tag
 
 # Offsets within the 512-byte header
 _OFF_MAGIC     = 0    # 6 bytes
@@ -204,6 +215,96 @@ def decrypt_directory(final_key: bytes, nonce: bytes, ciphertext: bytes) -> dict
     """Decrypt the directory index. Returns dict."""
     plaintext = aes_gcm_decrypt(final_key, nonce, ciphertext)
     return json.loads(plaintext)
+
+
+# ── Journal record format (v2) ──────────────────────────────────────────────
+# Each record is self-contained so a truncated journal tail is recoverable
+# (replay simply stops at the last valid record).  Wire layout:
+#   [header_nonce 12B][header_ct_len uint32 BE][header_ct + GCM tag][body]
+# The header is an encrypted JSON object describing the op; body bytes are
+# the raw encrypted file blob for "write" ops (same chunked AES-GCM format
+# used in the baseline data section) or empty otherwise.
+
+def _write_journal_record(
+    f: IO[bytes],
+    final_key: bytes,
+    op: dict,
+    body: bytes,
+) -> int:
+    """Append one journal record at current position. Returns body offset
+    (absolute file offset where the body bytes start).  The caller should
+    use this to update dir_index entries for "write" ops."""
+    header_dict = {k: v for k, v in op.items() if k not in ("blob",)}
+    header_dict["body_length"] = len(body)
+    header_plain = json.dumps(
+        header_dict, sort_keys=True, separators=(",", ":")
+    ).encode()
+    header_nonce = secrets.token_bytes(12)
+    header_ct = AESGCM(derive_aes_key(final_key)).encrypt(
+        header_nonce, header_plain, b""
+    )
+    start = f.tell()
+    f.write(header_nonce)
+    f.write(struct.pack(">I", len(header_ct)))
+    f.write(header_ct)
+    body_offset = start + 12 + 4 + len(header_ct)
+    if body:
+        f.write(body)
+    return body_offset
+
+
+def _read_journal_records(
+    path: str,
+    final_key: bytes,
+    start_offset: int,
+    end_offset: int,
+) -> list[tuple[dict, int, int]]:
+    """Read all journal records between *start_offset* and *end_offset*.
+
+    Returns a list of (header_dict, body_offset, body_length) tuples.
+    Stops silently at a truncated or corrupt record — the tail is treated
+    as an incomplete append (crash during save), not an error.
+    """
+    aes = AESGCM(derive_aes_key(final_key))
+    records: list[tuple[dict, int, int]] = []
+    with open(path, "rb") as f:
+        f.seek(start_offset)
+        pos = start_offset
+        while pos < end_offset:
+            nonce = f.read(12)
+            if len(nonce) < 12:
+                break
+            raw_len = f.read(4)
+            if len(raw_len) < 4:
+                break
+            ct_len = struct.unpack(">I", raw_len)[0]
+            if ct_len < _JOURNAL_MIN_HEADER_CT or ct_len > _JOURNAL_MAX_HEADER_CT:
+                break
+            ct = f.read(ct_len)
+            if len(ct) < ct_len:
+                break
+            try:
+                header_plain = aes.decrypt(nonce, ct, b"")
+                header = json.loads(header_plain)
+            except Exception:
+                # Truncated / corrupt / wrong-key.  The last successful record
+                # is the effective end of the journal.
+                break
+            if not isinstance(header, dict):
+                break
+            body_length = int(header.get("body_length", 0))
+            if body_length < 0 or body_length > end_offset - pos:
+                break
+            body_offset = pos + 12 + 4 + ct_len
+            # Skip the body without reading it — blobs are loaded lazily
+            # via VolumeContainer._get_blob() at their absolute offsets.
+            next_pos = body_offset + body_length
+            if next_pos > end_offset:
+                break
+            f.seek(next_pos)
+            records.append((header, body_offset, body_length))
+            pos = next_pos
+    return records
 
 
 # ── Per-file chunk encryption (for volume data section) ─────────────────────
@@ -491,14 +592,22 @@ class VolumeContainer:
         self.auth_params: dict = {}
         self.metadata: dict = {}
         self.dir_index: dict[str, dict] = {}
-        # _file_data holds encrypted blobs for files that have been written
-        # (via write_file) or are pending save.  On open() we intentionally
-        # do NOT pre-load all blobs — unmodified files are read lazily from
-        # disk via _get_blob().  This keeps mount RAM bounded by the working
-        # set instead of the full container size.
+        # _file_data holds encrypted blobs for files written this session
+        # but not yet flushed to disk.  On open() we intentionally do NOT
+        # pre-load all blobs — unmodified files are read lazily via
+        # _get_blob() so mount RAM stays bounded by the working set.
         self._file_data: dict[str, bytes] = {}
         self._data_offset: int = 0
         self._file_size: int = 0
+        # Format-v2 journal bookkeeping.  _journal_start is the absolute
+        # byte offset where the append-only journal begins (= end of the
+        # baseline blobs section).  _baseline_size is the size of the
+        # baseline blobs section alone (used to decide when to compact).
+        # _pending_ops records changes since the last save() so save()
+        # can emit them as journal records in one append.
+        self._baseline_size: int = 0
+        self._journal_start: int = 0
+        self._pending_ops: list[dict] = []
         self._dirty = False
 
     def open(self) -> None:
@@ -569,10 +678,35 @@ class VolumeContainer:
                     "— the volume file may be tampered with"
                 )
 
-        # Bounds-check each file entry against the container size WITHOUT
-        # reading blobs.  Truncated containers are caught here; per-file
-        # corruption is caught on read by AES-GCM.
-        remaining_size = self._file_size - self._data_offset
+        # Bounds-check each baseline file entry against the baseline size.
+        # For v1 containers, baseline == entire data section (no journal).
+        # For v2, the journal starts immediately after the baseline blobs;
+        # any baseline entry that extends past _baseline_size is corrupt.
+        self._baseline_size = sum(
+            e.get("data_length", 0)
+            for e in self.dir_index.values()
+            if e.get("type") != "dir"
+        )
+        self._journal_start = self._data_offset + self._baseline_size
+        # The baseline section must fit entirely within the file; anything
+        # less means the container has been truncated inside the canonical
+        # data and we have no safe recovery.  (A truncated *journal* tail
+        # is tolerated — that's just a crash during save — but baseline
+        # truncation is always an error.)
+        if self._file_size < self._journal_start:
+            raise ValueError(
+                f"Volume file truncated within baseline data "
+                f"(expected at least {self._journal_start} bytes, "
+                f"got {self._file_size}) — the volume file may be corrupt"
+            )
+        # A v1 container must have nothing beyond the baseline; a v2
+        # container may legitimately have a journal there.
+        if self.header.get("version", 1) < 2 and self._file_size > self._journal_start:
+            raise ValueError(
+                "Trailing bytes after baseline data in v1 volume "
+                "— the volume file may be truncated or corrupt"
+            )
+        remaining_size = self._baseline_size
         for vpath, entry in self.dir_index.items():
             if entry.get("type") == "dir":
                 continue
@@ -584,6 +718,72 @@ class VolumeContainer:
                     f"(offset {offset} + length {length} > {remaining_size}) "
                     "— the volume file may be truncated or corrupt"
                 )
+
+        # Replay the append-only journal (v2+).  Each record updates the
+        # in-memory dir_index on top of the baseline; write records point
+        # future _get_blob() reads into the journal region.  A truncated
+        # or corrupt tail is treated as an incomplete append (crash during
+        # save): we stop replay at the last valid record and the volume
+        # remains consistent.
+        if self.header.get("version", 1) >= 2 and self._file_size > self._journal_start:
+            self._replay_journal()
+
+    def _replay_journal(self) -> None:
+        """Apply journal records to the in-memory dir_index.
+
+        Reads records starting at ``_journal_start`` until ``_file_size``.
+        Each record header is encrypted under ``final_key``; a record whose
+        header fails to decrypt (truncated, corrupt, or never fully flushed)
+        terminates replay, which is treated as an incomplete append — the
+        container state up to that point is consistent.
+        """
+        records = _read_journal_records(
+            self.path, self.final_key,
+            self._journal_start, self._file_size,
+        )
+        for header, body_offset, body_length in records:
+            op_type = header.get("type")
+            vpath = header.get("vpath")
+            if not isinstance(vpath, str) or not vpath.startswith("/"):
+                # Skip malformed records defensively; don't abort replay.
+                continue
+            if op_type == "write":
+                self.dir_index[vpath] = {
+                    "type": "file",
+                    "size": header.get("size", 0),
+                    "mode": header.get("mode", 0o100644),
+                    "mtime": header.get("mtime", 0),
+                    "nonce": header.get("nonce", ""),
+                    "chunk_count": header.get("chunk_count", 0),
+                    # data_offset is stored relative to _data_offset so the
+                    # same _get_blob() logic works for both baseline and
+                    # journal entries.
+                    "data_offset": body_offset - self._data_offset,
+                    "data_length": body_length,
+                    "content_hash": header.get("content_hash", ""),
+                }
+            elif op_type == "delete":
+                self.dir_index.pop(vpath, None)
+            elif op_type == "rename":
+                new_vpath = header.get("new_vpath")
+                if (isinstance(new_vpath, str) and new_vpath.startswith("/")
+                        and vpath in self.dir_index):
+                    self.dir_index[new_vpath] = self.dir_index.pop(vpath)
+            elif op_type == "mkdir":
+                # Directories are cheap to recreate on rmdir/mkdir cycles;
+                # replay unconditionally sets the entry.
+                if not vpath.endswith("/"):
+                    vpath = vpath + "/"
+                self.dir_index[vpath] = {
+                    "type": "dir",
+                    "mode": header.get("mode", 0o40755),
+                    "mtime": header.get("mtime", 0),
+                }
+            elif op_type == "rmdir":
+                if not vpath.endswith("/"):
+                    vpath = vpath + "/"
+                self.dir_index.pop(vpath, None)
+            # Unknown op types are silently skipped for forward compat.
 
     def _get_blob(self, vpath: str) -> bytes:
         """Return the encrypted blob for *vpath*.
@@ -701,23 +901,41 @@ class VolumeContainer:
         return plaintext
 
     def write_file(self, vpath: str, data: bytes) -> None:
-        """Encrypt and store file data in the volume."""
+        """Encrypt and store file data in the volume.
+
+        The blob lives in _file_data until the next save(), which will
+        append it to the journal region of the container (format v2+).
+        """
         nonce, blob, chunk_count, sha256_hex = encrypt_file_data(
             data, self.final_key, self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
         )
+        mtime = int(time.time())
+        mode = 0o100644
+        nonce_b64 = base64.b64encode(nonce).decode()
 
         self.dir_index[vpath] = {
             "type": "file",
             "size": len(data),
-            "mode": 0o100644,
-            "mtime": int(time.time()),
-            "nonce": base64.b64encode(nonce).decode(),
+            "mode": mode,
+            "mtime": mtime,
+            "nonce": nonce_b64,
             "chunk_count": chunk_count,
-            "data_offset": 0,  # recomputed on save
+            "data_offset": 0,  # reset on save() / compact()
             "data_length": len(blob),
             "content_hash": sha256_hex,
         }
         self._file_data[vpath] = blob
+        # Record the op so save() can emit one journal record per change.
+        self._pending_ops.append({
+            "type": "write",
+            "vpath": vpath,
+            "size": len(data),
+            "mode": mode,
+            "mtime": mtime,
+            "nonce": nonce_b64,
+            "chunk_count": chunk_count,
+            "content_hash": sha256_hex,
+        })
         self._dirty = True
 
     def mkdir(self, vpath: str) -> None:
@@ -726,11 +944,19 @@ class VolumeContainer:
             vpath += "/"
         if vpath in self.dir_index:
             return  # already exists
+        mtime = int(time.time())
+        mode = 0o40755
         self.dir_index[vpath] = {
             "type": "dir",
-            "mode": 0o40755,
-            "mtime": int(time.time()),
+            "mode": mode,
+            "mtime": mtime,
         }
+        self._pending_ops.append({
+            "type": "mkdir",
+            "vpath": vpath,
+            "mode": mode,
+            "mtime": mtime,
+        })
         self._dirty = True
 
     def delete(self, vpath: str) -> None:
@@ -738,15 +964,20 @@ class VolumeContainer:
         if vpath not in self.dir_index:
             raise FileNotFoundError(f"No such entry: {vpath}")
         entry = self.dir_index[vpath]
+        is_dir = entry.get("type") == "dir"
 
         # If it's a directory, make sure it's empty
-        if entry.get("type") == "dir":
+        if is_dir:
             children = self.list_dir(vpath.rstrip("/"))
             if children:
                 raise OSError(f"Directory not empty: {vpath}")
 
         del self.dir_index[vpath]
         self._file_data.pop(vpath, None)
+        self._pending_ops.append({
+            "type": "rmdir" if is_dir else "delete",
+            "vpath": vpath,
+        })
         self._dirty = True
 
     def rename(self, old_path: str, new_path: str) -> None:
@@ -759,6 +990,11 @@ class VolumeContainer:
         self.dir_index[new_path] = self.dir_index.pop(old_path)
         if old_path in self._file_data:
             self._file_data[new_path] = self._file_data.pop(old_path)
+        self._pending_ops.append({
+            "type": "rename",
+            "vpath": old_path,
+            "new_vpath": new_path,
+        })
         self._dirty = True
 
     def get_entry(self, vpath: str) -> dict | None:
@@ -770,13 +1006,94 @@ class VolumeContainer:
         return self._dirty
 
     def save(self) -> None:
-        """Re-encrypt and write the entire volume back to disk.
+        """Persist pending changes to disk.
 
-        Memory profile is bounded by the largest in-memory write buffer
-        (the largest blob in `_file_data`) plus a streaming copy window for
-        unmodified blobs read from the original container — NOT the total
-        container size.  Even a 10 GB volume saves with O(single-file RAM)
-        as long as recently-written files are modest.
+        Format-v2 fast path: append pending ops as journal records at the
+        end of the container.  This makes save() proportional to the size
+        of the changes, not the size of the container — a 1-byte edit on
+        a 1 GB volume is ~4 KB of I/O instead of 1 GB.
+
+        Falls back to a full compact when:
+          * the container is still format v1 (upgrade to v2 in one shot), or
+          * the journal would exceed _JOURNAL_COMPACT_RATIO of the baseline
+            after this append (the next open() would spend too long
+            replaying).
+
+        Crash safety: each journal record is self-authenticating
+        (AES-GCM on the header + empty-AAD body).  A crash mid-append
+        leaves a partial record; open() stops replay at the last complete
+        record, which is consistent with the last completed save().
+        """
+        if not self._pending_ops and not self._dirty:
+            return
+
+        # v1 containers always upgrade via compact.  This keeps the on-disk
+        # version in sync with the actual layout (no mixed v1-header + v2-
+        # journal containers in the wild).
+        if self.header.get("version", 1) < VOLUME_FORMAT_VERSION:
+            self.compact()
+            return
+
+        # Heuristic: if the existing journal + our pending ops would push
+        # the journal past _JOURNAL_COMPACT_RATIO of the baseline, compact
+        # now so open() stays fast.  Estimate pending journal bytes
+        # optimistically — the exact size is overhead + body length.
+        existing_journal = max(0, self._file_size - self._journal_start)
+        pending_body_bytes = sum(
+            len(self._file_data.get(op["vpath"], b""))
+            for op in self._pending_ops
+            if op["type"] == "write"
+        )
+        # Rough: each record header is ~250 bytes encrypted (small JSON + 12B
+        # nonce + 4B length + 16B tag).  Overestimating here only biases us
+        # toward compacting more eagerly, which is fine.
+        pending_overhead = len(self._pending_ops) * 300
+        total_journal = existing_journal + pending_overhead + pending_body_bytes
+        if self._baseline_size > 0 and total_journal > self._baseline_size * _JOURNAL_COMPACT_RATIO:
+            self.compact()
+            return
+        # Tiny / empty baseline: avoid unbounded-ratio divide; just compact
+        # if the journal is already bigger than the baseline.
+        if self._baseline_size == 0 and total_journal > 1 << 20:  # >1 MB
+            self.compact()
+            return
+
+        self._append_journal()
+
+    def _append_journal(self) -> None:
+        """Append pending ops as journal records at end-of-file (v2)."""
+        with open(self.path, "r+b") as f:
+            f.seek(0, 2)  # SEEK_END
+            for op in self._pending_ops:
+                body = b""
+                if op["type"] == "write":
+                    body = self._file_data.get(op["vpath"], b"")
+                body_offset = _write_journal_record(f, self.final_key, op, body)
+                if op["type"] == "write" and op["vpath"] in self.dir_index:
+                    entry = self.dir_index[op["vpath"]]
+                    # Journal-region body offset is absolute; store relative
+                    # to _data_offset so _get_blob() uses one formula.
+                    entry["data_offset"] = body_offset - self._data_offset
+                    entry["data_length"] = len(body)
+            f.flush()
+            os.fsync(f.fileno())
+            self._file_size = f.tell()
+
+        self._pending_ops.clear()
+        self._file_data.clear()
+        self._dirty = False
+
+    def compact(self) -> None:
+        """Rewrite the entire container as a fresh baseline with no journal.
+
+        Used automatically for v1→v2 upgrade and whenever the journal grows
+        large relative to the baseline.  Also available to callers (e.g. a
+        "Compact volume" action in the Volume Manager UI) to reclaim space
+        that deleted / overwritten files leave in the journal.
+
+        Preserves atomicity via ``.tmp`` + ``os.replace()``.  Memory profile
+        is O(largest file in _file_data) plus a 1 MB sliding window for
+        streaming unmodified blobs from the current container.
         """
         # Capture OLD offsets before overwriting them in the dir_index;
         # we need them to copy unmodified blobs from the current file.
@@ -855,12 +1172,21 @@ class VolumeContainer:
 
         # Update state for continued use.  _file_data is cleared because all
         # blobs now live canonically on disk at the new offsets; future reads
-        # go through _get_blob() which will seek-read them fresh.
+        # go through _get_blob() which will seek-read them fresh.  The
+        # journal region is empty post-compact, so _journal_start coincides
+        # with the end of the baseline blobs.
         self._data_offset = new_data_offset
+        self._baseline_size = new_offset  # sum of lengths written above
+        self._journal_start = new_data_offset + new_offset
         # Re-stat to pick up the new file size for bounds checks.
         self._file_size = os.path.getsize(self.path)
         self.header["meta_nonce"] = meta_nonce
         self.header["dir_nonce"] = dir_nonce
+        # Keep the header version in sync with what _compact actually wrote
+        # (v1 containers are upgraded to v2 on first save via this path).
+        self.header["version"] = VOLUME_FORMAT_VERSION
+        self.metadata["format_version"] = VOLUME_FORMAT_VERSION
+        self._pending_ops.clear()
         self._file_data.clear()
         self._dirty = False
 
