@@ -6,7 +6,7 @@ shamirs>=1.0
 mnemonic>=0.20
 
 # Optional: drag-and-drop support
-tkinterdnd2>=0.3
+tkinterdnd2>=0.4.3
 
 # Optional: password strength estimator
 zxcvbn>=4.4
