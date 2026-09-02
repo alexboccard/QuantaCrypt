@@ -3,6 +3,7 @@
 import base64 as _b64
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -11,20 +12,22 @@ import time as _time
 import uuid
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 
 from quantacrypt.core import crypto as cc
 from quantacrypt.core.crypto import (
     MAGIC, FORMAT_VERSION, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION,
 )
 from quantacrypt.ui.shared import (
-    C, F, UI,
+    C, F, SP, ICON, REVEAL_LABEL,
+    accel, bind_shortcut,
     styled_entry, bind_context_menu, fmt_size, rule, section_label,
+    card, kv_row, confirm, alert, reveal_path, friendly_error,
     FlatButton, SegmentedControl, StagedProgressBar,
     FileCard, WizardSteps, RecentFiles, notify,
 )
 
-P = 24  # consistent padding throughout
+P = SP["xl"]  # outer page padding
 
 STAGES = [
     ("Verifying password",  0.55, "Argon2id"),
@@ -33,6 +36,19 @@ STAGES = [
     ("Unlocking",           0.15, "Decapsulat"),
     ("Decrypting file",     0.15, "Decrypting payload"),
 ]
+
+# Copy that appears in more than one place — hoisted so the reset path can't
+# drift from the initial build (it had: "Select an encrypted file" vs "...
+# .qcx file", "output path" vs "output folder").
+FILE_PROMPT     = "Select an encrypted .qcx file"
+FILE_SUB_DROP   = "Click anywhere · .qcx is QuantaCrypt's encrypted format · or drag & drop"
+FILE_SUB_NODROP = "Click anywhere · .qcx is QuantaCrypt's encrypted format"
+SEC_HINT_EMPTY  = "Open a file to see how it's protected."
+OUT_HINT_EMPTY  = "Open a file first to set the output folder."
+OUT_HINT_LOADED = "Output folder — the original filename will be restored."
+VERIFY_HELP     = ("Verify key only checks that your password or shares are right "
+                   "without writing anything to disk.")
+NO_RECOVERY_NOTE = "There is no way to recover this file without the password."
 
 _WL = None
 def get_wl():
@@ -43,6 +59,7 @@ def get_wl():
     return _WL
 
 _MAX_TAIL = 1 << 20  # 1 MB tail search window
+_MAX_SHARE_FILE = 1 << 20  # share .txt files are a few KB; refuse anything huge
 
 def load_pkg(path):
     """Parse a .qcx file without loading the whole thing into RAM."""
@@ -94,21 +111,14 @@ def load_pkg(path):
     return pkg
 
 def _find_stage(msg):
-    for i,(name,_,kw) in enumerate(STAGES):
-        if kw.lower() in msg.lower(): return i, msg
+    """Map a raw core progress string to (stage index, friendly label).
+    The label is the STAGES name plus any NN% the core reported — the raw
+    string itself ("Decrypting payload... 45%") is never shown."""
+    for i, (name, _, kw) in enumerate(STAGES):
+        if kw.lower() in msg.lower():
+            m = re.search(r"(\d+)%", msg)
+            return i, (f"{name}  {m.group(1)}%" if m else name)
     return None, None
-
-def _reveal(path):
-    """Open the containing folder in the system file manager."""
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", "-R", path], check=False)
-        elif sys.platform == "win32":
-            subprocess.run(["explorer", "/select,", path], check=False)
-        else:
-            subprocess.run(["xdg-open", os.path.dirname(os.path.abspath(path))], check=False)
-    except Exception:
-        pass
 
 
 def _open_file(path):
@@ -124,30 +134,74 @@ def _open_file(path):
         pass
 
 
+def _share_list(nums):
+    """'Share 2' / 'Shares 1 and 3' / 'Shares 1, 2 and 4' — never a list repr."""
+    nums = [str(n) for n in nums]
+    if len(nums) == 1:
+        return f"Share {nums[0]}"
+    return "Shares " + ", ".join(nums[:-1]) + f" and {nums[-1]}"
+
+
+def _extract_share_codes(text, wl=None):
+    """Find every share in free text, in order of appearance, as QCSHARE- codes.
+    Recognises QCSHARE- lines and 50-word mnemonic blocks (the share files
+    the encryptor writes contain both; the mnemonic is only converted when
+    the code for the same share wasn't already found)."""
+    codes = []
+    seen = set()
+    lines = [ln.strip() for ln in text.splitlines()]
+    for ln in lines:
+        if ln.startswith("QCSHARE-") and ln not in seen:
+            seen.add(ln); codes.append(ln)
+    if wl is None:
+        try: wl = get_wl()
+        except Exception: wl = None
+    if wl:
+        wl_set = set(wl)
+        block = []
+        def _flush():
+            if len(block) == 50:
+                try:
+                    code = cc.encode_share(cc.mnemonic_to_share(" ".join(block)))
+                except Exception:
+                    code = None
+                if code and code not in seen:
+                    seen.add(code); codes.append(code)
+            block.clear()
+        for ln in lines:
+            toks = ln.lower().split()
+            if toks and all(t in wl_set for t in toks):
+                block.extend(toks)
+            else:
+                _flush()
+        _flush()
+    return codes
+
+
 # ── WordEntry ─────────────────────────────────────────────────────────────────
 
 class WordEntry(tk.Frame):
     MAX_DROP = 8
 
-    def __init__(self, parent, number, wl, on_confirm=None, **kw):
+    def __init__(self, parent, number, wl, on_confirm=None, on_done=None, **kw):
         super().__init__(parent, bg=C["surface2"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
-        self._wl=wl; self._cb=on_confirm; self._nxt=None
+        self._wl=wl; self._cb=on_confirm; self._done_cb=on_done; self._nxt=None
         self._dd=None; self._lb=None; self._open=False
-        tk.Label(self, text=f"{number:02d}", font=(UI,7),
-                 bg=C["surface2"], fg=C["text3"], width=2).pack(side="left", padx=(4,1))
+        tk.Label(self, text=f"{number:02d}", font=F["small"],
+                 bg=C["surface2"], fg=C["text3"], width=2).pack(side="left", padx=(SP["xs"],0))
         self._v = tk.StringVar()
         self._v.trace_add("write", self._typed)
         self._e = tk.Entry(self, textvariable=self._v, font=F["mono_s"],
                            bg=C["surface2"], fg=C["text"],
-                           insertbackground=C["accent"],
+                           insertbackground=C["accent_text"],
                            relief="flat", bd=0, highlightthickness=0, width=9)
         bind_context_menu(self._e)
-        self._e.pack(side="left", fill="x", expand=True, ipady=4, padx=(0,4))
+        self._e.pack(side="left", fill="x", expand=True, ipady=SP["xs"], padx=(0,SP["xs"]))
         for ev,fn in [("<Down>",self._dn),("<Up>",self._up),("<Return>",self._ret),
                       ("<Tab>",self._tab),("<space>",self._spc),
                       ("<FocusOut>",self._fout),("<FocusIn>",self._fin),
-                      ("<Escape>",lambda e:self._close())]:
+                      ("<Escape>",self._esc)]:
             self._e.bind(ev, fn)
 
     def get(self): return self._v.get().strip().lower()
@@ -155,13 +209,24 @@ class WordEntry(tk.Frame):
     def focus(self): self._e.focus_set()
     def focus_force(self): self.winfo_toplevel().lift(); self._e.focus_force()
     def valid(self): return self.get() in self._wl
+    def set_enabled(self, on):
+        self._e.config(state="normal" if on else "disabled")
+
+    def _esc(self, e):
+        """Escape closes the autocomplete only.  It must swallow the event:
+        letting it propagate reaches the window's Escape binding, which
+        closes the decryptor and throws away every typed word."""
+        if self._open or self._dd is not None:
+            self._close()
+            return "break"
+        return None
 
     def _typed(self,*_):
         t = self._v.get().strip().lower()
         if not t: self._close(); self._set_b(C["border"]); return
         m = [w for w in self._wl if w.startswith(t)]
         if not m: self._set_b(C["error"]); self._close(); return
-        self._set_b(C["success"] if t in self._wl else C["accent"])
+        self._set_b(C["success"] if t in self._wl else C["accent_text"])
         if not (len(m)==1 and m[0]==t): self._show(m)
         else: self._close()
 
@@ -233,7 +298,7 @@ class WordEntry(tk.Frame):
             self._dd.wm_attributes("-topmost", True)
             self._dd.configure(bg=C["border"])
             fr = tk.Frame(self._dd, bg=C["surface"],
-                          highlightbackground=C["accent"], highlightthickness=1)
+                          highlightbackground=C["accent_text"], highlightthickness=1)
             fr.pack(fill="both", expand=True, padx=1, pady=1)
             sb2 = tk.Scrollbar(fr, orient="vertical", bg=C["surface2"])
             self._lb = tk.Listbox(fr, yscrollcommand=sb2.set, font=F["mono_s"],
@@ -249,7 +314,7 @@ class WordEntry(tk.Frame):
             self._lb.bind("<Double-1>",        self._lbpick)
             self._lb.bind("<ButtonRelease-1>", self._lbpick)
             self._lb.bind("<Tab>",             self._lbtab)
-            self._lb.bind("<Escape>",          lambda e: self._close())
+            self._lb.bind("<Escape>",          self._lbesc)
             self._lb.bind("<FocusOut>",        lambda e: self.after(120,self._mc))
         self._lb.delete(0,"end")
         show = matches[:30]
@@ -295,6 +360,12 @@ class WordEntry(tk.Frame):
         if s: self._sel(self._lb.get(s[0]))
         return "break"
 
+    def _lbesc(self, e):
+        self._close()
+        try: self._e.focus_force()
+        except Exception: pass
+        return "break"
+
     def _sel(self, word):
         self._v.set(word); self._set_b(C["success"])
         self._close()
@@ -305,6 +376,7 @@ class WordEntry(tk.Frame):
 
     def _next(self):
         if self._nxt: self._nxt.focus_force()
+        elif self._done_cb: self._done_cb()
 
     def _set_b(self,c): self.config(highlightbackground=c, highlightthickness=1)
 
@@ -314,25 +386,29 @@ class WordEntry(tk.Frame):
 class MnemonicShareInput(tk.Frame):
     """Collapsible mnemonic share panel.  Share 1 starts expanded; others
     start collapsed so only the header/progress bar is visible.  Clicking the
-    header row (or the chevron) toggles the 50-word grid open/closed."""
+    header row (or the chevron) toggles the 50-word grid open/closed; the
+    header is also in the Tab order and toggles with Return / space."""
 
-    def __init__(self, parent, num, wl, start_expanded=True, **kw):
+    def __init__(self, parent, num, wl, start_expanded=True,
+                 on_change=None, on_done=None, **kw):
         super().__init__(parent, bg=C["bg"], **kw)
         self._wl=wl; self._cells=[]; self._expanded = start_expanded
+        self._on_change = on_change
+        self._last_n = -1
 
         hdr = tk.Frame(self, bg=C["surface"],
                        highlightbackground=C["border"], highlightthickness=1,
-                       cursor="hand2")
-        hdr.pack(fill="x", pady=(0,6))
+                       cursor="hand2", takefocus=1)
+        hdr.pack(fill="x", pady=(0,SP["s"]))
+        self._hdr = hdr
 
-        # Chevron label — changes between ▸ (collapsed) and ▾ (expanded)
-        self._chevron = tk.Label(hdr, text="▾" if start_expanded else "▸",
+        self._chevron = tk.Label(hdr, text=ICON["chevron_open"] if start_expanded else ICON["chevron_closed"],
                                   font=F["body_b"], bg=C["surface"], fg=C["text3"],
                                   cursor="hand2")
-        self._chevron.pack(side="left", padx=(10,0), pady=10)
+        self._chevron.pack(side="left", padx=(SP["s"],0), pady=SP["s"])
 
         left = tk.Frame(hdr, bg=C["surface"])
-        left.pack(side="left", padx=(6,14), pady=10)
+        left.pack(side="left", padx=(SP["s"],SP["l"]), pady=SP["s"])
         tk.Label(left, text=f"Share {num}", font=F["body_b"],
                  bg=C["surface"], fg=C["text"]).pack(anchor="w")
         self._count = tk.Label(left, text="0 / 50 words", font=F["caption"],
@@ -340,24 +416,28 @@ class MnemonicShareInput(tk.Frame):
         self._count.pack(anchor="w")
 
         self._btn_right = tk.Frame(hdr, bg=C["surface"])
-        self._btn_right.pack(side="right", padx=14, pady=10)
+        self._btn_right.pack(side="right", padx=SP["l"], pady=SP["s"])
         self._paste_btn = FlatButton(self._btn_right, "Paste", self._paste, primary=False, small=True)
-        self._paste_btn.pack(side="right", padx=(8,0))
+        self._paste_btn.pack(side="right", padx=(SP["s"],0))
         self._clear_btn = FlatButton(self._btn_right, "Clear", self.clear,  primary=False, small=True)
         self._clear_btn.pack(side="right")
 
         self._pbar = tk.Canvas(hdr, height=2, bg=C["surface2"], highlightthickness=0)
         self._pbar.pack(fill="x", side="bottom")
 
-        # Bind click on header elements to toggle
         for w in (hdr, self._chevron, left):
             w.bind("<Button-1>", lambda e: self.toggle())
+        hdr.bind("<Return>", lambda e: self.toggle())
+        hdr.bind("<space>",  lambda e: self.toggle())
+        hdr.bind("<FocusIn>",  lambda e: hdr.config(highlightbackground=C["accent_text"], highlightthickness=2))
+        hdr.bind("<FocusOut>", lambda e: hdr.config(highlightbackground=C["border"], highlightthickness=1))
 
         self._grid_frame = tk.Frame(self, bg=C["bg"])
         for c in range(10): self._grid_frame.columnconfigure(c, weight=1)
 
         for i in range(50):
-            cell = WordEntry(self._grid_frame, i+1, wl, on_confirm=self._confirmed)
+            cell = WordEntry(self._grid_frame, i+1, wl, on_confirm=self._confirmed,
+                             on_done=on_done if i == 49 else None)
             cell.grid(row=i//10, column=i%10, padx=2, pady=2, sticky="ew")
             self._cells.append(cell)
         for i in range(49):
@@ -374,10 +454,10 @@ class MnemonicShareInput(tk.Frame):
         self._expanded = not self._expanded
         if self._expanded:
             self._grid_frame.pack(fill="x")
-            self._chevron.config(text="▾")
+            self._chevron.config(text=ICON["chevron_open"])
         else:
             self._grid_frame.pack_forget()
-            self._chevron.config(text="▸")
+            self._chevron.config(text=ICON["chevron_closed"])
 
     def expand(self):
         if not self._expanded: self.toggle()
@@ -388,10 +468,18 @@ class MnemonicShareInput(tk.Frame):
     def get_mnemonic(self): return " ".join(c.get() for c in self._cells)
     def is_complete(self): return all(c.valid() for c in self._cells)
     def valid_count(self): return sum(1 for c in self._cells if c.valid())
+    def has_input(self): return any(c.get() for c in self._cells)
     def focus(self):
         """Expand first so cells are visible before giving focus."""
         self.expand()
         if self._cells: self._cells[0].focus()
+    def set_words(self, words):
+        for cell, word in zip(self._cells, words): cell.set(word.lower())
+        self._upd()
+    def set_enabled(self, on):
+        for c in self._cells: c.set_enabled(on)
+        self._paste_btn.enable(on); self._clear_btn.enable(on)
+        self._hdr.config(takefocus=1 if on else 0)
     def clear(self):
         for c in self._cells: c.set("")
         self._upd()
@@ -407,9 +495,10 @@ class MnemonicShareInput(tk.Frame):
 
     def _upd(self):
         n = self.valid_count()
-        col = C["success"] if n==50 else (C["warning"] if n>=25 else C["accent"])
+        col = C["success"] if n==50 else (C["warning"] if n>=25 else C["accent_text"])
+        glyph = f"  {ICON['ok']}" if n == 50 else ""
         self._count.config(
-            text=f"{n} / 50 words",
+            text=f"{n} / 50 words{glyph}",
             fg=C["success"] if n==50 else (C["warning"] if n>0 else C["text3"]))
         self.update_idletasks()
         w = self._pbar.winfo_width()
@@ -417,64 +506,67 @@ class MnemonicShareInput(tk.Frame):
             self._pbar.delete("all")
             f = int(w*n/50)
             if f: self._pbar.create_rectangle(0,0,f,2, fill=col, outline="")
+        if n != self._last_n:
+            self._last_n = n
+            if self._on_change: self._on_change()
 
     def _paste(self):
+        top = self.winfo_toplevel()
         try: text = self.clipboard_get()
-        except Exception: messagebox.showwarning("Paste","Clipboard empty."); return
+        except Exception: alert(top, "Nothing to paste", "The clipboard is empty."); return
         if text.strip().startswith("QCSHARE-"):
-            messagebox.showinfo("Wrong format",
-                "That looks like a code share (starts with QCSHARE-).\n\n"
-                "Switch the share to \"code\" format using the toggle button,\n"
-                "then paste it there instead."); return
+            alert(top, "That's a code share",
+                  "This share starts with QCSHARE-, so it's a code share. "
+                  "Switch to \"QCSHARE- codes\" above and paste it there instead.")
+            return
         words = text.strip().split()
         if len(words) != 50:
-            messagebox.showwarning("Wrong length",f"Expected 50 words, got {len(words)}."); return
+            alert(top, "Wrong length", f"A share phrase has 50 words — the clipboard has {len(words)}.")
+            return
         bad = [w for w in words if w.lower() not in self._wl]
-        if bad and not messagebox.askyesno("Unknown words",
-            f"{len(bad)} unknown word(s): {', '.join(bad[:3])}.\nFill anyway?"): return
-        for cell,word in zip(self._cells, words): cell.set(word.lower())
-        self._upd()
+        if bad and not confirm(top, "Unknown words",
+                               f"{len(bad)} word(s) aren't in the share word list: "
+                               f"{', '.join(bad[:3])}.\nFill the grid anyway?",
+                               yes="Fill anyway", no="Cancel"):
+            return
+        self.set_words(words)
 
 
 # ── FileInfoCard ──────────────────────────────────────────────────────────────
+
+def _protection_label(meta):
+    """Plain-language 'how is this file protected' string used by both cards."""
+    mode = meta.get("mode", "?")
+    if mode == "single":
+        return "A password"
+    if mode == "shamir":
+        return (f"A split key — any {meta.get('threshold','?')} of "
+                f"{meta.get('total','?')} shares unlock it")
+    return str(mode)
+
 
 class FileInfoCard(tk.Frame):
     """Shows file metadata including encrypted-at date and original size."""
     def __init__(self, parent, meta, orig, sz=0, ts=0, **kw):
         super().__init__(parent, bg=C["surface"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
+        inner = tk.Frame(self, bg=C["surface"])
+        inner.pack(fill="x", padx=SP["l"], pady=SP["s"])
         # Filename is always inside the encrypted payload (revealed after decryption).
-        if orig:
-            file_label = orig
-        else:
-            file_label = "Hidden — shown after decryption"
-        mode = meta.get("mode", "?")
-        if mode == "single":
-            mode_label = "Password-protected"
-        elif mode == "shamir":
-            mode_label = f"Split key — needs {meta.get('threshold','?')} of {meta.get('total','?')} people"
-        else:
-            mode_label = mode
+        file_label = orig if orig else "Hidden — shown after decryption"
         rows = [
-            ("File",       file_label),
-            ("Mode",       mode_label),
-            ("Encryption", "Quantum-resistant (AES-256-GCM + ML-KEM)"),
+            ("File",        file_label),
+            ("Protected by", _protection_label(meta)),
+            ("Encryption",  "Quantum-resistant (AES-256-GCM + ML-KEM)"),
         ]
         # Show original size and encryption date if available
-        if sz: rows.append(("Orig size", fmt_size(sz)))
+        if sz: rows.append(("Original size", fmt_size(sz)))
         if ts:
             try:
-                rows.append(("Encrypted", _time.strftime("%Y-%m-%d %H:%M", _time.localtime(ts))))
+                rows.append(("Encrypted on", _time.strftime("%Y-%m-%d %H:%M", _time.localtime(ts))))
             except Exception: pass
-        for lbl,val in rows:
-            row = tk.Frame(self, bg=C["surface"])
-            row.pack(fill="x", padx=14, pady=3)
-            tk.Label(row, text=lbl, font=F["caption"],
-                     bg=C["surface"], fg=C["text3"], width=9, anchor="w").pack(side="left")
-            tk.Label(row, text=val, font=F["caption"],
-                     bg=C["surface"], fg=C["text2"],
-                     wraplength=340, justify="left", anchor="w").pack(side="left", fill="x")
-        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", pady=(6,0))
+        for lbl, val in rows:
+            kv_row(inner, lbl, val, label_width=12)
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -489,7 +581,8 @@ except ImportError:
 class _Tooltip:
     """Minimal hover tooltip for Tkinter widgets.
     Usage: _Tooltip(widget, "text")
-    """
+    Hover-only help is invisible to keyboard users, so callers should also
+    render the same text as a visible caption."""
     def __init__(self, widget, text):
         self._widget = widget; self._text = text; self._tip = None
         widget.bind("<Enter>", self._show, add="+")
@@ -506,7 +599,7 @@ class _Tooltip:
             tip.configure(bg=C["surface2"])
             tk.Label(tip, text=self._text, font=F["small"],
                      bg=C["surface2"], fg=C["text2"],
-                     padx=8, pady=4).pack()
+                     padx=SP["s"], pady=SP["xs"]).pack()
         except Exception: self._tip = None
 
     def _hide(self, event=None):
@@ -514,6 +607,14 @@ class _Tooltip:
             if self._tip: self._tip.destroy()
         except Exception: pass
         self._tip = None
+
+
+def _section(parent, text):
+    """section_label() plus a handle on its text label so it can be relabelled
+    (the Secret section reads PASSWORD or SHARES depending on the file)."""
+    section_label(parent, text, padx=P)
+    row = parent.winfo_children()[-1]
+    return row.winfo_children()[0]
 
 
 class DecryptorApp(tk.Toplevel):
@@ -535,15 +636,20 @@ class DecryptorApp(tk.Toplevel):
         self._ts       = 0   # Encryption timestamp (known after decryption)
         self._mode_val = self._meta["mode"] if self._meta else None
         self._busy     = False
+        self._verifying = False  # which flow the worker is running (for cancel copy)
         self._cancel   = False   # signals worker thread to abort
         self._tmp_path = None    # tracks temp file for cleanup on close
         self._imode    = tk.StringVar(value="mnemonic")
-        self._inputs   = []
-        self._entries  = []
+        self._inputs   = []      # MnemonicShareInput panels (mnemonic mode)
+        self._entries  = []      # QCSHARE- entries (raw mode)
+        self._entry_marks = []   # validity glyph labels beside each raw entry
+        self._share_btns  = []   # Paste / Paste all / Load / Add buttons (frozen during decrypt)
+        self._add_btn     = None
+        self._pw_failures = 0
         self._on_close = on_close
         self._imode_trace_id = None  # set in _load_payload when shamir mode is active
         # Always wire WM_DELETE_WINDOW so closing while busy is handled safely
-        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.protocol("WM_DELETE_WINDOW", self._maybe_close)
 
         self._build()
         self._center(center_at=center_at)
@@ -555,38 +661,81 @@ class DecryptorApp(tk.Toplevel):
             self._load_payload()
 
         # Register drag-and-drop (only works when base class is TkinterDnD.Tk)
+        drop_ok = False
         if _DND_FILES:
             try:
                 self.drop_target_register(_DND_FILES)
                 self.dnd_bind("<<Drop>>", self._on_drop)
+                drop_ok = True
             except Exception:
                 pass
-        # Ctrl+O to open file (guarded: no-op while busy)
-        def _ctrl_o(e):
+        # Only promise "drag & drop" when a drop target actually registered
+        self._file_card.set_drop_supported(drop_ok, FILE_SUB_DROP, FILE_SUB_NODROP)
+
+        def _open_shortcut():
             if self._busy:
-                self._err.config(text="Busy — please wait for decryption to finish")
-                self.after(2000, lambda: self._err.config(text="") if self._err.cget("text").startswith("Busy") else None)
+                self._flash_busy()
             else:
                 self._file_card._pick()
-        self.bind("<Control-o>", _ctrl_o)
-        self.bind("<Control-O>", _ctrl_o)
-        # Ctrl+Return to start decryption (shows busy message if already running)
-        def _ctrl_ret(e):
+        def _decrypt_shortcut():
             if self._busy:
-                self._err.config(text="Busy — please wait for decryption to finish")
-                self.after(2000, lambda: self._err.config(text="")
-                           if self._err.cget("text").startswith("Busy") else None)
+                self._flash_busy()
             else:
                 self._start()
-        self.bind("<Control-Return>", _ctrl_ret)
-        # Escape closes the window — safe even without a launcher (on_close may be None)
-        self.bind("<Escape>", lambda e: self._close())
+        bind_shortcut(self, "o", _open_shortcut)
+        bind_shortcut(self, "Return", _decrypt_shortcut)
+        self.bind("<Escape>", self._on_escape)
+
+    # ── Status line ───────────────────────────────────────────────────────────
+
+    def _set_status(self, msg, detail=""):
+        """Neutral progress / info text (grey)."""
+        self._err.config(text=msg, fg=C["text3"])
+        self._err_detail.config(text=detail)
+
+    def _set_error(self, msg, detail=""):
+        """Something went wrong (red).  ``detail`` is the technical second line."""
+        self._err.config(text=msg, fg=C["error"])
+        self._err_detail.config(text=detail)
+
+    def _flash_busy(self):
+        self._set_status("Busy — please wait for decryption to finish")
+        self.after(2000, lambda: self._set_status("")
+                   if self._err.cget("text").startswith("Busy") else None)
+
+    # ── Close / Escape ────────────────────────────────────────────────────────
+
+    def _has_typed_input(self):
+        if self._mode_val == "single" and hasattr(self, "_pw"):
+            try:
+                if self._pw.get(): return True
+            except Exception: pass
+        if any(inp.has_input() for inp in self._inputs): return True
+        return any(e.get().strip() for e in self._entries)
+
+    def _on_escape(self, e=None):
+        self._maybe_close()
+        return "break"
+
+    def _maybe_close(self):
+        """Close guard: while running, Escape is a cancel request; with a
+        password or shares typed but unused, ask first; otherwise close."""
+        if self._busy:
+            self._close()
+            return
+        if self._has_typed_input():
+            if not confirm(self, "Discard what you typed?",
+                           "Your password or shares haven't been used yet. "
+                           "Closing this window throws them away.",
+                           yes="Discard", no="Keep editing", danger=True):
+                return
+        self._close()
 
     def _close(self):
         if self._busy:
             # Signal worker to stop, clean up temp file, then close
             self._cancel = True
-            self._err.config(text="Cancelling — please wait…")
+            self._set_status("Cancelling — please wait…")
             # Poll until worker finishes (or force close after 5s)
             self._poll_close(0)
             return
@@ -623,25 +772,38 @@ class DecryptorApp(tk.Toplevel):
 
     def _on_drop(self, event):
         """Handle drag-and-drop .qcx file."""
-        if self._busy: return          # ignore drops during active decryption
+        if self._busy:
+            self._flash_busy()
+            return
         raw = event.data.strip()
         if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
-        path = raw.split("} {")[0]
-        if os.path.isfile(path):
-            self._file_card.load(path)
-            self._on_file(path)
+        parts = raw.split("} {")
+        path = parts[0]
+        if os.path.isdir(path):
+            self._set_error("That's a folder — drop a single .qcx file instead.")
+            return
+        if not os.path.isfile(path):
+            self._set_error("Nothing usable was dropped — drop a .qcx file, or click the box to choose one.")
+            return
+        if len(parts) > 1:
+            self._set_status(f"Only one file can be decrypted at a time — using {os.path.basename(path)}.")
+        self._file_card.load(path)
+        self._on_file(path)
+
+    # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self):
         hdr = tk.Frame(self, bg=C["bg"])
-        hdr.pack(fill="x", padx=P, pady=(18,0))
+        hdr.pack(fill="x", padx=P, pady=(SP["l"],0))
         tk.Label(hdr, text="QuantaCrypt", font=F["display"],
                  bg=C["bg"], fg=C["text"]).pack(side="left")
         tk.Label(hdr, text="Decrypt", font=F["heading"],
-                 bg=C["bg"], fg=C["text3"]).pack(side="left", padx=(10,0), pady=3)
+                 bg=C["bg"], fg=C["text3"]).pack(side="left", padx=(SP["s"],0), pady=SP["xs"])
         if self._on_close:
-            FlatButton(hdr, "← Home", self._close, primary=False, small=True).pack(side="right")
+            FlatButton(hdr, f"{ICON['back']} Home", self._maybe_close,
+                       primary=False, small=True).pack(side="right")
         self._wiz = WizardSteps(self, self.STEPS)
-        self._wiz.pack(fill="x", padx=P, pady=(12,0))
+        self._wiz.pack(fill="x", padx=P, pady=(SP["m"],0))
         rule(self, pady=0)
 
         outer = tk.Frame(self, bg=C["bg"]); outer.pack(fill="both", expand=True)
@@ -662,52 +824,58 @@ class DecryptorApp(tk.Toplevel):
         cv.bind_all("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
 
         # 1. File — uses shared FileCard from shared_ui
-        section_label(b, "1  FILE", padx=P)
+        _section(b, "1  FILE")
         self._file_card = FileCard(b, self._on_file,
-                                   prompt="Select an encrypted .qcx file",
-                                   sub="Click anywhere · .qcx is QuantaCrypt's encrypted format · or drag & drop",
+                                   prompt=FILE_PROMPT,
+                                   sub=FILE_SUB_DROP,
                                    filetypes=[("QuantaCrypt","*.qcx"),("All files","*")])
         self._file_card.pack(fill="x", padx=P)
         self._info_wrap = tk.Frame(b, bg=C["bg"])
-        self._info_wrap.pack(fill="x", padx=P, pady=(8,0))
+        self._info_wrap.pack(fill="x", padx=P, pady=(SP["s"],0))
         # Inspect button — shown after file load, reveals public metadata
         self._inspect_row = tk.Frame(b, bg=C["bg"])
-        self._inspect_row.pack(fill="x", padx=P, pady=(4,0))
+        self._inspect_row.pack(fill="x", padx=P, pady=(SP["xs"],0))
 
-        # 2. Password / Shares
-        section_label(b, "2  PASSWORD / SHARES", padx=P)
+        # 2. Password / Shares — relabelled per file in _load_payload
+        self._sec_label = _section(b, "2  PASSWORD")
         self._sec_wrap = tk.Frame(b, bg=C["bg"])
         self._sec_wrap.pack(fill="x", padx=P)
-        tk.Label(self._sec_wrap, text="Open a file to see decryption options.",
+        tk.Label(self._sec_wrap, text=SEC_HINT_EMPTY,
                  font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
 
-        # 3. Output
-        section_label(b, "3  OUTPUT FOLDER", padx=P)
+        # 3. Decrypt — output folder + the action row
+        _section(b, "3  DECRYPT")
+        tk.Label(b, text="Save to", font=F["caption"], bg=C["bg"], fg=C["text3"],
+                 anchor="w").pack(fill="x", padx=P, pady=(0,SP["xs"]))
         out_row = tk.Frame(b, bg=C["bg"]); out_row.pack(fill="x", padx=P)
         self._out = styled_entry(out_row)
-        self._out.pack(side="left", fill="x", expand=True, ipady=8, ipadx=10)
-        self._browse_btn = FlatButton(out_row, "…", self._browse_out, primary=False, small=True)
-        self._browse_btn.pack(side="left", padx=(6,0))
-        self._out_hint = tk.Label(b, text="Open a file first to set output folder.",
+        self._out.pack(side="left", fill="x", expand=True, ipady=SP["s"], ipadx=SP["s"])
+        self._browse_btn = FlatButton(out_row, "Choose…", self._browse_out, primary=False, small=True)
+        self._browse_btn.pack(side="left", padx=(SP["s"],0))
+        self._out_hint = tk.Label(b, text=OUT_HINT_EMPTY,
                                    font=F["caption"], bg=C["bg"], fg=C["text3"], anchor="w")
-        self._out_hint.pack(fill="x", padx=P, pady=(4,0))
+        self._out_hint.pack(fill="x", padx=P, pady=(SP["xs"],0))
 
-        rule(b, pady=18, padx=P)
-        act = tk.Frame(b, bg=C["bg"]); act.pack(fill="x", padx=P, pady=(0,4))
-        self._btn = FlatButton(act, "Decrypt File →", self._start)
+        act = tk.Frame(b, bg=C["bg"]); act.pack(fill="x", padx=P, pady=(SP["l"],SP["xs"]))
+        self._btn = FlatButton(act, f"Decrypt file {ICON['arrow']}", self._start)
         self._btn.pack(side="left")
         self._btn.enable(False)   # enabled once a file is loaded
         # Verify: check key is correct without writing any output to disk
         self._verify_btn = FlatButton(act, "Verify key only", self._start_verify,
                                        primary=False, small=True)
-        self._verify_btn.pack(side="left", padx=(10,0))
+        self._verify_btn.pack(side="left", padx=(SP["s"],0))
         self._verify_btn.enable(False)   # enabled once a file is loaded
-        # Tooltip so first-time users understand what "Verify key only" does
-        _Tooltip(self._verify_btn,
-                 "Checks your password/shares are correct without writing any output")
+        # Hover tooltip AND a visible caption — hover-only help never reaches
+        # keyboard users.
+        _Tooltip(self._verify_btn, VERIFY_HELP)
+        tk.Label(b, text=VERIFY_HELP, font=F["small"], bg=C["bg"], fg=C["text3"],
+                 anchor="w", justify="left", wraplength=490).pack(fill="x", padx=P)
         self._err = tk.Label(b, text="", font=F["caption"], bg=C["bg"], fg=C["error"],
                              anchor="w", justify="left", wraplength=490)
-        self._err.pack(fill="x", padx=P, pady=(0,8))
+        self._err.pack(fill="x", padx=P, pady=(SP["s"],0))
+        self._err_detail = tk.Label(b, text="", font=F["small"], bg=C["bg"], fg=C["text3"],
+                                    anchor="w", justify="left", wraplength=490)
+        self._err_detail.pack(fill="x", padx=P, pady=(0,SP["s"]))
 
         self._prog = StagedProgressBar(b, [(n,w) for n,w,_ in STAGES])
         # Cancel button row shown alongside the progress bar while busy.
@@ -719,15 +887,16 @@ class DecryptorApp(tk.Toplevel):
         self._cancel_btn.pack(side="right")
         self._results = tk.Frame(b, bg=C["bg"]); self._results.pack(fill="x", padx=P)
         # keyboard shortcut hint
-        tk.Label(b, text="Ctrl+O  Open file  ·  Ctrl+↵  Decrypt",
-                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(8,0))
-        tk.Frame(b, bg=C["bg"], height=16).pack()
+        tk.Label(b, text=f"{accel('O')}  Open file  ·  {accel('↵')}  Decrypt  ·  Esc  Close",
+                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(SP["s"],0))
+        tk.Frame(b, bg=C["bg"], height=SP["l"]).pack()
 
     # ── File loading ──────────────────────────────────────────────────────────
 
     def _on_file(self, path):
-        """Sanitize exception — show our ValueError messages, mask OS errors."""
-        self._err.config(text="")  # Clear any previous file-load error
+        """Load a .qcx; our own ValueErrors become one plain sentence plus a
+        technical second line, OS errors are masked."""
+        self._set_status("")
         try:
             pkg = load_pkg(path)
             self._payload  = pkg
@@ -735,14 +904,22 @@ class DecryptorApp(tk.Toplevel):
             self._orig     = None
             self._mode_val = self._meta["mode"]
             self._qcx_path = path  # Keep in sync so _run decrypts the right file
+            self._pw_failures = 0
             self._load_payload(path)
             self.title(f"{os.path.basename(path)} — QuantaCrypt · Decrypt")
         except ValueError as e:
-            # Our own descriptive messages are safe to show
-            self._err.config(text=f"File error: {e}")
-        except Exception:
+            msg = str(e)
+            low = msg.lower()
+            if "not a quantacrypt" in low:
+                self._set_error("This isn't a QuantaCrypt .qcx file — choose a file that "
+                                "QuantaCrypt encrypted.")
+            elif "newer version" in low or "older format" in low:
+                self._set_error(friendly_error(e))
+            else:
+                self._set_error("This .qcx file is damaged and can't be read.", msg)
+        except Exception as e:
             # OS/IO errors — don't expose paths or internals
-            self._err.config(text="Could not open file — check it is a valid .qcx file")
+            self._set_error("Couldn't open that file.", friendly_error(e))
 
     def _load_payload(self, path=None):
         for w in self._info_wrap.winfo_children(): w.destroy()
@@ -757,41 +934,44 @@ class DecryptorApp(tk.Toplevel):
             suggested_dir = os.path.dirname(os.path.abspath(qcx))
             if path or not self._out.get().strip():
                 self._out.delete(0,"end"); self._out.insert(0, suggested_dir)
-            self._out_hint.config(text="Output folder — the original filename will be restored.")
+            self._out_hint.config(text=OUT_HINT_LOADED)
 
         # Refresh inspect button row — make it discoverable
         for w in self._inspect_row.winfo_children(): w.destroy()
-        FlatButton(self._inspect_row, "🔍 View file details", self._show_inspect,
+        FlatButton(self._inspect_row, "View file details", self._show_inspect,
                    primary=False, small=True).pack(side="left")
         tk.Label(self._inspect_row, text="(no password needed)",
-                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(side="left", padx=(6, 0))
+                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(side="left", padx=(SP["s"], 0))
 
         # Enable action buttons now that a valid file is loaded
         self._btn.enable(True)
-        self._btn.config(text="Decrypt File →")  # Restore action label
+        self._btn.config(text=f"Decrypt file {ICON['arrow']}")  # Restore action label
         self._verify_btn.enable(True)
 
         for w in self._sec_wrap.winfo_children(): w.destroy()
-        self._inputs=[]; self._entries=[]
+        self._inputs=[]; self._entries=[]; self._entry_marks=[]; self._share_btns=[]
+        self._add_btn = None
         self._wiz.set_step(1)
 
         if self._mode_val == "single":
+            self._sec_label.config(text="2  PASSWORD")
             tk.Label(self._sec_wrap, text="Password", font=F["caption"],
-                     bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,3))
+                     bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,SP["xs"]))
             # Password row with per-field show/hide toggle
             pw_row = tk.Frame(self._sec_wrap, bg=C["bg"])
             pw_row.pack(fill="x")
             self._pw = styled_entry(pw_row, show="•")
-            self._pw.pack(side="left", fill="x", expand=True, ipady=8, ipadx=10)
+            self._pw.pack(side="left", fill="x", expand=True, ipady=SP["s"], ipadx=SP["s"])
             self._eye_btn = FlatButton(pw_row, "Show", self._toggle_pw, primary=False, small=True)
-            self._eye_btn.pack(side="left", padx=(4,0))
+            self._eye_btn.pack(side="left", padx=(SP["xs"],0))
             self._pw.bind("<Return>", lambda e: self._start())
             self._pw.focus()
         else:
+            self._sec_label.config(text="2  SHARES")
             k=self._meta.get("threshold", 2); n=self._meta.get("total", k)
             tk.Label(self._sec_wrap,
                      text=f"Enter any {k} of the {n} shares to unlock this file.",
-                     font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,6))
+                     font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(0,SP["s"]))
             # Remove stale trace from previous file load before _imode.set
             # (which fires all live traces against the destroyed _inputs_frame)
             if self._imode_trace_id:
@@ -801,7 +981,7 @@ class DecryptorApp(tk.Toplevel):
             self._imode.set("mnemonic")
             SegmentedControl(self._sec_wrap,
                 [("mnemonic","50-word phrases"), ("raw","QCSHARE- codes")],
-                self._imode).pack(fill="x", pady=(0,10))
+                self._imode).pack(fill="x", pady=(0,SP["s"]))
             self._imode_trace_id = self._imode.trace_add("write", lambda *_: self._rebuild_inputs())
             self._inputs_frame = tk.Frame(self._sec_wrap, bg=C["bg"])
             self._inputs_frame.pack(fill="x")
@@ -829,54 +1009,46 @@ class DecryptorApp(tk.Toplevel):
         mode = meta.get("mode", "?")
         if mode == "shamir":
             k, n = meta.get("threshold", "?"), meta.get("total", "?")
-            mode_str = f"Split key — needs {k} of {n} people"
+            protect = (f"A split key — any {k} of {n} shares unlock it "
+                       f"(Shamir secret sharing)")
         else:
-            mode_str = "Password-protected"
-
+            protect = "A password, slowed down against guessing (Argon2id)"
         version = meta.get("version", "?")
-        key_bits = meta.get("key_bits", 512)
 
         # Build popup
         win = tk.Toplevel(self)
-        win.title("File Info")
+        win.title("File details")
         win.configure(bg=C["bg"])
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
 
-        P2 = 20
-        tk.Label(win, text="File Info", font=F["heading"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", padx=P2, pady=(18,4))
+        P2 = SP["xl"] - SP["xs"]
+        tk.Label(win, text="File details", font=F["heading"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", padx=P2, pady=(SP["l"],SP["xs"]))
         tk.Label(win, text=os.path.basename(self._qcx_path), font=F["mono"],
-                 bg=C["bg"], fg=C["text2"]).pack(anchor="w", padx=P2, pady=(0,10))
+                 bg=C["bg"], fg=C["text2"]).pack(anchor="w", padx=P2, pady=(0,SP["s"]))
 
-        card = tk.Frame(win, bg=C["surface"],
-                        highlightbackground=C["border"], highlightthickness=1)
-        card.pack(fill="x", padx=P2, pady=(0,4))
-
-        def row(label, value, hl=False):
-            r = tk.Frame(card, bg=C["surface"]); r.pack(fill="x", padx=14, pady=4)
-            tk.Label(r, text=label, font=F["caption"], bg=C["surface"],
-                     fg=C["text3"], width=14, anchor="w").pack(side="left")
-            tk.Label(r, text=value, font=F["caption"], bg=C["surface"],
-                     fg=C["success"] if hl else C["text2"],
-                     anchor="w", justify="left", wraplength=320).pack(side="left", fill="x")
-
-        row("File size",   file_size)
-        row("Mode",        mode_str)
-        row("Encryption",  "Quantum-resistant (AES-256-GCM + ML-KEM)")
-        row("Password",    "Hardened with slow hash (Argon2id)")
-        row("Format",      f"QuantaCrypt v{version}")
+        body = card(win, padx=SP["l"], pady=SP["s"])
+        body.outer.pack(fill="x", padx=P2, pady=(0,SP["xs"]))
+        kv_row(body, "File size",    file_size, label_width=12, wraplength=320)
+        kv_row(body, "Protected by", protect, label_width=12, wraplength=320)
+        kv_row(body, "Encryption",   "Quantum-resistant (AES-256-GCM + ML-KEM)",
+               label_width=12, wraplength=320)
+        kv_row(body, "Format",       f"QuantaCrypt file format v{version}",
+               label_width=12, wraplength=320)
         if fp:
-            row("Fingerprint", fp + "…  (first 64KB SHA-256)")
+            kv_row(body, "Fingerprint", f"{fp}…  (first 64 KB, SHA-256)",
+                   label_width=12, wraplength=320)
         tk.Label(win,
-                 text="The original filename and file size are encrypted\n"
-                      "and only revealed after successful decryption.",
+                 text="The original filename and size are encrypted too —\n"
+                      "they're revealed only after a successful decryption.",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
-                 justify="left").pack(anchor="w", padx=P2, pady=(8,0))
+                 justify="left").pack(anchor="w", padx=P2, pady=(SP["s"],0))
 
-        FlatButton(win, "Close", win.destroy, primary=False, small=True).pack(
-            anchor="e", padx=P2, pady=(12,18))
+        close_btn = FlatButton(win, "Close", win.destroy, primary=False, small=True)
+        close_btn.pack(anchor="e", padx=P2, pady=(SP["m"],SP["l"]))
+        win.bind("<Escape>", lambda e: win.destroy())
 
         # Centre over parent
         win.update_idletasks()
@@ -884,6 +1056,7 @@ class DecryptorApp(tk.Toplevel):
         ww, wh = self.winfo_width(), self.winfo_height()
         dw, dh = win.winfo_width(), win.winfo_height()
         win.geometry(f"+{pw+(ww-dw)//2}+{ph+(wh-dh)//2}")
+        close_btn.focus_set()
 
     def _toggle_pw(self):
         """Toggle password field visibility with text button."""
@@ -893,71 +1066,187 @@ class DecryptorApp(tk.Toplevel):
         if hasattr(self, "_eye_btn"):
             self._eye_btn.config(text="Hide" if vis else "Show")
 
+    # ── Share inputs ──────────────────────────────────────────────────────────
+
     def _build_share_inputs(self, k):
         for w in self._inputs_frame.winfo_children(): w.destroy()
-        self._inputs=[]; self._entries=[]
+        self._inputs=[]; self._entries=[]; self._entry_marks=[]; self._share_btns=[]
+        self._add_btn = None
+        n = self._meta.get("total", k) if self._meta else k
+        # Header row: "N of k shares complete" counter + bulk-entry buttons
+        hdr_row = tk.Frame(self._inputs_frame, bg=C["bg"])
+        hdr_row.pack(fill="x", pady=(0,SP["s"]))
+        self._share_counter = tk.Label(hdr_row, text="", font=F["caption"],
+                                       bg=C["bg"], fg=C["text3"])
+        self._share_counter.pack(side="left")
+        b = FlatButton(hdr_row, "Load from file…", self._load_shares_from_files,
+                       primary=False, small=True)
+        b.pack(side="right"); self._share_btns.append(b)
+        b = FlatButton(hdr_row, "Paste all", self._paste_all_shares,
+                       primary=False, small=True)
+        b.pack(side="right", padx=(0,SP["s"])); self._share_btns.append(b)
+        _Tooltip(self._share_btns[0], "Open the .share-N-of-M.txt files the encryptor saved")
+
+        self._slots_frame = tk.Frame(self._inputs_frame, bg=C["bg"])
+        self._slots_frame.pack(fill="x")
+        for i in range(k):
+            self._add_share_slot(start_expanded=(i == 0))
+
+        # Extra slot: when one share turns out to be wrong, add a spare instead
+        # of clearing a good one.  The first k valid shares are used.
+        add_row = tk.Frame(self._inputs_frame, bg=C["bg"])
+        add_row.pack(fill="x", pady=(0,SP["s"]))
+        self._add_btn = FlatButton(add_row, "+ Add another share",
+                                   lambda: self._add_share_slot(focus=True),
+                                   primary=False, small=True)
+        self._add_btn.pack(side="left"); self._share_btns.append(self._add_btn)
+        self._add_hint = tk.Label(add_row, text="", font=F["small"], bg=C["bg"], fg=C["text3"])
+        self._add_hint.pack(side="left", padx=(SP["s"],0))
+        self._refresh_add_btn()
+        self._update_share_counter()
+
+        if self._inputs: self._inputs[0].focus()
+        elif self._entries: self._entries[0].focus()
+
+    def _slot_count(self):
+        return len(self._inputs) if self._imode.get() == "mnemonic" else len(self._entries)
+
+    def _refresh_add_btn(self):
+        if not getattr(self, "_add_btn", None): return
+        n = self._meta.get("total", 0) if self._meta else 0
+        at_max = self._slot_count() >= n
+        try:
+            self._add_btn.enable(not at_max and not self._busy)
+            self._add_hint.config(text=f"This file was split into {n} shares." if at_max else "")
+        except tk.TclError:
+            self._add_btn = None  # widget was destroyed by a rebuild
+
+    def _add_share_slot(self, start_expanded=True, focus=False):
+        """Append one more share input (mnemonic panel or QCSHARE- row).
+        ``focus`` moves the cursor into it (the "+ Add another share" button)."""
+        idx = self._slot_count()
+        n = self._meta.get("total", 0) if self._meta else 0
+        if n and idx >= n:
+            return
         if self._imode.get() == "mnemonic":
             wl = get_wl()
-            for i in range(k):
-                # First share expanded, rest collapsed to reduce initial height
-                inp = MnemonicShareInput(self._inputs_frame, i+1, wl, start_expanded=(i==0))
-                inp.pack(fill="x", pady=(0,12))
-                self._inputs.append(inp)
-            if self._inputs: self._inputs[0].focus()
+            inp = MnemonicShareInput(self._slots_frame, idx+1, wl,
+                                     start_expanded=start_expanded,
+                                     on_change=self._update_share_counter,
+                                     on_done=lambda i=idx: self._share_done(i))
+            inp.pack(fill="x", pady=(0,SP["m"]))
+            self._inputs.append(inp)
+            if focus: inp.focus()
         else:
-            # Raw share mode — header row with fill counter + Paste all button
-            hdr_row = tk.Frame(self._inputs_frame, bg=C["bg"])
-            hdr_row.pack(fill="x", pady=(0,6))
-            self._share_counter = tk.Label(hdr_row,
-                text=f"0 of {k} shares entered",
-                font=F["caption"], bg=C["bg"], fg=C["text3"])
-            self._share_counter.pack(side="left")
-            # Paste all — finds QCSHARE- lines in clipboard and fills entries in order
-            FlatButton(hdr_row, "Paste all", self._paste_all_shares,
-                       primary=False, small=True).pack(side="right")
-            for i in range(k):
-                row = tk.Frame(self._inputs_frame, bg=C["bg"])
-                row.pack(fill="x", pady=(0,8))
-                tk.Label(row, text=f"Share {i+1}", font=F["caption"],
-                         bg=C["bg"], fg=C["text3"], width=9, anchor="w").pack(side="left")
-                e = styled_entry(row)
-                e.pack(side="left", fill="x", expand=True, ipady=7, ipadx=10)
-                def _on_share_key(ev, entry=e):
-                    self._update_share_counter()
-                    val = entry.get().strip()
-                    if not val:
-                        entry.config(highlightbackground=C["border"])
-                    elif val.startswith("QCSHARE-"):
-                        entry.config(highlightbackground=C["success"])
-                    else:
-                        entry.config(highlightbackground=C["error"])
-                e.bind("<KeyRelease>", _on_share_key)
-                # <<Paste>> fires before text lands; schedule validation 10ms later
-                e.bind("<<Paste>>", lambda ev: self.after(10, _on_share_key, None))
-                # Individual paste button for each share
-                def _paste_one(entry=e):
-                    self._paste_single_share(entry)
-                FlatButton(row, "Paste", _paste_one,
-                           primary=False, small=True).pack(side="left", padx=(6,0))
-                self._entries.append(e)
-            if self._entries: self._entries[0].focus()
+            row = tk.Frame(self._slots_frame, bg=C["bg"])
+            row.pack(fill="x", pady=(0,SP["s"]))
+            tk.Label(row, text=f"Share {idx+1}", font=F["caption"],
+                     bg=C["bg"], fg=C["text3"], width=9, anchor="w").pack(side="left")
+            e = styled_entry(row)
+            e.pack(side="left", fill="x", expand=True, ipady=SP["s"], ipadx=SP["s"])
+            # Validity glyph beside the field — colour alone isn't enough
+            mark = tk.Label(row, text="", font=F["caption"], bg=C["bg"], fg=C["text3"], width=2)
+            mark.pack(side="left", padx=(SP["xs"],0))
+            self._entries.append(e); self._entry_marks.append(mark)
+            def _on_share_key(ev, entry=e):
+                self._mark_entry(entry)
+                self._update_share_counter()
+            e.bind("<KeyRelease>", _on_share_key)
+            # <<Paste>> fires before text lands; schedule validation 10ms later
+            e.bind("<<Paste>>", lambda ev: self.after(10, _on_share_key, None))
+            e.bind("<Return>", lambda ev, i=idx: self._share_done(i))
+            def _paste_one(entry=e):
+                self._paste_single_share(entry)
+            pb = FlatButton(row, "Paste", _paste_one, primary=False, small=True)
+            pb.pack(side="left", padx=(SP["xs"],0)); self._share_btns.append(pb)
+            if focus: e.focus_set()
+        self._refresh_add_btn()
+
+    def _mark_entry(self, entry):
+        """Colour + glyph for one QCSHARE- entry."""
+        try: i = self._entries.index(entry)
+        except ValueError: return
+        val = entry.get().strip()
+        mark = self._entry_marks[i]
+        if not val:
+            entry.config(highlightbackground=C["border"]); mark.config(text="")
+        elif val.startswith("QCSHARE-"):
+            entry.config(highlightbackground=C["success"]); mark.config(text=ICON["ok"], fg=C["success"])
+        else:
+            entry.config(highlightbackground=C["error"]); mark.config(text=ICON["err"], fg=C["error"])
+
+    def _share_done(self, i):
+        """Return on the last word / entry of share i: move to the next share,
+        or submit when this was the last one."""
+        if self._busy: return
+        k = self._meta.get("threshold", 2) if self._meta else 2
+        if self._imode.get() == "mnemonic":
+            complete = sum(1 for inp in self._inputs if inp.is_complete())
+            if complete >= k:
+                self._start(); return
+            for j, inp in enumerate(self._inputs):
+                if j != i and not inp.is_complete():
+                    inp.focus(); return
+        else:
+            filled = sum(1 for e in self._entries if e.get().strip().startswith("QCSHARE-"))
+            if filled >= k:
+                self._start(); return
+            for j, e in enumerate(self._entries):
+                if j != i and not e.get().strip():
+                    e.focus_set(); return
 
     def _update_share_counter(self):
-        """Update fill count label for raw QCSHARE- mode."""
+        """'N of k shares complete' — both input modes."""
         if not hasattr(self, "_share_counter"): return
-        filled = sum(1 for e in self._entries if e.get().strip())
-        total  = len(self._entries)
-        col    = C["success"] if filled == total else (C["warning"] if filled > 0 else C["text3"])
+        try:
+            if not self._share_counter.winfo_exists(): return
+        except Exception: return
+        k = self._meta.get("threshold", 2) if self._meta else 2
+        if self._imode.get() == "mnemonic":
+            done = sum(1 for inp in self._inputs if inp.is_complete())
+        else:
+            done = sum(1 for e in self._entries if e.get().strip().startswith("QCSHARE-"))
+        col = C["success"] if done >= k else (C["warning"] if done > 0 else C["text3"])
+        glyph = f"  {ICON['ok']}" if done >= k else ""
         self._share_counter.config(
-            text=f"{filled} of {total} share{'s' if total!=1 else ''} entered",
-            fg=col)
+            text=f"{min(done, k)} of {k} shares complete{glyph}", fg=col)
+
+    def _fill_shares(self, codes):
+        """Put QCSHARE- codes into the slots in order (both modes).  Adds
+        slots up to the file's total when more codes than slots were found."""
+        k = self._meta.get("threshold", 2)
+        n = self._meta.get("total", k)
+        while self._slot_count() < min(len(codes), n):
+            self._add_share_slot(start_expanded=False)
+        if self._imode.get() == "mnemonic":
+            skipped = []
+            for i, inp in enumerate(self._inputs):
+                if i < len(codes):
+                    try:
+                        mn = cc.share_to_mnemonic({**cc.decode_share(codes[i]), "threshold": k})
+                        inp.set_words(mn.split())
+                        if i > 0: inp.collapse()
+                    except Exception:
+                        skipped.append(i + 1)
+                        inp.clear()
+                else:
+                    inp.clear()
+            if skipped:
+                self._set_error(f"{_share_list(skipped)} couldn't be read — the code may be damaged.")
+        else:
+            for i, entry in enumerate(self._entries):
+                entry.delete(0, "end")
+                if i < len(codes):
+                    entry.insert(0, codes[i])
+                self._mark_entry(entry)
+        self._update_share_counter()
 
     def _paste_single_share(self, entry):
         """Paste a single QCSHARE- code from the clipboard into one entry."""
         try:
             text = self.clipboard_get().strip()
         except Exception:
-            messagebox.showwarning("Paste", "Clipboard is empty or unreadable.")
+            alert(self, "Nothing to paste", "The clipboard is empty.")
             return
         # If clipboard has multiple lines, grab the first QCSHARE- line
         code = text
@@ -968,51 +1257,68 @@ class DecryptorApp(tk.Toplevel):
                 break
         entry.delete(0, "end")
         entry.insert(0, code)
-        if code.startswith("QCSHARE-"):
-            entry.config(highlightbackground=C["success"])
-        else:
-            entry.config(highlightbackground=C["error"])
+        self._mark_entry(entry)
         self._update_share_counter()
 
     def _paste_all_shares(self):
-        """Find all QCSHARE- lines in clipboard and fill entries in order."""
+        """Find every share in the clipboard and fill the slots in order."""
         try:
             text = self.clipboard_get()
         except Exception:
-            messagebox.showwarning("Paste all", "Clipboard is empty or unreadable."); return
-        lines = [ln.strip() for ln in text.splitlines()]
-        found = [ln for ln in lines if ln.startswith("QCSHARE-")]
-        if not found:
-            messagebox.showwarning(
-                "Paste all",
-                "No QCSHARE- codes found in clipboard.\n\n"
-                "Copy your shares file and try again."); return
-        k = len(self._entries)
-        if len(found) < k:
-            if not messagebox.askyesno(
-                    "Not enough shares",
-                    f"Found {len(found)} QCSHARE- code(s) but need {k}.\n\n"
-                    f"Fill the first {len(found)} anyway?",
-                    icon="warning"): return
-        for i, entry in enumerate(self._entries):
-            entry.delete(0, "end")
-            if i < len(found):
-                entry.insert(0, found[i])
-                entry.config(highlightbackground=C["success"])
-            else:
-                entry.config(highlightbackground=C["border"])
-        self._update_share_counter()
+            alert(self, "Nothing to paste", "The clipboard is empty."); return
+        self._apply_found_shares(_extract_share_codes(text), "the clipboard")
+
+    def _load_shares_from_files(self):
+        """Open the .share-N-of-M.txt files the encryptor wrote (or any text
+        file containing QCSHARE- codes / 50-word phrases) and fill the slots."""
+        if self._busy: return
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Choose share files",
+            filetypes=[("Share files", "*.txt"), ("All files", "*")],
+            initialdir=os.path.dirname(self._qcx_path) if self._qcx_path else os.path.expanduser("~"))
+        if not paths: return
+        codes, unreadable = [], []
+        for p in paths:
+            try:
+                if os.path.getsize(p) > _MAX_SHARE_FILE:
+                    unreadable.append(os.path.basename(p)); continue
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                unreadable.append(os.path.basename(p)); continue
+            for c in _extract_share_codes(text):
+                if c not in codes: codes.append(c)
+        if unreadable:
+            self._set_error(f"Couldn't read {', '.join(unreadable)}.")
+        where = "that file" if len(paths) == 1 else "those files"
+        self._apply_found_shares(codes, where)
+
+    def _apply_found_shares(self, codes, where):
+        if not codes:
+            alert(self, "No shares found",
+                  f"No QCSHARE- codes or 50-word phrases were found in {where}.")
+            return
+        k = self._meta.get("threshold", 2)
+        if len(codes) < k:
+            if not confirm(self, "Not enough shares",
+                           f"Found {len(codes)} share{'s' if len(codes) != 1 else ''} in {where}, "
+                           f"but this file needs {k}.\nFill the first {len(codes)} anyway?",
+                           yes="Fill anyway", no="Cancel"):
+                return
+        self._fill_shares(codes)
+        self._set_status(f"Loaded {min(len(codes), self._slot_count())} share"
+                         f"{'s' if len(codes) != 1 else ''} from {where}.")
 
     def _rebuild_inputs(self):
         if self._meta and self._mode_val == "shamir":
             has_data = (
-                any(inp.valid_count() > 0 for inp in self._inputs)
+                any(inp.has_input() for inp in self._inputs)
                 or any(e.get().strip() for e in self._entries)
             )
             if has_data:
-                if not messagebox.askyesno("Switch mode?",
-                        "Switching input mode will clear any shares you have entered.",
-                        icon="warning"):
+                if not confirm(self, "Switch share format?",
+                               "Switching the format clears every share you've entered so far.",
+                               yes="Switch and clear", no="Keep editing", danger=True):
                     if getattr(self, "_rebuilding", False): return
                     # Use try/finally so flag always gets reset, even on exception
                     try:
@@ -1042,114 +1348,183 @@ class DecryptorApp(tk.Toplevel):
     def _validate(self):
         if not self._payload: return "Open a .qcx file first"
         out_dir = self._out.get().strip()
-        if not out_dir: return "Specify an output folder"
-        if not os.path.isdir(out_dir): return "Output folder does not exist"
+        if not out_dir: return "Choose a folder to save the decrypted file in"
+        if not os.path.isdir(out_dir): return "That output folder doesn't exist — choose another"
         if self._mode_val == "single":
             if not hasattr(self, "_pw") or not self._pw.get(): return "Enter your password"
         else:
-            # Validate enough shares are provided for the threshold
-            threshold = self._meta.get("threshold", 2) if self._meta else 2
+            # Need k usable shares; spare slots that were left empty are ignored
+            k = self._meta.get("threshold", 2) if self._meta else 2
             if self._imode.get() == "mnemonic":
-                if len(self._inputs) < threshold:
-                    return f"Need at least {threshold} shares, but only {len(self._inputs)} provided"
-                bad = [(i+1, inp.valid_count()) for i,inp in enumerate(self._inputs)
-                       if not inp.is_complete()]
-                if bad:
-                    return "Incomplete: " + ", ".join(f"Share {i}: {n}/50" for i,n in bad)
+                complete = [inp for inp in self._inputs if inp.is_complete()]
+                partial = [(i+1, inp.valid_count()) for i, inp in enumerate(self._inputs)
+                           if inp.has_input() and not inp.is_complete()]
+                if partial:
+                    return "Incomplete: " + ", ".join(f"Share {i}: {n}/50 words" for i, n in partial)
+                if len(complete) < k:
+                    empty = [i+1 for i, inp in enumerate(self._inputs) if not inp.has_input()]
+                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty — "
+                            f"this file needs {k} shares")
             else:
-                if len(self._entries) < threshold:
-                    return f"Need at least {threshold} shares, but only {len(self._entries)} provided"
-                empty = [i+1 for i,e in enumerate(self._entries) if not e.get().strip()]
-                if empty: return f"Share(s) {empty} are empty"
-                # Check QCSHARE- prefix so bad pastes give a clear error
-                bad_fmt = [i+1 for i,e in enumerate(self._entries)
-                           if e.get().strip() and not e.get().strip().startswith("QCSHARE-")]
+                vals = [e.get().strip() for e in self._entries]
+                bad_fmt = [i+1 for i, v in enumerate(vals) if v and not v.startswith("QCSHARE-")]
                 if bad_fmt:
                     verb = "don't" if len(bad_fmt) > 1 else "doesn't"
-                    pl = "s" if len(bad_fmt) > 1 else ""
-                    return (f"Share{pl} {bad_fmt} {verb} look right — "
+                    return (f"{_share_list(bad_fmt)} {verb} look right — "
                             f"code shares start with QCSHARE-")
+                good = [v for v in vals if v]
+                if len(good) < k:
+                    empty = [i+1 for i, v in enumerate(vals) if not v]
+                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty — "
+                            f"this file needs {k} shares")
         return None
 
-    def _start(self):
+    def _focus_first_bad(self):
+        """Put the cursor on whatever the validation error is about, expanding
+        a collapsed share panel if needed, so the message points at something visible."""
+        try:
+            if self._mode_val == "single":
+                if hasattr(self, "_pw"): self._pw.focus_set()
+                return
+            if not self._out.get().strip() or not os.path.isdir(self._out.get().strip()):
+                self._out.focus_set(); return
+            if self._imode.get() == "mnemonic":
+                for inp in self._inputs:
+                    if inp.has_input() and not inp.is_complete():
+                        inp.focus(); return
+                for inp in self._inputs:
+                    if not inp.has_input():
+                        inp.focus(); return
+            else:
+                for e in self._entries:
+                    v = e.get().strip()
+                    if v and not v.startswith("QCSHARE-"):
+                        e.focus_set(); return
+                for e in self._entries:
+                    if not e.get().strip():
+                        e.focus_set(); return
+        except Exception:
+            pass
+
+    def _shares_wrong_copy(self):
+        k = self._meta.get("threshold", "?") if self._meta else "?"
+        n = self._meta.get("total", "?") if self._meta else "?"
+        return (f"These shares don't unlock this file. Any {k} of the {n} shares will "
+                f"work, so try swapping in a different share — QuantaCrypt can't tell "
+                f"which one is wrong.")
+
+    def _focus_credential(self):
+        """After a failure: back to the first credential input in either mode."""
+        try:
+            if self._mode_val == "single" and hasattr(self, "_pw"):
+                self._pw.focus_set(); self._pw.selection_range(0, "end")
+            elif self._inputs:
+                self._inputs[0].focus()
+            elif self._entries:
+                self._entries[0].focus_set(); self._entries[0].selection_range(0, "end")
+        except Exception:
+            pass
+
+    def _begin(self, verify, err):
+        """Shared tail for Decrypt and Verify: show the validation result,
+        capture widget state on the main thread, freeze the form, start the worker."""
         if self._busy: return
-        err = self._validate()
         if err:
-            self._err.config(text=err)
+            self._set_error(err)
+            self._focus_first_bad()
             self.after(50, lambda: self._cv.yview_moveto(1.0))  # Scroll after layout reflow
             return
         out = self._out.get().strip()
-        self._err.config(text=""); self._busy=True
-        self._cancel = False
-        self._prog.pack(fill="x", padx=P, pady=(0,4), before=self._results)
-        self._cancel_row.pack(fill="x", padx=P, pady=(0, 6), before=self._results)
-        self._cancel_btn.enable(True)
-        self._prog.start(); self._freeze(); self._wiz.set_step(2)
-        self.after(50, lambda: self._cv.yview_moveto(1.0))
-        for w in self._results.winfo_children(): w.destroy()
         # Capture ALL Tk widget state on the main thread — widget reads are not thread-safe
         pw_captured = self._pw.get() if self._mode_val == "single" and hasattr(self, "_pw") else None
-        # For Shamir mode, collect shares now (StringVar/Entry reads must be on main thread)
         shares_captured = None
         if self._mode_val != "single":
             try:
                 shares_captured = self._collect_shares()
             except Exception as ex:
-                self._busy = False
-                self._prog.pack_forget()
-                self._thaw()
-                self._err.config(text=str(ex))
+                if "Checksum" in str(ex):
+                    self._set_error(self._shares_wrong_copy())
+                else:
+                    self._set_error(friendly_error(ex))
+                self._focus_credential()
+                self.after(50, lambda: self._cv.yview_moveto(1.0))
                 return
-        threading.Thread(target=self._run, args=(out, pw_captured, shares_captured), daemon=True).start()
+        self._set_status(""); self._busy = True; self._verifying = verify
+        self._cancel = False
+        self._prog.pack(fill="x", padx=P, pady=(0,SP["xs"]), before=self._results)
+        self._cancel_row.pack(fill="x", padx=P, pady=(0, SP["s"]), before=self._results)
+        self._cancel_btn.enable(True)
+        self._prog.start(); self._freeze(); self._wiz.set_step(2)
+        self.after(50, lambda: self._cv.yview_moveto(1.0))
+        self.after(60, self._cancel_btn.focus_set)
+        for w in self._results.winfo_children(): w.destroy()
+        if verify:
+            threading.Thread(target=self._verify_run,
+                             args=(pw_captured, shares_captured), daemon=True).start()
+        else:
+            threading.Thread(target=self._run,
+                             args=(out, pw_captured, shares_captured), daemon=True).start()
+
+    def _start(self):
+        if self._busy: return
+        self._begin(verify=False, err=self._validate())
 
     def _freeze(self):
-        """Disable all interactive controls while decryption runs."""
+        """Disable every interactive control while decryption runs — including
+        the share inputs and their Paste / Clear / Load buttons."""
         self._btn.enable(False)
+        self._verify_btn.enable(False)
         try: self._browse_btn.enable(False)  # Prevent browse during decrypt
         except Exception: pass
         try: self._out.config(state="disabled")
         except Exception: pass
-        try:
-            self._file_card.config(cursor="")
-            for w in [self._file_card, self._file_card._icon,
-                      self._file_card._line1, self._file_card._line2]:
-                w.unbind("<Button-1>")
-            # Suppress hover highlight during decryption
-            self._file_card.unbind("<Enter>")
-            self._file_card.unbind("<Leave>")
+        try: self._file_card.set_enabled(False)
         except Exception: pass
-        # Freeze password or share inputs
         try:
             if self._mode_val == "single" and hasattr(self, "_pw"):
                 self._pw.config(state="disabled")
                 self._eye_btn.enable(False)
         except Exception: pass
+        for inp in self._inputs:
+            try: inp.set_enabled(False)
+            except Exception: pass
+        for e in self._entries:
+            try: e.config(state="disabled")
+            except Exception: pass
+        for b in self._share_btns:
+            try: b.enable(False)
+            except Exception: pass
 
     def _thaw(self):
         """Re-enable all interactive controls after decryption completes or fails."""
         self._btn.enable(True)
+        if self._payload: self._verify_btn.enable(True)
         try: self._browse_btn.enable(True)  # Restore browse button
         except Exception: pass
         try: self._out.config(state="normal")
         except Exception: pass
-        try:
-            self._file_card.config(cursor="hand2")
-            for w in [self._file_card, self._file_card._icon,
-                      self._file_card._line1, self._file_card._line2]:
-                w.bind("<Button-1>", lambda e: self._file_card._pick())
-            # Restore hover bindings after decryption
-            self._file_card.bind("<Enter>", lambda e: self._file_card._hl(True))
-            self._file_card.bind("<Leave>", lambda e: self._file_card._hl(False))
+        try: self._file_card.set_enabled(True)
         except Exception: pass
         try:
             if self._mode_val == "single" and hasattr(self, "_pw"):
                 self._pw.config(state="normal")
                 if hasattr(self, "_eye_btn"): self._eye_btn.enable(True)
         except Exception: pass
+        for inp in self._inputs:
+            try: inp.set_enabled(True)
+            except Exception: pass
+        for e in self._entries:
+            try: e.config(state="normal")
+            except Exception: pass
+        for b in self._share_btns:
+            try: b.enable(True)
+            except Exception: pass
+        self._refresh_add_btn()
 
     def _prog_cb(self, msg):
-        idx,_ = _find_stage(msg)
-        if idx is not None: self.after(0, self._prog.advance, idx, msg)
+        # Friendly stage name + percentage only; the raw core string never reaches the bar
+        idx, label = _find_stage(msg)
+        if idx is not None: self.after(0, self._prog.advance, idx, label)
 
     def _run(self, out_dir, pw_captured, shares_captured=None):
         """Worker thread — streaming decryption."""
@@ -1228,7 +1603,8 @@ class DecryptorApp(tk.Toplevel):
 
             if self._mode_val == "single":
                 self.after(0, self._clear_pw)
-            self.after(0, self._done, out, out_size, fname, sz, ts)
+            # n > 2 means the loop renamed the output to avoid an existing file
+            self.after(0, self._done, out, out_size, fname, sz, ts, n > 2)
         except cc.CancelledOperation:
             try: os.remove(tmp)
             except OSError: pass
@@ -1236,9 +1612,7 @@ class DecryptorApp(tk.Toplevel):
         except Exception as ex:
             try: os.remove(tmp)
             except OSError: pass
-            # Some cryptography exceptions (e.g. InvalidTag) produce an empty str().
-            # Fall back to the class name so _fail can still pattern-match on it.
-            self.after(0, self._fail, str(ex) or type(ex).__name__)
+            self.after(0, self._fail, ex)
 
     def _clear_pw(self):
         """Clear password entry on the main thread after successful decryption."""
@@ -1247,54 +1621,58 @@ class DecryptorApp(tk.Toplevel):
             except Exception: pass
 
     def _collect_shares(self):
+        """Gather the filled shares (main thread), reject duplicates, and
+        return the first k as QCSHARE- codes."""
+        k = self._meta.get("threshold", 0)
+        slots = []   # (slot number, share dict, code)
         if self._imode.get() == "mnemonic":
-            share_dicts = [cc.mnemonic_to_share(inp.get_mnemonic()) for inp in self._inputs]
-            meta_k = self._meta.get("threshold", 0)
-            for i, sd in enumerate(share_dicts, 1):
+            for i, inp in enumerate(self._inputs, 1):
+                if not inp.is_complete(): continue
+                sd = cc.mnemonic_to_share(inp.get_mnemonic())
                 mn_k = sd.get("threshold", 0)
-                if mn_k and mn_k != meta_k:
+                if mn_k and mn_k != k:
                     raise ValueError(
                         f"Share {i} doesn't match this file — it was created for a "
                         f"different encryption that needs {mn_k} people, but this file "
-                        f"needs {meta_k}. Check you have the right shares."
+                        f"needs {k}. Check you have the right shares."
                     )
-            return [cc.encode_share(sd) for sd in share_dicts]
-        return [e.get().strip() for e in self._entries]
+                slots.append((i, sd, cc.encode_share(sd)))
+        else:
+            for i, e in enumerate(self._entries, 1):
+                code = e.get().strip()
+                if not code: continue
+                try:
+                    sd = cc.decode_share(code)
+                except ValueError as ex:
+                    raise ValueError(
+                        f"Share {i} can't be read — the code may be incomplete or damaged. "
+                        f"Paste the whole QCSHARE- line again."
+                    ) from ex
+                slots.append((i, sd, code))
+        # The same share pasted twice recovers nothing, and the failure would
+        # otherwise surface as a cryptic wrong-key error.
+        seen = {}
+        for i, sd, _ in slots:
+            key = (sd.get("index"), sd.get("value"))
+            if key in seen:
+                raise ValueError(
+                    f"Shares {seen[key]} and {i} are the same share — you need {k} different shares."
+                )
+            seen[key] = i
+        return [code for _, _, code in slots[:k]]
 
     def _start_verify(self):
         """Validate the password/shares decrypt the file without writing any output.
         Derives keys, verifies the metadata HMAC, and decrypts the first chunk only.
         Gives confidence the credentials are correct before doing a full decrypt."""
         if self._busy: return
-        err = self._validate()
-        if err:
-            self._err.config(text=err)
-            self.after(50, lambda: self._cv.yview_moveto(1.0))
-            return
-        self._err.config(text=""); self._busy = True
-        self._prog.pack(fill="x", padx=P, pady=(0,4), before=self._results)
-        self._prog.start(); self._freeze(); self._wiz.set_step(2)
-        self.after(50, lambda: self._cv.yview_moveto(1.0))
-        for w in self._results.winfo_children(): w.destroy()
-        pw_captured = self._pw.get() if self._mode_val == "single" and hasattr(self, "_pw") else None
-        shares_captured = None
-        if self._mode_val != "single":
-            try:
-                shares_captured = self._collect_shares()
-            except Exception as ex:
-                self._busy = False
-                self._prog.pack_forget()
-                self._thaw()
-                self._err.config(text=str(ex))
-                return
-        threading.Thread(
-            target=self._verify_run,
-            args=(pw_captured, shares_captured),
-            daemon=True
-        ).start()
+        self._begin(verify=True, err=self._validate())
 
     def _verify_run(self, pw_captured, shares_captured=None):
         """Worker thread: derive keys, verify HMAC, decrypt first chunk. No output written."""
+        def _check_cancel():
+            if self._cancel:
+                raise cc.CancelledOperation()
         try:
             meta = self._meta
             if self._mode_val == "single":
@@ -1303,10 +1681,12 @@ class DecryptorApp(tk.Toplevel):
                 pw_captured = None  # noqa: F841 — release str reference
                 argon_key = cc.argon2id_derive(pw_bytes, _b64.b64decode(meta["argon_salt"]))
                 del pw_bytes
+                _check_cancel()
                 self.after(0, self._prog.advance, 1, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(argon_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
+                _check_cancel()
                 self.after(0, self._prog.advance, 2, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(argon_key, kem_ss)
@@ -1317,14 +1697,17 @@ class DecryptorApp(tk.Toplevel):
                 share_dicts = [cc.decode_share(s) for s in shares_captured]
                 self.after(0, self._prog.advance, 1, "Combining shares to recover the key...")
                 master_key = cc.shamir_recover(share_dicts[:meta["threshold"]])
+                _check_cancel()
                 self.after(0, self._prog.advance, 2, "Loading encryption key...")
                 sk = cc.aes_gcm_decrypt(master_key,
                                         _b64.b64decode(meta["kyber_sk_enc_nonce"]),
                                         _b64.b64decode(meta["kyber_sk_enc"]))
+                _check_cancel()
                 self.after(0, self._prog.advance, 3, "Unlocking file protection...")
                 kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
                 final_key = cc.xor_bytes(master_key, kem_ss)
                 hmac_key  = master_key
+            _check_cancel()
 
             # Step 1: verify metadata HMAC
             self.after(0, self._prog.advance, 4, "Checking file integrity...")
@@ -1359,53 +1742,48 @@ class DecryptorApp(tk.Toplevel):
             aad = cc._chunk_aad(0, chunk_count == 1)
             cipher.decrypt(nonce, ct, aad)  # raises if wrong key
             self.after(0, self._verify_done)
+        except cc.CancelledOperation:
+            self.after(0, self._cancelled)
         except Exception as ex:
-            self.after(0, self._fail, str(ex) or type(ex).__name__)
+            self.after(0, self._fail, ex)
 
     def _verify_done(self):
         """Show verification success without writing any output."""
-        self._busy = False; self._prog.complete(); self._thaw()
-        self._wiz.set_step(len(self.STEPS))
-        ok = tk.Frame(self._results, bg=C["surface"],
-                      highlightbackground=C["success"], highlightthickness=1)
-        ok.pack(fill="x", pady=(14,0))
-        ok_in = tk.Frame(ok, bg=C["surface"]); ok_in.pack(fill="x", padx=14, pady=12)
-        tk.Label(ok_in, text="✓  Key verified — credentials are correct",
-                 font=F["body_b"], bg=C["surface"], fg=C["success"]).pack(side="left")
-        tk.Label(ok, text="Your password / shares successfully decrypted the first block. "
-                          "No output file was written.",
+        self._busy = False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
+        self._pw_failures = 0
+        # Nothing was written — the Decrypt step is not done, so stay on it
+        self._wiz.set_step(2)
+        ok = card(self._results, padx=SP["l"], pady=SP["m"])
+        ok.outer.config(highlightbackground=C["success"])
+        ok.outer.pack(fill="x", pady=(SP["l"],0))
+        tk.Label(ok, text=f"{ICON['ok']}  Key verified — your credentials are correct",
+                 font=F["body_b"], bg=C["surface"], fg=C["success"]).pack(anchor="w")
+        tk.Label(ok, text="Your password / shares decrypted the first block. "
+                          "Nothing has been written to disk yet.",
                  font=F["caption"], bg=C["surface"], fg=C["text3"],
-                 anchor="w", justify="left", wraplength=490).pack(anchor="w", padx=14, pady=(0,8))
-        btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", padx=14, pady=(0,12))
-        FlatButton(btn_row, "Decrypt now →", self._reset_and_decrypt,
-                   primary=True, small=True).pack(side="left")
-        FlatButton(btn_row, "Decrypt another →", self._reset,
-                   primary=False, small=True).pack(side="left", padx=(8,0))
+                 anchor="w", justify="left", wraplength=490).pack(anchor="w", pady=(SP["xs"],SP["s"]))
+        btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x")
+        go = FlatButton(btn_row, f"Decrypt now {ICON['arrow']}", self._reset_and_decrypt,
+                        primary=True, small=True)
+        go.pack(side="left")
+        FlatButton(btn_row, f"Decrypt another {ICON['arrow']}", self._reset,
+                   primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         self.after(50, lambda: self._cv.yview_moveto(1.0))
+        self.after(60, go.focus_set)
 
     def _reset_and_decrypt(self):
-        """After a successful verify, keep the same file loaded and go straight to decrypt."""
-        # Save state we want to preserve
-        saved_payload  = self._payload
-        saved_meta     = self._meta
-        saved_qcx      = self._qcx_path
-        saved_mode     = self._mode_val
-        self._reset()
-        # Reload the same file so the form is populated
-        if saved_qcx and os.path.isfile(saved_qcx):
-            self._file_card.load(saved_qcx)
-            self._payload  = saved_payload
-            self._meta     = saved_meta
-            self._qcx_path = saved_qcx
-            self._mode_val = saved_mode
-            self._load_payload()
+        """After a successful verify, decrypt with the credentials still in the
+        form — no reset, no re-entering the password or shares."""
+        for w in self._results.winfo_children(): w.destroy()
+        self._start()
 
-    def _done(self, path, size, fname="", sz=0, ts=0):
+    def _done(self, path, size, fname="", sz=0, ts=0, renamed=False):
         self._busy=False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
         # Immediately disable the Decrypt button — _thaw() re-enables it,
         # but on success it must stay disabled until "Decrypt another" is clicked.
         # Doing this before building the card avoids a visible flash of the enabled state.
         self._btn.enable(False)
+        self._pw_failures = 0
         # set_step past the last step → all circles show ✓ (complete)
         self._wiz.set_step(len(self.STEPS))
         display = os.path.basename(fname) if fname else os.path.basename(path)
@@ -1416,7 +1794,6 @@ class DecryptorApp(tk.Toplevel):
         self._orig = os.path.basename(fname) if fname else None
         # Add to recent files list
         try:
-            from quantacrypt.ui.shared import RecentFiles
             RecentFiles.add(self._qcx_path, self._meta)
         except Exception:
             pass
@@ -1434,12 +1811,16 @@ class DecryptorApp(tk.Toplevel):
             try:
                 entry.config(state="normal")
                 entry.delete(0, "end")
+                self._mark_entry(entry)
             except Exception: pass
-        ok = tk.Frame(self._results, bg=C["surface"],
-                      highlightbackground=C["success"], highlightthickness=1)
-        ok.pack(fill="x", pady=(14,0))
-        ok_in = tk.Frame(ok, bg=C["surface"]); ok_in.pack(fill="x", padx=14, pady=12)
-        tk.Label(ok_in, text="✓  Decrypted successfully", font=F["body_b"],
+        if self._entries: cleared_shares = True
+        self._update_share_counter()
+
+        ok = card(self._results, padx=SP["l"], pady=SP["m"])
+        ok.outer.config(highlightbackground=C["success"])
+        ok.outer.pack(fill="x", pady=(SP["l"],0))
+        ok_in = tk.Frame(ok, bg=C["surface"]); ok_in.pack(fill="x")
+        tk.Label(ok_in, text=f"{ICON['ok']}  Decrypted successfully", font=F["body_b"],
                  bg=C["surface"], fg=C["success"]).pack(side="left")
         tk.Label(ok_in, text=fmt_size(size), font=F["caption"],
                  bg=C["surface"], fg=C["text3"]).pack(side="right")
@@ -1448,11 +1829,16 @@ class DecryptorApp(tk.Toplevel):
         # Only show separate filename line when it differs from the output path basename
         if display_name != os.path.basename(path):
             tk.Label(ok, text=display_name, font=F["mono"],
-                     bg=C["surface"], fg=C["text2"]).pack(anchor="w", padx=14, pady=(0,2))
+                     bg=C["surface"], fg=C["text2"]).pack(anchor="w", pady=(SP["xs"],0))
         # Show full output path so user knows exactly where it went
         tk.Label(ok, text=path, font=F["caption"],
                  bg=C["surface"], fg=C["text3"], anchor="w",
-                 wraplength=490, justify="left").pack(anchor="w", padx=14, pady=(2,0))
+                 wraplength=490, justify="left").pack(anchor="w", pady=(SP["xs"],0))
+        if renamed:
+            tk.Label(ok, text=(f"A file named {display_name} already existed there, "
+                               f"so this one was saved as {os.path.basename(path)}."),
+                     font=F["caption"], bg=C["surface"], fg=C["warning"], anchor="w",
+                     wraplength=490, justify="left").pack(anchor="w", pady=(SP["xs"],0))
         # Show original size and timestamp if available
         if sz or ts:
             info_parts = []
@@ -1462,22 +1848,24 @@ class DecryptorApp(tk.Toplevel):
                 except Exception: pass
             if info_parts:
                 tk.Label(ok, text="  ·  ".join(info_parts), font=F["caption"],
-                         bg=C["surface"], fg=C["text3"]).pack(anchor="w", padx=14, pady=(4,0))
+                         bg=C["surface"], fg=C["text3"]).pack(anchor="w", pady=(SP["xs"],0))
         # Note that shares were cleared for security
         if cleared_shares:
-            tk.Label(ok, text="Share inputs cleared after decryption.",
-                     font=F["caption"], bg=C["surface"], fg=C["text3"]).pack(anchor="w", padx=14, pady=(2,0))
+            tk.Label(ok, text="Share inputs were cleared after decryption.",
+                     font=F["caption"], bg=C["surface"], fg=C["text3"]).pack(anchor="w", pady=(SP["xs"],0))
         # Label the button so it's clear re-running needs "Decrypt another →"
-        self._btn.config(text="Decrypt again →")
+        self._btn.config(text=f"Decrypt again {ICON['arrow']}")
         # Reveal + decrypt another
-        btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", padx=14, pady=(8,12))
-        FlatButton(btn_row, "Decrypt another →", self._reset, primary=False, small=True).pack(side="left")
+        btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", pady=(SP["s"],0))
+        another = FlatButton(btn_row, f"Decrypt another {ICON['arrow']}", self._reset,
+                             primary=False, small=True)
+        another.pack(side="left")
         # If output looks like a folder-encrypted zip, offer one-click extraction
         import zipfile as _zf
         _is_folder_zip = (fname or "").endswith(".zip") and os.path.isfile(path) and _zf.is_zipfile(path)
         if _is_folder_zip:
             def _extract(p=path):
-                import zipfile, tkinter.messagebox as _mb
+                import zipfile
                 out_dir = os.path.dirname(os.path.abspath(p))
                 try:
                     with zipfile.ZipFile(p) as zf:
@@ -1490,38 +1878,44 @@ class DecryptorApp(tk.Toplevel):
                                 raise ValueError(f"Path traversal detected in archive: {member}")
                         zf.extractall(out_dir)
                     top = os.path.join(out_dir, names[0].split("/")[0]) if names else out_dir
-                    _reveal(top)
-                    _mb.showinfo("Extracted", f"Folder extracted to:\n{out_dir}", parent=self)
+                    self._reveal(top)
+                    alert(self, "Folder extracted", f"The folder was extracted to:\n{out_dir}")
                 except Exception as ex:
-                    _mb.showerror("Extraction failed", str(ex), parent=self)
-            FlatButton(btn_row, "Extract folder", _extract, primary=True, small=True).pack(side="left", padx=(8,0))
+                    alert(self, "Extraction failed", friendly_error(ex))
+            FlatButton(btn_row, "Extract folder", _extract, primary=True, small=True).pack(side="left", padx=(SP["s"],0))
         else:
-            FlatButton(btn_row, "Open file", lambda: _open_file(path), primary=False, small=True).pack(side="left", padx=(8,0))
-        FlatButton(btn_row, "Show in folder", lambda: _reveal(path), primary=False, small=True).pack(side="left", padx=(8,0))
+            FlatButton(btn_row, "Open file", lambda: _open_file(path), primary=False, small=True).pack(side="left", padx=(SP["s"],0))
+        FlatButton(btn_row, REVEAL_LABEL, lambda: self._reveal(path), primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         self.after(50, lambda: self._cv.yview_moveto(1.0))
+        self.after(60, another.focus_set)
+
+    def _reveal(self, path):
+        if not reveal_path(path):
+            self._set_status(f"Couldn't open the file manager — the file is at {path}")
 
     def _reset(self):
         self._payload  = None; self._meta = None; self._orig = None
         self._mode_val = None; self._inputs = []; self._entries = []
-        self._sz = 0; self._ts = 0
+        self._entry_marks = []; self._share_btns = []; self._add_btn = None
+        self._sz = 0; self._ts = 0; self._pw_failures = 0
         # Clear trace ID so next file load does not attempt to remove a stale ID
         if self._imode_trace_id:
             try: self._imode.trace_remove("write", self._imode_trace_id)
             except Exception: pass
             self._imode_trace_id = None
         self._out.delete(0, "end")
-        self._out_hint.config(text="Open a file first to set output path.")
-        self._err.config(text="")
+        self._out_hint.config(text=OUT_HINT_EMPTY)
+        self._set_status("")
         for w in self._results.winfo_children(): w.destroy()
         for w in self._info_wrap.winfo_children(): w.destroy()
         for w in self._inspect_row.winfo_children(): w.destroy()
         for w in self._sec_wrap.winfo_children(): w.destroy()
         self._verify_btn.enable(False)
-        tk.Label(self._sec_wrap, text="Open a file to see decryption options.",
+        self._sec_label.config(text="2  PASSWORD")
+        tk.Label(self._sec_wrap, text=SEC_HINT_EMPTY,
                  font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
-        # Use FileCard.reset() — no destroy/recreate needed
-        self._file_card.reset("Select an encrypted file",
-                              "Click anywhere · .qcx files · or drag & drop")
+        # Same prompt as the initial build; the drop hint follows what was registered
+        self._file_card.reset(FILE_PROMPT)
         # btn stays disabled — re-enabled by _load_payload when a valid file is opened
         self._btn.config(text="Open a file to begin")  # Neutral text while disabled
         self._prog.pack_forget(); self._wiz.set_step(0)
@@ -1539,7 +1933,7 @@ class DecryptorApp(tk.Toplevel):
             self._cancel_btn.enable(False)
         except Exception:
             pass
-        self._err.config(text="Cancelling — finishing the current chunk…")
+        self._set_status("Cancelling — finishing the current step…")
 
     def _cancelled(self):
         """Post-cancel UI reset."""
@@ -1551,46 +1945,39 @@ class DecryptorApp(tk.Toplevel):
         self._cancel_row.pack_forget()
         self._thaw()
         self._wiz.set_step(2)
-        self._err.config(text="Decryption cancelled — no output was written.")
+        what = "Verification" if self._verifying else "Decryption"
+        self._set_status(f"{what} cancelled — nothing was written.")
+        notify(f"{what} cancelled", "Nothing was written.", sound=False)
+        self._focus_credential()
 
-    def _fail(self, msg):
+    def _fail(self, exc):
+        """Worker failure → one plain sentence on the status line.  Only the
+        two credential cases get bespoke copy; everything else goes through
+        friendly_error() so the two wizards can't drift apart again."""
         self._busy=False; self._cancel=False; self._tmp_path=None
         self._prog.stop(); self._prog.pack_forget(); self._cancel_row.pack_forget(); self._thaw()
         self._wiz.set_step(2)  # stay at Decrypt step — error is shown there
-        if "InvalidTag" in msg:
-            hint = ("Wrong password — please re-enter and try again."
-                    if self._mode_val == "single" else
-                    "Wrong shares — check you have the correct shares for this file.")
-            self._err.config(text=hint)
-            # Auto-select the password field so the user can immediately retype
-            if self._mode_val == "single" and hasattr(self, "_pw"):
-                # Defer focus so _thaw's state=normal is processed first
-                def _refocus():
-                    try: self._pw.focus_set(); self._pw.selection_range(0, "end")
-                    except Exception: pass
-                self.after(10, _refocus)
-        elif "older format" in msg.lower() or "no longer supported" in msg.lower():
-            self._err.config(text=msg)
-        elif "Checksum" in msg:
-            self._err.config(text="One of your shares has a checksum error — it may be damaged or for a different file.")
-        elif "threshold mismatch" in msg.lower() or "doesn't match this file" in msg.lower():
-            self._err.config(text=msg)  # our own descriptive message
-        elif "newer version" in msg.lower():
-            self._err.config(text=msg)  # Safe — our own message
-        elif "No space left" in msg or "disk" in msg.lower():
-            self._err.config(text="Not enough disk space. Free up some storage and try again.")
-        elif "Permission" in msg or "Access is denied" in msg:
-            self._err.config(text="Can't write to that folder — check permissions or choose a different output folder.")
-        elif "Not a QuantaCrypt" in msg or "truncated" in msg.lower():
-            self._err.config(text="This doesn't appear to be a valid .qcx file. Make sure you selected the right file.")
-        elif "out of range" in msg.lower():
-            self._err.config(text="These shares don't work — they may be damaged or from a different file.")
-        elif "Metadata authentication" in msg or "tampered" in msg.lower():
-            self._err.config(text="This file appears to have been modified or corrupted. It can't be safely decrypted.")
-        elif "Authentication failed" in msg or "chunk" in msg.lower():
-            self._err.config(text="File integrity check failed — the file may be damaged or corrupted.")
+        if isinstance(exc, BaseException):
+            msg = str(exc) or type(exc).__name__
+            wrong_key = "InvalidTag" in msg or "InvalidTag" in type(exc).__name__
+        else:  # tolerate a pre-mapped string
+            msg = str(exc); exc = RuntimeError(msg)
+            wrong_key = "InvalidTag" in msg
+        detail = ""
+        if wrong_key and self._mode_val == "single":
+            self._pw_failures += 1
+            text = ("Wrong password — check Caps Lock, use Show to see what you typed, "
+                    "and try again.")
+            if self._pw_failures >= 3:
+                detail = NO_RECOVERY_NOTE
+        elif wrong_key or "Checksum" in msg or "out of range" in msg.lower():
+            text = self._shares_wrong_copy()
         else:
-            self._err.config(text="Something went wrong. Double-check your inputs and try again.")
+            text = friendly_error(exc)
+        self._set_error(text, detail)
+        notify("Decryption failed", text, sound=False)
+        # Defer focus so _thaw's state=normal is processed first
+        self.after(10, self._focus_credential)
         # Scroll to bottom so the error label is visible
         self.after(50, lambda: self._cv.yview_moveto(1.0))  # Reflow delay
 

@@ -156,15 +156,17 @@ open htmlcov/index.html
 
 ## Keyboard Shortcuts
 
+`⌘` on macOS (`Ctrl` also works there), `Ctrl` on Linux / Windows.
+
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+E` | Open Encryptor |
-| `Ctrl+D` | Open Decryptor |
-| `Ctrl+V` | Open Volume Manager |
-| `Ctrl+I` | Inspect a .qcx file |
-| `Ctrl+O` | Browse for a file |
-| `Ctrl+Return` | Start encryption / decryption |
-| `Escape` | Close window |
+| `⌘E` | Open Encryptor |
+| `⌘D` | Open Decryptor |
+| `⌘M` | Open Volume Manager (mount) |
+| `⌘I` | Inspect a .qcx file |
+| `⌘O` | Browse for a file (in a wizard) |
+| `⌘Return` | Start encryption / decryption |
+| `Escape` | Close a wizard — asks first if you have typed anything; never quits the app |
 
 ---
 

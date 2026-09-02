@@ -7,44 +7,104 @@ import time
 import tkinter as tk
 
 __all__ = [
-    "C", "F", "UI", "MONO",
+    "C", "F", "UI", "MONO", "SP", "ICON", "MOD", "MOD_LABEL", "REVEAL_LABEL",
+    "accel", "bind_shortcut",
     "styled_entry", "bind_context_menu", "fmt_size", "rule", "section_label",
+    "card", "kv_row", "confirm", "alert", "reveal_path",
     "FlatButton", "SegmentedControl", "StagedProgressBar",
     "PasswordStrengthBar", "FileCard", "WizardSteps",
-    "ClipboardTimer", "RecentFiles",
+    "ClipboardTimer", "RecentFiles", "RecentVolumes", "AppPrefs",
 ]
 
 # ── Colors ────────────────────────────────────────────────────────────────────
+# Every pair below was contrast-checked (WCAG): text on accent 4.7:1, text on
+# accent_hover 6.2:1, text on error_fill 5.2:1, text3 on surface 5.0:1,
+# accent_text on surface 5.5:1.  "accent" is a FILL colour (buttons, selected
+# segments, progress); use "accent_text" for links and emphasis on dark
+# surfaces — the fill is too dark to read as text.
 C = {
-    "bg":         "#1c1c1e",
-    "surface":    "#2c2c2e",
-    "surface2":   "#3a3a3c",
-    "surface3":   "#48484a",
-    "border":     "#48484a",
-    "accent":     "#4a90d9",
-    "accent_dim": "#2d5a8a",
-    "text":       "#f5f5f7",
-    "text2":      "#c8c8cc",
-    "text3":      "#8e8e93",
-    "success":    "#30d158",
-    "error":      "#ff453a",
-    "warning":    "#ffd60a",
-    "warn_dim":   "#7a6500",
+    "bg":           "#1c1c1e",
+    "surface":      "#2c2c2e",
+    "surface2":     "#3a3a3c",
+    "surface3":     "#48484a",
+    "border":       "#48484a",
+    "accent":       "#2f6fb8",   # fill
+    "accent_hover": "#265d9c",   # hover goes darker so contrast rises
+    "accent_press": "#1f4c80",
+    "accent_dim":   "#2d5a8a",
+    "accent_text":  "#6aa6e8",   # links / active labels on dark surfaces
+    "text":         "#f5f5f7",
+    "text2":        "#c8c8cc",
+    "text3":        "#9a9aa0",
+    "success":      "#30d158",
+    "error":        "#ff453a",   # error TEXT on bg
+    "error_fill":   "#c22d26",   # danger button fill
+    "error_hover":  "#a8241e",
+    "warning":      "#ffd60a",
+    "warn_dim":     "#7a6500",
 }
 
-UI   = "DejaVu Sans"
-MONO = "DejaVu Sans Mono"
+# ── Fonts ─────────────────────────────────────────────────────────────────────
+# Tk silently substitutes the system family when a font is missing, so a
+# hard-coded "DejaVu Sans Mono" turns PROPORTIONAL on macOS (verified: both
+# DejaVu faces resolve to .AppleSystemUIFont).  Pick per platform.
+if sys.platform == "darwin":
+    UI, MONO = ".AppleSystemUIFont", "Menlo"
+elif sys.platform == "win32":
+    UI, MONO = "Segoe UI", "Consolas"
+else:
+    UI, MONO = "DejaVu Sans", "DejaVu Sans Mono"
 
+# Type scale: base 13 × 1.2ⁿ → 11 / 13 / 16 / 19 / 22 / 27.  "small" (10) is
+# the one sub-scale size, reserved for meta text (dates, counters, hints).
 F = {
-    "display": (UI, 20, "bold"),
-    "heading": (UI, 15, "bold"),
+    "hero":    (UI, 27, "bold"),
+    "display": (UI, 22, "bold"),
+    "title":   (UI, 19, "bold"),
+    "heading": (UI, 16, "bold"),
     "body":    (UI, 13),
     "body_b":  (UI, 13, "bold"),
     "caption": (UI, 11),
+    "caption_u": (UI, 11, "underline"),
     "small":   (UI, 10),
     "mono":    (MONO, 12),
     "mono_s":  (MONO, 10),
 }
+
+# Spacing scale (pt).  Every padx/pady should be one of these.
+SP = {"xs": 4, "s": 8, "m": 12, "l": 16, "xl": 24, "xxl": 32}
+
+# Status glyphs — the only non-letter symbols the UI draws.  Kept in one map
+# so they can be swapped or suppressed per platform; never use colour emoji.
+ICON = {"ok": "✓", "err": "✗", "warn": "⚠", "arrow": "→", "back": "←",
+        "chevron_open": "▾", "chevron_closed": "▸", "close": "×"}
+
+# Platform modifier for keyboard shortcuts.  ⌘ on macOS, Ctrl elsewhere.
+MOD       = "Command" if sys.platform == "darwin" else "Control"
+MOD_LABEL = "⌘" if sys.platform == "darwin" else "Ctrl+"
+# One label for "show me this file in the file manager" on every screen.
+REVEAL_LABEL = "Show in Finder" if sys.platform == "darwin" else "Show in folder"
+
+
+def accel(key: str) -> str:
+    """Human-readable accelerator: accel("O") → "⌘O" / "Ctrl+O"."""
+    return f"{MOD_LABEL}{key}"
+
+
+def bind_shortcut(widget, key: str, handler, *, also_control: bool = True):
+    """Bind <Mod-key> (both cases) — the platform modifier, plus Ctrl on
+    macOS when ``also_control`` so muscle-memory from other platforms still
+    works.  ``key`` is a single letter or a Tk keysym like "Return"."""
+    def _cb(_e, h=handler):
+        h()
+        return "break"
+    keys = {key.lower(), key.upper()} if len(key) == 1 else {key}
+    mods = {MOD}
+    if also_control:
+        mods.add("Control")
+    for m in mods:
+        for k in keys:
+            widget.bind(f"<{m}-{k}>", _cb)
 
 
 def bind_context_menu(widget):
@@ -55,7 +115,7 @@ def bind_context_menu(widget):
     def _show(event):
         menu = tk.Menu(widget, tearoff=0,
                        bg=C["surface2"], fg=C["text"],
-                       activebackground=C["accent"], activeforeground="#fff",
+                       activebackground=C["accent"], activeforeground=C["text"],
                        font=F["caption"], relief="flat", bd=0)
         is_text = isinstance(widget, tk.Text)
         has_sel = False
@@ -110,11 +170,107 @@ def bind_context_menu(widget):
 def styled_entry(parent, **kw):
     e = tk.Entry(
         parent, bg=C["surface2"], fg=C["text"],
-        insertbackground=C["accent"], relief="flat",
-        highlightbackground=C["border"], highlightcolor=C["accent"],
+        insertbackground=C["accent_text"], relief="flat",
+        highlightbackground=C["border"], highlightcolor=C["accent_text"],
         highlightthickness=1, font=F["body"], **kw)
     bind_context_menu(e)
     return e
+
+
+def card(parent, padx=SP["m"], pady=SP["s"], **kw):
+    """The one card recipe: surface fill + hairline border.  Returns the
+    inner frame to pack content into (so callers never retype the border)."""
+    outer = tk.Frame(parent, bg=C["surface"],
+                     highlightbackground=C["border"], highlightthickness=1, **kw)
+    inner = tk.Frame(outer, bg=C["surface"])
+    inner.pack(fill="both", expand=True, padx=padx, pady=pady)
+    inner.outer = outer  # type: ignore[attr-defined]
+    return inner
+
+
+def kv_row(parent, label, value, *, label_width=11, wraplength=340, pady=3):
+    """Label/value row used by every metadata card (file info, inspect, results)."""
+    row = tk.Frame(parent, bg=parent.cget("bg"))
+    row.pack(fill="x", pady=pady)
+    tk.Label(row, text=label, font=F["caption"], bg=row.cget("bg"), fg=C["text3"],
+             width=label_width, anchor="w").pack(side="left")
+    val = tk.Label(row, text=value, font=F["caption"], bg=row.cget("bg"),
+                   fg=C["text2"], anchor="w", wraplength=wraplength, justify="left")
+    val.pack(side="left", fill="x")
+    return val
+
+
+def _dialog(parent, title, message, buttons, *, danger=False, default=0):
+    """Themed modal dialog.  ``buttons`` is a list of (label, value); the
+    first is the primary action.  Returns the chosen value (or the last
+    button's value on Escape / window close)."""
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(bg=C["bg"])
+    win.resizable(False, False)
+    win.transient(parent)
+    result = {"v": buttons[-1][1]}
+    P = SP["xl"]
+    tk.Label(win, text=title, font=F["heading"], bg=C["bg"], fg=C["text"],
+             wraplength=380, justify="left").pack(anchor="w", padx=P, pady=(P - 4, SP["s"]))
+    tk.Label(win, text=message, font=F["body"], bg=C["bg"], fg=C["text2"],
+             wraplength=380, justify="left").pack(anchor="w", padx=P, pady=(0, P - 4))
+    row = tk.Frame(win, bg=C["bg"])
+    row.pack(fill="x", padx=P, pady=(0, P - 4))
+    btns = []
+    for i, (label, value) in enumerate(buttons):
+        def _choose(v=value):
+            result["v"] = v
+            win.destroy()
+        b = FlatButton(row, label, _choose, primary=(i == 0 and not danger),
+                       danger=(i == 0 and danger), small=True)
+        b.pack(side="right" if i == 0 else "right", padx=(SP["s"], 0))
+        btns.append(b)
+    win.bind("<Escape>", lambda e: (win.destroy()))
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.update_idletasks()
+    try:
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        ww, wh = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{px + (pw - ww) // 2}+{py + (ph - wh) // 2}")
+    except Exception:
+        pass
+    win.grab_set()
+    win.focus_force()
+    btns[min(default, len(btns) - 1)].focus_set()
+    win.wait_window()
+    return result["v"]
+
+
+def confirm(parent, title, message, *, yes="Continue", no="Cancel",
+            danger=False, default_no=True) -> bool:
+    """Themed yes/no.  Destructive actions pass danger=True; the safe button
+    holds focus by default so a stray Return never destroys anything."""
+    return bool(_dialog(parent, title, message, [(yes, True), (no, False)],
+                        danger=danger, default=1 if default_no else 0))
+
+
+def alert(parent, title, message, *, ok="OK") -> None:
+    """Themed single-button message."""
+    _dialog(parent, title, message, [(ok, None)])
+
+
+def reveal_path(path: str) -> bool:
+    """Show ``path`` in the platform file manager.  Returns False when no
+    handler is available so callers can say so instead of failing silently."""
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            target = path if os.path.isdir(path) else os.path.dirname(path)
+            subprocess.Popen(["xdg-open", target])
+        return True
+    except Exception:
+        return False
 
 
 def _find_app_icon() -> str:
@@ -294,49 +450,64 @@ except ImportError:
 
 
 class FlatButton(tk.Label):
-    """Flat filled button with hover effect."""
+    """Flat filled button.  States: rest / hover / pressed / focus / disabled.
+    Hover and press go DARKER (contrast rises); the focus ring is drawn in
+    the text colour on filled buttons so it is visible on the accent."""
     def __init__(self, parent, text, command=None, primary=True,
                  danger=False, small=False, **kw):
         if danger:
-            bg, fg, hov = C["error"],   C["text"],  "#ff6961"
+            bg, fg, hov, press = C["error_fill"], C["text"], C["error_hover"], C["error_hover"]
         elif primary:
-            bg, fg, hov = C["accent"],  C["text"],  "#5ba3e8"
+            bg, fg, hov, press = C["accent"], C["text"], C["accent_hover"], C["accent_press"]
         else:
-            bg, fg, hov = C["surface2"], C["text2"], C["surface3"]
+            bg, fg, hov, press = C["surface2"], C["text2"], C["surface3"], C["surface"]
 
         font = F["small"] if small else F["body_b"]
-        padx = 14 if small else 20
-        pady = 7  if small else 9
+        padx = SP["m"] if small else SP["l"] + SP["xs"]
+        pady = SP["s"] - 2 if small else SP["s"]
 
         super().__init__(parent, text=text, font=font,
                          bg=bg, fg=fg, cursor="hand2",
                          padx=padx, pady=pady, **kw)
         self._cmd = command
-        self._bg = bg; self._hov = hov; self._fg = fg
-        self.config(takefocus=1)
-        self.bind("<Button-1>", lambda e: command() if command else None)
-        self.bind("<Return>",   lambda e: (command() if command else None))
-        self.bind("<space>",    lambda e: (command() if command else None))
-        self.bind("<Enter>",    lambda e: self.config(bg=hov))
-        self.bind("<Leave>",    lambda e: self.config(bg=bg))
-        self.bind("<FocusIn>",  lambda e: self.config(highlightbackground=C["accent"],
-                                                       highlightthickness=1))
-        self.bind("<FocusOut>", lambda e: self.config(highlightbackground=bg,
-                                                       highlightthickness=0))
+        self._bg = bg; self._hov = hov; self._fg = fg; self._press = press
+        self._filled = primary or danger
+        self._ring = C["text"] if self._filled else C["accent_text"]
+        self._enabled = True
+        self._bind_live()
+
+    def _fire(self, _e=None):
+        if self._cmd:
+            self._cmd()
+        return "break"
+
+    def _bind_live(self):
+        self.bind("<Button-1>",        lambda e: self.config(bg=self._press))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Return>",   self._fire)
+        self.bind("<space>",    self._fire)
+        self.bind("<Enter>",    lambda e: self.config(bg=self._hov))
+        self.bind("<Leave>",    lambda e: self.config(bg=self._bg))
+        self.bind("<FocusIn>",  lambda e: self.config(highlightbackground=self._ring,
+                                                       highlightcolor=self._ring,
+                                                       highlightthickness=2))
+        self.bind("<FocusOut>", lambda e: self.config(highlightthickness=0))
+
+    def _release(self, e):
+        inside = 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height()
+        self.config(bg=self._hov if inside else self._bg)
+        if inside:
+            return self._fire()
+        return None
+
+    def set_text(self, text):
+        self.config(text=text)
 
     def enable(self, on=True):
         self._enabled = on
         if on:
             self.config(fg=self._fg, cursor="hand2", bg=self._bg, takefocus=1)
-            self.bind("<Button-1>", lambda e: self._cmd() if self._cmd else None)
-            self.bind("<Return>",   lambda e: (self._cmd() if self._cmd else None))
-            self.bind("<space>",    lambda e: (self._cmd() if self._cmd else None))
-            self.bind("<Enter>",    lambda e: self.config(bg=self._hov))
-            self.bind("<Leave>",    lambda e: self.config(bg=self._bg))
-            self.bind("<FocusIn>",  lambda e: self.config(highlightbackground=C["accent"],
-                                                           highlightthickness=1))
-            self.bind("<FocusOut>", lambda e: self.config(highlightbackground=self._bg,
-                                                           highlightthickness=0))
+            self._bind_live()
             # If mouse is already over the button, apply hover colour immediately
             try:
                 x, y = self.winfo_pointerxy()
@@ -347,16 +518,14 @@ class FlatButton(tk.Label):
             except Exception:
                 pass
         else:
-            # Use 'arrow' explicitly — cursor='' may inherit from parent
-            self.config(fg=C["text3"], cursor="arrow", bg=C["surface2"], takefocus=0,
+            # Disabled: sinks to the surface colour so it cannot be confused
+            # with an enabled secondary button.  Use 'arrow' explicitly —
+            # cursor='' may inherit from parent.
+            self.config(fg=C["text3"], cursor="arrow", bg=C["surface"], takefocus=0,
                         highlightthickness=0)
-            self.bind("<Button-1>", lambda e: None)
-            self.bind("<Return>",   lambda e: None)
-            self.bind("<space>",    lambda e: None)
-            self.bind("<Enter>",    lambda e: None)
-            self.bind("<Leave>",    lambda e: None)
-            self.bind("<FocusIn>",  lambda e: None)  # suppress ring on disabled btn
-            self.bind("<FocusOut>", lambda e: None)
+            for ev in ("<Button-1>", "<ButtonRelease-1>", "<Return>", "<space>",
+                       "<Enter>", "<Leave>", "<FocusIn>", "<FocusOut>"):
+                self.bind(ev, lambda e: None)
 
 
 class SegmentedControl(tk.Frame):
@@ -380,11 +549,33 @@ class SegmentedControl(tk.Frame):
 
         # Keyboard: Tab focuses the control, Left/Right arrows switch options
         self.config(takefocus=True)
-        self.bind("<FocusIn>",  lambda e: self.config(highlightbackground=C["accent"], highlightthickness=2))
+        self.bind("<FocusIn>",  lambda e: self.config(highlightbackground=C["accent_text"], highlightthickness=2))
         self.bind("<FocusOut>", lambda e: self.config(highlightbackground=C["border"], highlightthickness=1))
         self.bind("<Left>",  lambda e: self._step(-1))
         self.bind("<Right>", lambda e: self._step(1))
         self.bind("<Return>", lambda e: None)  # absorb so form doesn't submit on focus
+
+    def set_enabled(self, on: bool):
+        """Freeze/thaw: blocks clicks and arrow keys, dims labels, and
+        drops the control from the Tab order while a job runs."""
+        self._enabled = on
+        for val, lbl in self._labels.items():
+            if on:
+                lbl.config(cursor="hand2")
+                lbl.bind("<Button-1>", lambda e, v=val: self._var.set(v))
+            else:
+                lbl.config(cursor="arrow")
+                lbl.bind("<Button-1>", lambda e: None)
+        if on:
+            self.bind("<Left>",  lambda e: self._step(-1))
+            self.bind("<Right>", lambda e: self._step(1))
+            self.config(takefocus=True)
+            self._refresh()
+        else:
+            self.unbind("<Left>"); self.unbind("<Right>")
+            self.config(takefocus=0)
+            for lbl in self._labels.values():
+                lbl.config(fg=C["text3"])
 
     def _step(self, direction):
         opts = self._opt_vals
@@ -679,7 +870,8 @@ class PasswordStrengthBar(tk.Frame):
     def _refresh(self):
         pw = self._var.get()
         score, label, tip = self._score(pw)
-        colors = [C["error"], C["error"], C["warning"], C["accent"], C["success"]]
+        # Quality ramp only — the action blue is not a grade.
+        colors = [C["error"], C["error"], C["warning"], C["success"], C["success"]]
         pct    = score / 4
         color  = colors[score] if pw else C["surface3"]
 
@@ -719,9 +911,9 @@ class FileCard(tk.Frame):
         self._selected  = False
         self._filetypes = filetypes or [("All files", "*")]
 
-        self._icon  = tk.Label(self, text="+", font=(UI, 26, "bold"),
+        self._icon  = tk.Label(self, text="+", font=F["hero"],
                                 bg=C["surface"], fg=C["surface3"])
-        self._icon.pack(pady=(20, 4))
+        self._icon.pack(pady=(SP["l"], SP["xs"]))
         self._line1 = tk.Label(self, text=prompt,
                                 font=F["body_b"], bg=C["surface"], fg=C["text3"])
         self._line1.pack()
@@ -741,11 +933,18 @@ class FileCard(tk.Frame):
         self.bind("<Return>", lambda e: self._pick())
         self.bind("<space>",  lambda e: self._pick())
         self.bind("<FocusIn>",  lambda e: self.config(
-            highlightbackground=C["accent"],
+            highlightbackground=C["accent_text"],
             highlightthickness=2))
         self.bind("<FocusOut>", lambda e: self.config(
             highlightbackground=C["success"] if self._selected else C["border"],
             highlightthickness=1))
+
+    def set_drop_supported(self, supported: bool, sub_with_drop: str, sub_without: str):
+        """Only promise drag & drop when the caller actually registered a
+        drop target — otherwise the hint is a lie."""
+        if not self._selected:
+            self._line2.config(text=sub_with_drop if supported else sub_without)
+        self._sub_default = sub_with_drop if supported else sub_without
 
     def _pick(self):
         from tkinter import filedialog
@@ -772,25 +971,54 @@ class FileCard(tk.Frame):
     def load(self, path):
         """Pre-populate card (used when app is launched with a file argument)."""
         self._selected = True
-        self._icon.config(text="✓", fg=C["success"])
+        self._icon.config(text=ICON["ok"], fg=C["success"])
         self._line1.config(text=os.path.basename(path), fg=C["text"], font=F["body_b"])
         try:
             size_str = fmt_size(os.path.getsize(path))
         except OSError:
             size_str = "unknown size"
         self._line2.config(text=f"{size_str}  ·  Click to change",
-                           fg=C["accent"])
+                           fg=C["accent_text"])
         for w in [self, self._icon, self._line1, self._line2]:
             w.config(bg=C["surface"])
+        self.config(highlightbackground=C["success"])
 
-    def reset(self, prompt, sub):
+    def load_folder(self, path, count: int, total_bytes: int, *, scanning=False):
+        """Folder state.  ``scanning=True`` shows the interim label while a
+        worker walks the tree; call again with the totals when done."""
+        self._selected = True
+        self._icon.config(text=ICON["ok"], fg=C["success"])
+        self._line1.config(text=os.path.basename(path.rstrip(os.sep)) or path,
+                           fg=C["text"], font=F["body_b"])
+        if scanning:
+            self._line2.config(text="Scanning folder…", fg=C["text3"])
+        else:
+            self._line2.config(
+                text=f"{count:,} files  ·  {fmt_size(total_bytes)}  ·  Click to change",
+                fg=C["accent_text"])
+        for w in [self, self._icon, self._line1, self._line2]:
+            w.config(bg=C["surface"])
+        self.config(highlightbackground=C["success"])
+
+    def set_enabled(self, on: bool):
+        """Freeze/thaw without callers touching private widgets."""
+        self.config(takefocus=bool(on), cursor="hand2" if on else "arrow")
+        for w in [self, self._icon, self._line1, self._line2]:
+            if on:
+                w.bind("<Button-1>", lambda e: self._pick())
+            else:
+                w.bind("<Button-1>", lambda e: None)
+
+    def reset(self, prompt, sub=None):
         """Restore to unselected state (used by _reset flows)."""
         self._selected = False
         self._icon.config(text="+", fg=C["surface3"])
         self._line1.config(text=prompt, fg=C["text3"], font=F["body_b"])
-        self._line2.config(text=sub,    fg=C["text3"])
+        self._line2.config(text=sub if sub is not None
+                           else getattr(self, "_sub_default", ""), fg=C["text3"])
         for w in [self, self._icon, self._line1, self._line2]:
             w.config(bg=C["surface"])
+        self.config(highlightbackground=C["border"])
 
     def _hl(self, on):
         if self._selected: return
@@ -803,7 +1031,7 @@ class WizardSteps(tk.Canvas):
     """Horizontal step tracker. Steps: list of names. Active = current step."""
     def __init__(self, parent, steps, **kw):
         nsteps = len(steps)
-        super().__init__(parent, width=nsteps*100, height=44,
+        super().__init__(parent, width=nsteps*100, height=56,
                          bg=C["bg"], bd=0, highlightthickness=0, **kw)
         self._steps  = steps
         self._active = 0
@@ -842,8 +1070,8 @@ class WizardSteps(tk.Canvas):
             if done:
                 self.create_oval(cx-r, cy-r, cx+r, cy+r,
                                   fill=C["success"], outline="")
-                self.create_text(cx, cy, text="✓", font=F["small"],
-                                  fill=C["text"])
+                self.create_text(cx, cy, text=ICON["ok"], font=F["small"],
+                                  fill=C["bg"])
             elif active:
                 self.create_oval(cx-r, cy-r, cx+r, cy+r,
                                   fill=C["accent"], outline="")
@@ -858,9 +1086,9 @@ class WizardSteps(tk.Canvas):
             # Label below — truncate if too wide for its slot
             max_chars = max(6, sw // 8)
             label_text = name if len(name) <= max_chars else name[:max_chars-1] + "…"
-            self.create_text(cx, cy+r+8, text=label_text, font=F["small"],
+            self.create_text(cx, cy+r+10, text=label_text, font=F["small"], anchor="n",
                               fill=C["success"] if done else
-                              (C["accent"] if active else C["text3"]))
+                              (C["accent_text"] if active else C["text3"]))
 
 
 class ClipboardTimer:
@@ -917,10 +1145,23 @@ class ClipboardTimer:
         except Exception: pass
         try:
             if self._label.winfo_exists():
-                self._label.config(text="Clipboard cleared ✓", fg=C["success"])
+                self._label.config(text=f"Clipboard cleared {ICON['ok']}", fg=C["success"])
                 self._root.after(2000, lambda: (
                     self._label.config(text="") if self._label.winfo_exists() else None))
         except Exception: pass
+
+
+def _data_dir() -> str:
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_DATA_HOME",
+                              os.path.expanduser("~/.local/share"))
+    d = os.path.join(base, "QuantaCrypt")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 class RecentFiles:
@@ -939,6 +1180,7 @@ class RecentFiles:
     """
     MAX_ITEMS = 10
     _PATH: str = ""   # resolved lazily so tests can monkeypatch before first use
+    _FILENAME = "recent.json"
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -946,16 +1188,7 @@ class RecentFiles:
     def _resolve_path(cls):
         if cls._PATH:
             return cls._PATH
-        if sys.platform == "darwin":
-            base = os.path.expanduser("~/Library/Application Support")
-        elif sys.platform == "win32":
-            base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        else:
-            base = os.environ.get("XDG_DATA_HOME",
-                                  os.path.expanduser("~/.local/share"))
-        d = os.path.join(base, "QuantaCrypt")
-        os.makedirs(d, exist_ok=True)
-        return os.path.join(d, "recent.json")
+        return os.path.join(_data_dir(), cls._FILENAME)
 
     @classmethod
     def _read_raw(cls):
@@ -1013,3 +1246,45 @@ class RecentFiles:
     @classmethod
     def clear(cls):
         cls._write_raw([])
+
+
+class RecentVolumes(RecentFiles):
+    """Recently mounted .qcv files — separate list from .qcx recents."""
+    _PATH: str = ""
+    _FILENAME = "recent-volumes.json"
+
+
+class AppPrefs:
+    """Tiny persisted key/value store (dismissed update tag, etc.)."""
+    _PATH: str = ""
+
+    @classmethod
+    def _resolve_path(cls):
+        return cls._PATH or os.path.join(_data_dir(), "prefs.json")
+
+    @classmethod
+    def _read(cls) -> dict:
+        import json
+        try:
+            with open(cls._resolve_path()) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
+    def get(cls, key, default=None):
+        return cls._read().get(key, default)
+
+    @classmethod
+    def set(cls, key, value):
+        import json
+        data = cls._read()
+        data[key] = value
+        try:
+            with open(cls._resolve_path(), "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass

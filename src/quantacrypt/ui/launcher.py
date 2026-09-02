@@ -6,9 +6,9 @@ import tkinter as tk
 
 from quantacrypt import __version__
 from quantacrypt.ui.shared import (
-    C, F, UI,
-    fmt_size, rule, friendly_error,
-    FlatButton, RecentFiles,
+    C, F, SP, ICON,
+    accel, bind_shortcut, card, kv_row, fmt_size, friendly_error,
+    FlatButton, RecentFiles, AppPrefs,
 )
 
 try:
@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any
 
+# Window width.  Everything below wraps to this so the launcher stays one
+# column and fits a 13" display with the Recent list open.
+_W = 520
+_RECENT_VISIBLE = 3
+
 
 class LauncherApp(tk.Toplevel):
     # DnD methods are injected at runtime by tkinterdnd2; declare for type-checkers
@@ -35,37 +40,26 @@ class LauncherApp(tk.Toplevel):
         super().__init__(master)
         self.title("QuantaCrypt")
         self.configure(bg=C["bg"])
-        self.resizable(False, False)
+        # Vertical resize only: the Recent list can grow past a small screen
+        # and pack() has no scroll; letting the user pull the window taller
+        # is the one-line mitigation.
+        self.resizable(False, True)
         self._build()
         self._center()
         # Check for updates in the background (non-blocking)
         from quantacrypt.ui.updater import check_for_update
         check_for_update(self, __version__)
-        # Keyboard shortcuts.  Bind both the Ctrl+ variant (Linux/Win
-        # convention) and the Cmd+ variant (macOS convention); Tk on
-        # macOS maps Cmd to Meta/Command, so binding both gives users
-        # either a platform-native or familiar shortcut.
-        _shortcuts = {
-            "e": self._open_encryptor,
-            "E": self._open_encryptor,
-            "d": self._open_decryptor,
-            "D": self._open_decryptor,
-            "i": self._inspect_file,
-            "I": self._inspect_file,
-            "v": self._open_volumes,
-            "V": self._open_volumes,
-        }
-        for key, handler in _shortcuts.items():
-            self.bind(f"<Control-{key}>", lambda e, h=handler: h())
-            if sys.platform == "darwin":
-                self.bind(f"<Command-{key}>", lambda e, h=handler: h())
-        # Escape quits the app; Cmd+W closes the window (macOS convention)
-        self.bind("<Escape>", lambda e: self._quit_app())
+        # Keyboard shortcuts: ⌘ on macOS (Ctrl also accepted), Ctrl elsewhere.
+        # M for volumes, not V — ⌘V is Paste on macOS.
+        bind_shortcut(self, "e", self._open_encryptor)
+        bind_shortcut(self, "d", self._open_decryptor)
+        bind_shortcut(self, "m", self._open_volumes)
+        bind_shortcut(self, "i", self._inspect_file)
+        # No Escape-to-quit: Escape must never be a data-loss key.  ⌘W / ⌘Q
+        # on the main window mean quit (with the mounted-volume guard).
         if sys.platform == "darwin":
-            self.bind("<Command-w>", lambda e: self._quit_app())
-            self.bind("<Command-W>", lambda e: self._quit_app())
-            self.bind("<Command-q>", lambda e: self._quit_app())
-            self.bind("<Command-Q>", lambda e: self._quit_app())
+            bind_shortcut(self, "w", self._quit_app, also_control=False)
+            bind_shortcut(self, "q", self._quit_app, also_control=False)
         self.protocol("WM_DELETE_WINDOW", self._quit_app)
         # Drag-and-drop: drop a .qcx → open decryptor
         if _DND_FILES:
@@ -135,6 +129,8 @@ class LauncherApp(tk.Toplevel):
             and os.path.splitext(p)[1].lower() in (".qcx", ".qcv")
         ]
         if not accepted:
+            self._set_hint("Drop a .qcx or .qcv file — other files can't be opened here.",
+                           error=True)
             return
 
         def _dispatch(path: str):
@@ -159,103 +155,124 @@ class LauncherApp(tk.Toplevel):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w, h   = self.winfo_width(), self.winfo_height()
-        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+        self.geometry(f"+{(sw-w)//2}+{max(0, (sh-h)//2)}")
+
+    # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self):
-        P = 32
+        P = SP["xxl"]
 
-        # ── Logo / title ──────────────────────────────────────────────────────
+        # ── Title ─────────────────────────────────────────────────────────────
         top = tk.Frame(self, bg=C["bg"])
-        top.pack(fill="x", padx=P, pady=(36, 0))
-
-        tk.Label(top, text="QuantaCrypt", font=(UI, 22, "bold"),
-                 bg=C["bg"], fg=C["text"]).pack()
+        top.pack(fill="x", padx=P, pady=(SP["xl"], 0))
+        tk.Label(top, text="QuantaCrypt", font=F["display"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
         tk.Label(top, text="Post-quantum file encryption",
-                 font=F["body"], bg=C["bg"], fg=C["text3"]).pack(pady=(4, 0))
+                 font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
 
-        rule(self, pady=28, padx=P)
+        # Slot the update banner packs into (see updater.py) — a named frame
+        # so the banner never has to guess at child indices.
+        self._banner_slot = tk.Frame(self, bg=C["bg"])
+        self._banner_slot.pack(fill="x", padx=P)
 
-        # ── Two mode cards ────────────────────────────────────────────────────
-        cards = tk.Frame(self, bg=C["bg"])
-        cards.pack(padx=P, pady=(0, 8))
+        # ── Three entry points, one per row ───────────────────────────────────
+        # Rows instead of tiles: no orphaned third card, denser, and the
+        # list scales if a fourth entry point ever appears.  The row whose
+        # mode was used last carries the accent; the others stay quiet.
+        last = AppPrefs.get("last_mode", "encrypt")
+        rows = tk.Frame(self, bg=C["bg"])
+        rows.pack(fill="x", padx=P, pady=(SP["l"], 0))
+        self._enc_card = self._make_row(
+            rows, "Encrypt",
+            "Protect a file with a password, or split the key between people.",
+            f"Encrypt a file {ICON['arrow']}", self._open_encryptor,
+            accent=(last == "encrypt"))
+        self._dec_card = self._make_row(
+            rows, "Decrypt",
+            "Open a .qcx file with its password or shares.",
+            f"Decrypt a file {ICON['arrow']}", self._open_decryptor,
+            accent=(last == "decrypt"))
+        self._vol_card = self._make_row(
+            rows, "Volumes",
+            "Create or mount an encrypted drive (.qcv) that works like a folder.",
+            f"Manage volumes {ICON['arrow']}", self._open_volumes,
+            accent=(last == "volumes"))
 
-        self._enc_card = self._make_card(
-            cards,
-            icon="🔒",
-            title="Encrypt",
-            body="Protect a file with a password\nor split it across multiple people.",
-            btn_text="Encrypt a file →",
-            command=self._open_encryptor,
-            accent=True,
-        )
-        self._enc_card.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        # ── Secondary: inspect + hint line ────────────────────────────────────
+        tools = tk.Frame(self, bg=C["bg"])
+        tools.pack(fill="x", padx=P, pady=(SP["m"], 0))
+        FlatButton(tools, "Inspect a .qcx file without the password",
+                   self._inspect_file, primary=False, small=True).pack(side="left")
 
-        self._dec_card = self._make_card(
-            cards,
-            icon="🔓",
-            title="Decrypt",
-            body="Open an encrypted .qcx file\nusing your password or shares.",
-            btn_text="Decrypt a file →",
-            command=self._open_decryptor,
-            accent=False,
-        )
-        self._dec_card.grid(row=0, column=1, sticky="nsew")
-
-        cards.columnconfigure(0, weight=1, minsize=220)
-        cards.columnconfigure(1, weight=1, minsize=220)
-
-        # ── Volumes card ───────────────────────────────────────────────────────
-        vol_row = tk.Frame(self, bg=C["bg"])
-        vol_row.pack(padx=P, pady=(10, 0))
-        self._vol_card = self._make_card(
-            vol_row,
-            icon="💾",
-            title="Volumes",
-            body="Create or mount encrypted\nvirtual drives (.qcv files).",
-            btn_text="Manage volumes →",
-            command=self._open_volumes,
-            accent=False,
-        )
-        self._vol_card.pack(fill="x")
-
-        # ── Drop hint ─────────────────────────────────────────────────────────
-        rule(self, pady=20, padx=P)
-
-        drop_hint = (
-            "You can also drag a .qcx or .qcv file onto this window."
-            if _DND_FILES else
-            "You can also open a .qcx file via the Decrypt button above, "
-            "or manage .qcv volumes via the Volumes card."
-        )
-        tk.Label(self, text=drop_hint,
-                 font=F["caption"], bg=C["bg"], fg=C["text3"],
-                 wraplength=420).pack(pady=(0, 12))
-
-        # Inspect button — previously only discoverable via Ctrl+I
-        inspect_row = tk.Frame(self, bg=C["bg"])
-        inspect_row.pack(pady=(0, 8))
-        FlatButton(inspect_row, "🔍 Inspect a .qcx file", self._inspect_file,
-                   primary=False, small=True).pack()
-        tk.Label(inspect_row, text="View encryption details without the password",
-                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(2, 0))
-        tk.Label(self,
-                 text="Your files are protected with quantum-resistant encryption.\n"
-                      "Encrypted files use the .qcx format and can only be opened with your password.",
-                 font=F["small"], bg=C["bg"], fg=C["text3"],
-                 wraplength=420, justify="center").pack(pady=(0, 8))
-
-        tk.Label(self, text=f"v{__version__}",
-                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(pady=(0, 4))
-
-        # Discoverable keyboard shortcut hint
-        tk.Label(self, text="Keyboard: Ctrl+E  Encrypt  ·  Ctrl+D  Decrypt  ·  Ctrl+V  Volumes  ·  Ctrl+I  Inspect",
-                 font=F["small"], bg=C["bg"], fg=C["text3"],
-                 wraplength=420).pack(pady=(0, 6))
+        # The drop hint is only shown when a drop target was actually
+        # registered (tkinterdnd2 present) — otherwise it would be a lie.
+        self._hint = tk.Label(self, text="", font=F["small"],
+                              bg=C["bg"], fg=C["text3"], wraplength=_W - 2 * P,
+                              justify="left", anchor="w")
+        self._hint.pack(fill="x", padx=P, pady=(SP["xs"], 0))
+        if _DND_FILES:
+            self._set_hint("You can also drop a .qcx or .qcv file onto this window.")
 
         # ── Recent files ───────────────────────────────────────────────────────
         self._recent_frame = tk.Frame(self, bg=C["bg"])
-        self._recent_frame.pack(fill="x", padx=P, pady=(0, 18))
+        self._recent_frame.pack(fill="x", padx=P, pady=(SP["m"], 0))
         self._build_recent()
+
+        # ── Footer: version + shortcuts on one line ───────────────────────────
+        sc = "  ·  ".join([
+            f"{accel('E')} Encrypt", f"{accel('D')} Decrypt",
+            f"{accel('M')} Volumes", f"{accel('I')} Inspect",
+        ])
+        tk.Label(self, text=f"v{__version__}   {sc}",
+                 font=F["small"], bg=C["bg"], fg=C["text3"],
+                 wraplength=_W - 2 * P, justify="left", anchor="w").pack(
+            fill="x", padx=P, pady=(SP["l"], SP["l"]))
+
+    def _set_hint(self, text, error=False):
+        self._hint.config(text=text, fg=C["error"] if error else C["text3"])
+        if error:
+            self.after(6000, lambda: self._hint.config(
+                text="You can also drop a .qcx or .qcv file onto this window."
+                     if _DND_FILES else "", fg=C["text3"]))
+
+    def _make_row(self, parent, title, body, btn_text, command, accent):
+        """One full-width entry point: title + one-line description on the
+        left, its action button on the right.  Whole row is focusable and
+        activates with Return/Space; hover/focus are shown on the border so
+        the button inside never merges with a recoloured background."""
+        inner = card(parent, padx=SP["l"], pady=SP["m"])
+        row = inner.outer
+        row.pack(fill="x", pady=(0, SP["s"]))
+
+        text = tk.Frame(inner, bg=C["surface"])
+        text.pack(side="left", fill="x", expand=True)
+        tk.Label(text, text=title, font=F["heading"],
+                 bg=C["surface"], fg=C["text"], anchor="w").pack(anchor="w")
+        tk.Label(text, text=body, font=F["caption"], bg=C["surface"],
+                 fg=C["text3"], justify="left", anchor="w",
+                 wraplength=_W - 2 * SP["xxl"] - 2 * SP["l"] - 170).pack(anchor="w", pady=(2, 0))
+
+        btn = FlatButton(inner, btn_text, command, primary=accent, small=True)
+        btn.pack(side="right", padx=(SP["m"], 0))
+
+        def _focus_ring(on):
+            row.config(highlightbackground=C["accent_text"] if on else C["border"],
+                       highlightthickness=2 if on else 1)
+
+        row.config(takefocus=True, cursor="hand2")
+        for w in (row, inner, text) + tuple(text.winfo_children()):
+            w.bind("<Button-1>", lambda e: command())
+        row.bind("<Return>", lambda e: command())
+        row.bind("<space>",  lambda e: command())
+        row.bind("<FocusIn>",  lambda e: _focus_ring(True))
+        row.bind("<FocusOut>", lambda e: _focus_ring(False))
+        row.bind("<Enter>", lambda e: row.config(highlightbackground=C["surface3"])
+                 if row.focus_get() is not row else None)
+        row.bind("<Leave>", lambda e: row.config(highlightbackground=C["border"])
+                 if row.focus_get() is not row else None)
+        return row
+
+    # ── Recent files ─────────────────────────────────────────────────────────
 
     def _build_recent(self):
         """Render or refresh the recent .qcx files list."""
@@ -265,22 +282,21 @@ class LauncherApp(tk.Toplevel):
         if not entries:
             return
         hdr = tk.Frame(self._recent_frame, bg=C["bg"])
-        hdr.pack(fill="x", pady=(0, 6))
-        tk.Label(hdr, text="RECENTLY USED", font=F["small"],
+        hdr.pack(fill="x", pady=(0, SP["xs"]))
+        tk.Label(hdr, text="RECENTLY DECRYPTED", font=F["small"],
                  bg=C["bg"], fg=C["text3"]).pack(side="left")
         def _do_clear():
             RecentFiles.clear()
             self._build_recent()
         FlatButton(hdr, "Clear", _do_clear, primary=False, small=True).pack(side="right")
-        MAX_VISIBLE = 5
-        for path, entry in entries[:MAX_VISIBLE]:
+        for path, entry in entries[:_RECENT_VISIBLE]:
             self._build_recent_row(path, entry)
-        # Show overflow count so the launcher doesn't overflow the screen
-        if len(entries) > MAX_VISIBLE:
-            extra = len(entries) - MAX_VISIBLE
+        # Cap the visible rows so the launcher never outgrows the screen
+        if len(entries) > _RECENT_VISIBLE:
+            extra = len(entries) - _RECENT_VISIBLE
             tk.Label(self._recent_frame,
-                     text=f"… and {extra} more",
-                     font=F["small"], bg=C["bg"], fg=C["text3"]).pack(anchor="w", pady=(2, 0))
+                     text=f"… and {extra} more (use Decrypt to browse)",
+                     font=F["small"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
 
     def _build_recent_row(self, path, entry):
         """Render a single recent-file row inside ``_recent_frame``."""
@@ -296,12 +312,11 @@ class LauncherApp(tk.Toplevel):
         except Exception:
             date_str = ""
 
-        row = tk.Frame(self._recent_frame, bg=C["surface"],
-                       highlightbackground=C["border"], highlightthickness=1,
-                       cursor="hand2")
-        row.pack(fill="x", pady=(0, 4))
-        top_inner = tk.Frame(row, bg=C["surface"])
-        top_inner.pack(fill="x", padx=12, pady=(8, 2))
+        inner = card(self._recent_frame, padx=SP["m"], pady=SP["s"])
+        row = inner.outer
+        row.pack(fill="x", pady=(0, SP["xs"]))
+        top_inner = tk.Frame(inner, bg=C["surface"])
+        top_inner.pack(fill="x")
         name_lbl = tk.Label(top_inner, text=os.path.basename(path),
                             font=F["caption"], bg=C["surface"], fg=C["text"])
         name_lbl.pack(side="left")
@@ -309,78 +324,27 @@ class LauncherApp(tk.Toplevel):
         meta_lbl = tk.Label(top_inner, text=combined_meta,
                             font=F["small"], bg=C["surface"], fg=C["text3"])
         meta_lbl.pack(side="right")
-        dir_lbl = tk.Label(row, text=os.path.dirname(path),
+        dir_lbl = tk.Label(inner, text=os.path.dirname(path),
                            font=F["small"], bg=C["surface"], fg=C["text3"],
-                           anchor="w", cursor="hand2")
-        dir_lbl.pack(fill="x", padx=12, pady=(0, 6))
+                           anchor="w")
+        dir_lbl.pack(fill="x")
 
-        widgets = (row, top_inner, name_lbl, meta_lbl, dir_lbl)
+        def _ring(on):
+            row.config(highlightbackground=C["accent_text"] if on else C["border"],
+                       highlightthickness=2 if on else 1)
 
-        def _hl(on, _widgets=widgets):
-            col = C["surface2"] if on else C["surface"]
-            for w in _widgets:
-                try:
-                    w.config(bg=col)
-                except Exception:
-                    pass
-
-        for w in widgets:
+        # Rows are real targets: focusable, Return/Space, visible ring.
+        row.config(takefocus=True, cursor="hand2")
+        for w in (row, inner, top_inner, name_lbl, meta_lbl, dir_lbl):
             w.bind("<Button-1>", lambda e, p=path: self._open_qcx(p))
-            w.bind("<Enter>", lambda e: _hl(True))
-            w.bind("<Leave>", lambda e: _hl(False))
-
-
-    def _make_card(self, parent, icon, title, body, btn_text, command, accent):
-        card = tk.Frame(parent, bg=C["surface"],
-                        highlightbackground=C["border"],  # Equal visual weight
-                        highlightthickness=1)
-
-        inner = tk.Frame(card, bg=C["surface"])
-        inner.pack(fill="both", expand=True, padx=20, pady=20)
-
-        lbl_icon  = tk.Label(inner, text=icon, font=(UI, 28),
-                             bg=C["surface"], fg=C["text"])
-        lbl_icon.pack(anchor="w")
-
-        lbl_title = tk.Label(inner, text=title, font=F["heading"],
-                             bg=C["surface"], fg=C["text"])
-        lbl_title.pack(anchor="w", pady=(8, 0))
-
-        lbl_body  = tk.Label(inner, text=body, font=F["caption"],
-                             bg=C["surface"], fg=C["text3"],
-                             justify="left", wraplength=175)
-        lbl_body.pack(anchor="w", pady=(6, 16))
-
-        btn = FlatButton(inner, btn_text, command, primary=accent)
-        btn.pack(anchor="w", fill="x")
-
-        # Collect every bg-carrying widget so the hover effect is visible
-        # across the full card area, not just the outer frame.
-        _bg_widgets = [card, inner, lbl_icon, lbl_title, lbl_body]
-
-        def _enter(_e):
-            if card.cget("highlightbackground") == C["accent"]: return  # focused — don't override
-            for w in _bg_widgets:
-                try: w.config(bg=C["surface2"])
-                except Exception: pass
-
-        def _leave(_e):
-            for w in _bg_widgets:
-                try: w.config(bg=C["surface"])
-                except Exception: pass
-
-        # Keyboard: make the whole card focusable with Tab, activate with Enter/Space
-        card.config(takefocus=True, cursor="hand2")
-        card.bind("<Return>", lambda e: command())
-        card.bind("<space>",  lambda e: command())
-        card.bind("<FocusIn>",  lambda e: card.config(highlightbackground=C["accent"], highlightthickness=2))
-        card.bind("<FocusOut>", lambda e: (card.config(highlightbackground=C["border"], highlightthickness=1), _leave(e)))
-        # Bind hover to card only — tkinter fires Enter/Leave per-widget, so binding
-        # to the card frame alone avoids rapid flicker as the pointer crosses children.
-        card.bind("<Enter>", _enter)
-        card.bind("<Leave>", _leave)
-
-        return card
+        row.bind("<Return>", lambda e, p=path: self._open_qcx(p))
+        row.bind("<space>",  lambda e, p=path: self._open_qcx(p))
+        row.bind("<FocusIn>",  lambda e: _ring(True))
+        row.bind("<FocusOut>", lambda e: _ring(False))
+        row.bind("<Enter>", lambda e: row.config(highlightbackground=C["surface3"])
+                 if row.focus_get() is not row else None)
+        row.bind("<Leave>", lambda e: row.config(highlightbackground=C["border"])
+                 if row.focus_get() is not row else None)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -406,7 +370,11 @@ class LauncherApp(tk.Toplevel):
                 parent=self,
             )
 
+    def _remember_mode(self, mode: str):
+        AppPrefs.set("last_mode", mode)
+
     def _open_volumes(self, volume_path: str | None = None):
+        self._remember_mode("volumes")
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
         def _build():
@@ -418,6 +386,7 @@ class LauncherApp(tk.Toplevel):
         self._safe_open_wizard(_build)
 
     def _open_encryptor(self):
+        self._remember_mode("encrypt")
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
         def _build():
@@ -445,12 +414,22 @@ class LauncherApp(tk.Toplevel):
                 f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
+        self._remember_mode("decrypt")
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
         def _build():
             from quantacrypt.ui.decryptor import DecryptorApp
-            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self._on_wizard_close, center_at=(cx, cy))
         self._safe_open_wizard(_build)
+
+    def _on_wizard_close(self):
+        """Re-show the launcher and refresh the Recent list (a decrypt may
+        have added an entry)."""
+        self.deiconify()
+        try:
+            self._build_recent()
+        except Exception:
+            pass
 
     def _open_qcx(self, path):
         """Open a specific .qcx file directly in the decryptor."""
@@ -464,12 +443,12 @@ class LauncherApp(tk.Toplevel):
                 f"{os.path.basename(path)}\n\n{friendly_error(e)}",
                 parent=self)
             return
+        self._remember_mode("decrypt")
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
         def _build():
-            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self.deiconify, center_at=(cx, cy))
+            DecryptorApp(self.master, payload=pkg, qcx_path=path, on_close=self._on_wizard_close, center_at=(cx, cy))
         self._safe_open_wizard(_build)
-
 
     def _inspect_file(self):
         """Open a .qcx file and show its metadata without entering credentials."""
@@ -495,46 +474,48 @@ class LauncherApp(tk.Toplevel):
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
-        P = 24
-        tk.Label(win, text="File Information", font=F["heading"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", padx=P, pady=(20,12))
-        card = tk.Frame(win, bg=C["surface"],
-                        highlightbackground=C["border"], highlightthickness=1)
-        card.pack(fill="x", padx=P, pady=(0,8))
+        P = SP["xl"]
+        tk.Label(win, text="File information", font=F["heading"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", padx=P, pady=(SP["l"], SP["m"]))
+        inner = card(win, padx=SP["m"], pady=SP["xs"])
+        inner.outer.pack(fill="x", padx=P, pady=(0, SP["s"]))
+        if meta.get("mode") == "single":
+            mode_str = "Password"
+        else:
+            mode_str = (f"Split key — any {meta.get('threshold')} of "
+                        f"{meta.get('total')} shares open it")
         rows = [
             ("File",       os.path.basename(path)),
             ("Size",       fmt_size(os.path.getsize(path))),
             ("Format",     f"v{meta.get('version', '?')}"),
-            ("Mode",       "Password-protected" if meta.get("mode") == "single"
-                           else f"Split key — needs {meta.get('threshold')} of {meta.get('total')} people"),
-            ("Encryption", "Quantum-resistant (AES-256-GCM + ML-KEM)"),
+            ("Unlocks with", mode_str),
+            ("Encryption", "Strong, and safe against future quantum computers "
+                           "(AES-256-GCM + ML-KEM)"),
         ]
         if meta.get("mode") == "single" and "argon_salt" in meta:
-            rows.append(("Password", "Hardened with slow hash (Argon2id)"))
+            rows.append(("Password", "Slow-hashed so guessing is expensive (Argon2id)"))
         if meta.get("payload_offset"):
-            rows.append(("Embedded", "Decryptor binary included"))
+            rows.append(("Portable", "Includes its own decryptor"))
         for lbl, val in rows:
-            row = tk.Frame(card, bg=C["surface"]); row.pack(fill="x", padx=14, pady=4)
-            tk.Label(row, text=lbl, font=F["caption"], bg=C["surface"], fg=C["text3"],
-                     width=10, anchor="w").pack(side="left")
-            tk.Label(row, text=val, font=F["caption"], bg=C["surface"], fg=C["text2"],
-                     anchor="w", wraplength=320, justify="left").pack(side="left", fill="x")
-        tk.Frame(card, bg=C["border"], height=1).pack(fill="x", pady=(6,0))
+            kv_row(inner, lbl, val, label_width=12, wraplength=320)
         # Path
         tk.Label(win, text=path, font=F["small"], bg=C["bg"], fg=C["text3"],
-                 wraplength=380, justify="left").pack(anchor="w", padx=P, pady=(0,4))
+                 wraplength=380, justify="left").pack(anchor="w", padx=P, pady=(0, SP["xs"]))
         note = tk.Label(win,
-                        text="Note: filename, original size, and encryption date are hidden\n"
-                             "inside the encrypted payload and can only be seen after decryption.",
+                        text="The original filename, size and date are inside the "
+                             "encrypted data and appear only after decryption.",
                         font=F["small"], bg=C["bg"], fg=C["text3"],
                         wraplength=380, justify="left")
-        note.pack(anchor="w", padx=P, pady=(0,12))
-        btn_row = tk.Frame(win, bg=C["bg"]); btn_row.pack(fill="x", padx=P, pady=(0,20))
-        FlatButton(btn_row, "Decrypt this file →",
+        note.pack(anchor="w", padx=P, pady=(0, SP["m"]))
+        btn_row = tk.Frame(win, bg=C["bg"]); btn_row.pack(fill="x", padx=P, pady=(0, SP["l"]))
+        FlatButton(btn_row, f"Decrypt this file {ICON['arrow']}",
                    lambda: (win.destroy(), self._open_qcx(path)),
                    primary=True, small=True).pack(side="left")
-        FlatButton(btn_row, "Close", win.destroy,
-                   primary=False, small=True).pack(side="left", padx=(8,0))
+        close_btn = FlatButton(btn_row, "Close", win.destroy,
+                               primary=False, small=True)
+        close_btn.pack(side="left", padx=(SP["s"], 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        close_btn.focus_set()
         # Centre over launcher
         win.update_idletasks()
         lx, ly = self.winfo_x(), self.winfo_y()

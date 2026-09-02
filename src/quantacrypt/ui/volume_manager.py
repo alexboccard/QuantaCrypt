@@ -3,40 +3,89 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Callable
+    from typing import Callable
 
 from quantacrypt.core import volume as vol
 from quantacrypt.ui.shared import (
-    C, F, UI,
-    styled_entry, bind_context_menu, fmt_size, rule, friendly_error,
+    C, F, SP, ICON, REVEAL_LABEL,
+    styled_entry, bind_context_menu, bind_shortcut, fmt_size, rule,
+    section_label, card, friendly_error, confirm, alert, reveal_path,
     FlatButton, SegmentedControl, StagedProgressBar,
-    PasswordStrengthBar, WizardSteps, ClipboardTimer,
+    PasswordStrengthBar, ClipboardTimer, RecentVolumes,
     notify,
 )
 
+_RELEASES_URL = "https://github.com/alexboccard/QuantaCrypt/releases"
+_FUSE_T_URL = "https://www.fuse-t.org/"
+_MACFUSE_URL = "https://macfuse.github.io/"
+
 
 # ── Volume Creation Stages ──────────────────────────────────────────────────
+# One stage list per protection mode: Shamir creation never derives a
+# password key, so it must not show "Securing password".  Keyword lists are
+# ordered most-specific first so "Encrypting Kyber private key" is not
+# swallowed by the plain "kyber" match.
 
-STAGES = [
-    ("Securing password", 0.60, "Argon2id"),
-    ("Generating keys",   0.20, "Kyber"),
-    ("Writing volume",    0.20, "Writing"),
+STAGES_PASSWORD = [
+    ("Securing password", 0.60),
+    ("Generating keys",   0.20),
+    ("Writing volume",    0.20),
+]
+_KW_PASSWORD = [
+    ("argon2", 0),
+    ("private key", 2), ("writing", 2), ("created", 2),
+    ("kyber", 1), ("encapsulat", 1),
+]
+
+STAGES_SHAMIR = [
+    ("Generating keys", 0.50),
+    ("Splitting key",   0.20),
+    ("Writing volume",  0.30),
+]
+_KW_SHAMIR = [
+    ("private key", 1),
+    ("writing", 2), ("created", 2),
+    ("master key", 0), ("kyber", 0), ("encapsulat", 0),
+]
+
+STAGES = STAGES_PASSWORD  # backward-compatible alias
+
+_MOUNT_STAGES = [
+    ("Reading volume", 0.10),
+    ("Unlocking",      0.70),
+    ("Mounting",       0.20),
 ]
 
 
-def _find_stage(msg: str):
-    for i, (name, _, kw) in enumerate(STAGES):
-        if kw.lower() in msg.lower():
-            return i, msg
+def _find_stage(msg: str, stages: list | None = None):
+    """Map a core progress message to ``(stage_index, friendly_label)``.
+
+    The friendly ``STAGES`` name is what the bar shows; an ``NN%`` suffix
+    from the core (if any) is kept so the bar can interpolate within the stage.
+    """
+    stages = stages or STAGES_PASSWORD
+    keywords = _KW_SHAMIR if stages is STAGES_SHAMIR else _KW_PASSWORD
+    low = msg.lower()
+    for kw, idx in keywords:
+        if kw in low:
+            name = stages[idx][0]
+            m = re.search(r"(\d+)%", msg)
+            if m:
+                name = f"{name} {m.group(1)}%"
+            return idx, name
     return None, None
 
 
@@ -45,37 +94,101 @@ def _find_stage(msg: str):
 class VolumeManagerApp(tk.Toplevel):
     """Combined volume creation wizard and mount/unmount panel."""
 
+    _P = SP["xl"]            # outer padding, one value for every panel
+    _STATUS_TTL_MS = 8000    # how long a top-level status line stays visible
+    _REFRESH_MS = 3000       # mounted-list poll interval while the window lives
+    _WRAP = 440
+
     def __init__(self, master: tk.Misc, on_close: Callable | None = None,
                  center_at: tuple[int, int] | None = None,
                  volume_path: str | None = None):
         super().__init__(master)
         self.title("QuantaCrypt — Encrypted Volumes")
         self.configure(bg=C["bg"])
-        self.resizable(False, False)
+        self.resizable(False, True)
 
         self._on_close = on_close
         self._center_at = center_at
         self._mode_var = tk.StringVar(value="mount" if volume_path else "create")
 
+        self._busy = False               # a create/mount worker is running
+        self._busy_what = ""
+        self._cancel_event = threading.Event()
+        self._auto_mp = ""               # last auto-filled mount point (Q25)
+        self._unmounting: set[str] = set()
+        self._row_notes: dict[str, tuple[str, str]] = {}   # mp → (text, fg)
+        self._rows: dict[str, dict] = {}
+        self._last_mounted_key: tuple | None = None
+        self._refresh_job = None
+        self._status_job = None
+        self._tickers: dict[str, dict] = {}
+        self._empty_note = ""
+
         self._build()
         self._center()
 
-        # If a .qcv path was provided, pre-fill the mount panel
-        if volume_path and hasattr(self, "_mount_path_var"):
+        # Prefill the mount panel: an explicit path wins, else the most
+        # recently mounted volume (M25).
+        if volume_path:
             self._mount_path_var.set(volume_path)
+            self._on_volume_selected(show_errors=True)
+        else:
+            recent = RecentVolumes.load()
+            if recent:
+                self._mount_path_var.set(recent[0][0])
 
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Escape>", lambda e: self._close())
-        # Keyboard shortcuts: Ctrl+N → Create, Ctrl+M → Mount
-        self.bind("<Control-n>", lambda e: self._mode_var.set("create"))
-        self.bind("<Control-N>", lambda e: self._mode_var.set("create"))
-        self.bind("<Control-m>", lambda e: self._mode_var.set("mount"))
-        self.bind("<Control-M>", lambda e: self._mode_var.set("mount"))
+        bind_shortcut(self, "n", lambda: self._mode_var.set("create"))
+        bind_shortcut(self, "m", lambda: self._mode_var.set("mount"))
+        self.after(50, self._focus_first)
+        self._schedule_refresh()
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def _close(self):
+        if self._busy:
+            if self._busy_what == "create":
+                ok = confirm(
+                    self, "Creation is still running",
+                    "Closing now cancels it. The unfinished volume file is "
+                    "deleted as soon as the current step finishes.",
+                    yes="Cancel and close", no="Keep working", danger=True)
+            else:
+                ok = confirm(
+                    self, "Mounting is still running",
+                    "A mount can't be interrupted. If it succeeds, the volume "
+                    "will be listed under Mounted Volumes next time you open "
+                    "this window.",
+                    yes="Close anyway", no="Keep working", danger=True)
+            if not ok:
+                return
+            self._cancel_event.set()
+        self._cancel_jobs()
         self.destroy()
         if self._on_close:
             self._on_close()
+
+    def _cancel_jobs(self):
+        for job in (self._refresh_job, self._status_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._refresh_job = self._status_job = None
+        for key in list(self._tickers):
+            self._stop_ticker(key)
+
+    def _after(self, fn, delay: int = 0):
+        """``after()`` that tolerates a window the worker has outlived."""
+        def _safe():
+            if self.winfo_exists():
+                fn()
+        try:
+            self.after(delay, _safe)
+        except (tk.TclError, RuntimeError):
+            pass  # window destroyed / interpreter shutting down
 
     def _center(self):
         self.update_idletasks()
@@ -88,16 +201,23 @@ class VolumeManagerApp(tk.Toplevel):
             w, h = self.winfo_width(), self.winfo_height()
             self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
 
+    # ── Layout ───────────────────────────────────────────────────────────────
+
     def _build(self):
-        P = 28
+        P = self._P
 
         # ── Header ──
-        tk.Label(self, text="Encrypted Volumes", font=F["display"],
-                 bg=C["bg"], fg=C["text"]).pack(padx=P, pady=(24, 4))
+        hdr = tk.Frame(self, bg=C["bg"])
+        hdr.pack(fill="x", padx=P, pady=(P, 0))
+        tk.Label(hdr, text="Encrypted Volumes", font=F["display"],
+                 bg=C["bg"], fg=C["text"]).pack(side="left")
+        FlatButton(hdr, f"{ICON['back']} Home", self._close,
+                   primary=False, small=True).pack(side="right")
         tk.Label(self, text="Create or mount encrypted virtual drives",
-                 font=F["body"], bg=C["bg"], fg=C["text3"]).pack(padx=P)
+                 font=F["body"], bg=C["bg"], fg=C["text3"]).pack(
+            anchor="w", padx=P, pady=(SP["xs"], 0))
 
-        rule(self, pady=16, padx=P)
+        rule(self, pady=SP["l"], padx=P)
 
         # ── Mode toggle ──
         seg_frame = tk.Frame(self, bg=C["bg"])
@@ -107,104 +227,193 @@ class VolumeManagerApp(tk.Toplevel):
                          self._mode_var).pack(fill="x")
         self._mode_var.trace_add("write", lambda *_: self._on_mode_change())
 
+        # One FUSE check feeds both panels: the create panel's warning strip
+        # (Q29) and the mount panel's setup screen.
+        from quantacrypt.core.fuse_ops import check_fuse_components
+        self._components = check_fuse_components()
+        self._fuse_ok = all(c["ok"] for c in self._components.values())
+
         # ── Content frames ──
         self._create_frame = tk.Frame(self, bg=C["bg"])
         self._mount_frame = tk.Frame(self, bg=C["bg"])
+        self._build_create_panel(self._create_frame)
+        self._build_mount_panel(self._mount_frame)
+        self._show_panel()
 
-        self._build_create_panel(self._create_frame, P)
-        self._build_mount_panel(self._mount_frame, P)
-
-        # Show the panel matching the initial mode
-        if self._mode_var.get() == "mount":
-            self._mount_frame.pack(fill="both", expand=True, padx=P, pady=(12, P))
-        else:
-            self._create_frame.pack(fill="both", expand=True, padx=P, pady=(12, P))
-
-    def _on_mode_change(self):
-        mode = self._mode_var.get()
+    def _show_panel(self):
+        P = self._P
         self._create_frame.pack_forget()
         self._mount_frame.pack_forget()
-        P = 28
-        if mode == "create":
-            self._create_frame.pack(fill="both", expand=True, padx=P, pady=(12, P))
-        else:
-            self._mount_frame.pack(fill="both", expand=True, padx=P, pady=(12, P))
+        frame = self._create_frame if self._mode_var.get() == "create" else self._mount_frame
+        frame.pack(fill="both", expand=True, padx=P, pady=(SP["m"], P))
+
+    def _on_mode_change(self):
+        self._show_panel()
+        self._focus_first()
+
+    def _focus_first(self):
+        """Put the keyboard somewhere useful on open and after a panel switch."""
+        try:
+            if self._mode_var.get() == "create":
+                self._loc_entry.focus_set()
+            elif self._setup_frame is not None and self._setup_frame.winfo_ismapped():
+                self._recheck_btn.focus_set()
+            elif not self._mount_path_var.get().strip():
+                self._mount_path_entry.focus_set()
+            elif self._mount_auth_var.get() == "password":
+                self._mount_pw_entry.focus_set()
+            else:
+                self._mount_shares_text.focus_set()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _toggle_show(entry: tk.Entry, btn: FlatButton):
+        hidden = entry.cget("show") != ""
+        entry.config(show="" if hidden else "•")
+        btn.set_text("Hide" if hidden else "Show")
+
+    def _set_status(self, text: str, fg: str | None = None, *, expire: bool = True):
+        """Top-level mount status.  Expires after ``_STATUS_TTL_MS`` so a
+        stale 'Mounted at …' never outlives the mount."""
+        if self._status_job is not None:
+            try:
+                self.after_cancel(self._status_job)
+            except Exception:
+                pass
+            self._status_job = None
+        self._mount_status.config(text=text, fg=fg or C["text3"])
+        if text and expire:
+            self._status_job = self.after(
+                self._STATUS_TTL_MS, lambda: self._mount_status.config(text=""))
 
     # ── Create Panel ─────────────────────────────────────────────────────────
 
-    def _build_create_panel(self, parent: tk.Frame, P: int):
-        # Auth mode
+    def _build_create_panel(self, parent: tk.Frame):
+        # Protection mode
         self._auth_var = tk.StringVar(value="password")
-        auth_frame = tk.Frame(parent, bg=C["bg"])
-        auth_frame.pack(fill="x", pady=(8, 0))
-        tk.Label(auth_frame, text="Protection mode", font=F["body_b"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
-        SegmentedControl(auth_frame,
-                         [("password", "Password"), ("shamir", "Split Key")],
-                         self._auth_var).pack(fill="x", pady=(6, 0))
+        tk.Label(parent, text="Protection", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["s"], 0))
+        SegmentedControl(parent,
+                         [("password", "Password"), ("shamir", "Split key")],
+                         self._auth_var).pack(fill="x", pady=(SP["xs"], 0))
         self._auth_var.trace_add("write", lambda *_: self._on_auth_change())
 
-        # Location
-        loc_frame = tk.Frame(parent, bg=C["bg"])
-        loc_frame.pack(fill="x", pady=(14, 0))
-        tk.Label(loc_frame, text="Save volume as", font=F["body_b"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
-        row = tk.Frame(loc_frame, bg=C["bg"])
-        row.pack(fill="x", pady=(4, 0))
-        self._loc_var = tk.StringVar()
-        e = styled_entry(row, textvariable=self._loc_var)
-        e.pack(side="left", fill="x", expand=True)
-        FlatButton(row, "Browse…", self._browse_save_location,
-                   primary=False, small=True).pack(side="left", padx=(8, 0))
+        # FUSE warning strip (Q29) — shown only while a component is missing
+        self._fuse_warn = card(parent, padx=SP["m"], pady=SP["s"])
+        wrow = tk.Frame(self._fuse_warn, bg=C["surface"])
+        wrow.pack(fill="x")
+        tk.Label(wrow, text=f"{ICON['warn']}  Mounting needs disk-mounting support — "
+                            "set it up under Mount Existing.",
+                 font=F["caption"], bg=C["surface"], fg=C["warning"],
+                 wraplength=340, justify="left").pack(side="left", fill="x", expand=True)
+        FlatButton(wrow, f"Set up {ICON['arrow']}",
+                   lambda: self._mode_var.set("mount"),
+                   primary=False, small=True).pack(side="right", padx=(SP["s"], 0))
+        if not self._fuse_ok:
+            self._fuse_warn.outer.pack(fill="x", pady=(SP["m"], 0))
 
-        # Password fields (shown for password mode)
-        self._pw_frame = tk.Frame(parent, bg=C["bg"])
-        self._pw_frame.pack(fill="x", pady=(14, 0))
+        # Location
+        tk.Label(parent, text="Save volume as", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["l"], 0))
+        row = tk.Frame(parent, bg=C["bg"])
+        row.pack(fill="x", pady=(SP["xs"], 0))
+        self._loc_var = tk.StringVar()
+        self._loc_entry = styled_entry(row, textvariable=self._loc_var)
+        self._loc_entry.pack(side="left", fill="x", expand=True)
+        self._loc_entry.bind("<Return>", lambda e: self._do_create())
+        FlatButton(row, "Browse…", self._browse_save_location,
+                   primary=False, small=True).pack(side="left", padx=(SP["s"], 0))
+        tk.Label(parent, text="One .qcv file holds everything. The volume grows "
+                              "as you add files — no fixed size to choose.",
+                 font=F["caption"], bg=C["bg"], fg=C["text3"],
+                 wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(SP["xs"], 0))
+
+        # Credentials slot — holds either the password or the split-key fields
+        self._cred_slot = tk.Frame(parent, bg=C["bg"])
+        self._cred_slot.pack(fill="x", pady=(SP["l"], 0))
+
+        # Password fields (password mode)
+        self._pw_frame = tk.Frame(self._cred_slot, bg=C["bg"])
+        self._pw_frame.pack(fill="x")
         tk.Label(self._pw_frame, text="Password", font=F["body_b"],
                  bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        pw_row = tk.Frame(self._pw_frame, bg=C["bg"])
+        pw_row.pack(fill="x", pady=(SP["xs"], 0))
         self._pw_var = tk.StringVar()
-        pw_e = styled_entry(self._pw_frame, textvariable=self._pw_var, show="●")
-        pw_e.pack(fill="x", pady=(4, 0))
-        PasswordStrengthBar(self._pw_frame, self._pw_var).pack(fill="x", pady=(4, 0))
+        self._pw_entry = styled_entry(pw_row, textvariable=self._pw_var, show="•")
+        self._pw_entry.pack(side="left", fill="x", expand=True)
+        self._pw_show = FlatButton(
+            pw_row, "Show", lambda: self._toggle_show(self._pw_entry, self._pw_show),
+            primary=False, small=True)
+        self._pw_show.pack(side="left", padx=(SP["s"], 0))
+        PasswordStrengthBar(self._pw_frame, self._pw_var).pack(fill="x", pady=(SP["xs"], 0))
 
         tk.Label(self._pw_frame, text="Confirm password", font=F["body_b"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(10, 0))
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["s"], 0))
+        pw2_row = tk.Frame(self._pw_frame, bg=C["bg"])
+        pw2_row.pack(fill="x", pady=(SP["xs"], 0))
         self._pw2_var = tk.StringVar()
-        pw2_e = styled_entry(self._pw_frame, textvariable=self._pw2_var, show="●")
-        pw2_e.pack(fill="x", pady=(4, 0))
+        self._pw2_entry = styled_entry(pw2_row, textvariable=self._pw2_var, show="•")
+        self._pw2_entry.pack(side="left", fill="x", expand=True)
+        self._pw2_show = FlatButton(
+            pw2_row, "Show", lambda: self._toggle_show(self._pw2_entry, self._pw2_show),
+            primary=False, small=True)
+        self._pw2_show.pack(side="left", padx=(SP["s"], 0))
+        self._pw_entry.bind("<Return>", lambda e: self._pw2_entry.focus_set())
+        self._pw2_entry.bind("<Return>", lambda e: self._do_create())
 
-        # Shamir fields (hidden by default)
-        self._shamir_frame = tk.Frame(parent, bg=C["bg"])
-        tk.Label(self._shamir_frame, text="Total shares (n)",
-                 font=F["body_b"], bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        # Split-key fields (hidden by default)
+        self._shamir_frame = tk.Frame(self._cred_slot, bg=C["bg"])
+        srow = tk.Frame(self._shamir_frame, bg=C["bg"])
+        srow.pack(fill="x")
+        ncol = tk.Frame(srow, bg=C["bg"])
+        ncol.pack(side="left", padx=(0, SP["xl"]))
+        tk.Label(ncol, text="Total shares (n)", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
         self._n_var = tk.StringVar(value="3")
-        styled_entry(self._shamir_frame, textvariable=self._n_var,
-                     width=6).pack(anchor="w", pady=(4, 8))
-        tk.Label(self._shamir_frame, text="Required to unlock (k)",
-                 font=F["body_b"], bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        self._n_entry = styled_entry(ncol, textvariable=self._n_var, width=6)
+        self._n_entry.pack(anchor="w", pady=(SP["xs"], 0))
+        kcol = tk.Frame(srow, bg=C["bg"])
+        kcol.pack(side="left")
+        tk.Label(kcol, text="Required to unlock (k)", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
         self._k_var = tk.StringVar(value="2")
-        styled_entry(self._shamir_frame, textvariable=self._k_var,
-                     width=6).pack(anchor="w", pady=(4, 0))
+        self._k_entry = styled_entry(kcol, textvariable=self._k_var, width=6)
+        self._k_entry.pack(anchor="w", pady=(SP["xs"], 0))
+        self._n_entry.bind("<Return>", lambda e: self._k_entry.focus_set())
+        self._k_entry.bind("<Return>", lambda e: self._do_create())
+        tk.Label(self._shamir_frame,
+                 text="Split key: any k of the n shares unlock the volume. There is "
+                      "no password — you get the shares right after creation.",
+                 font=F["caption"], bg=C["bg"], fg=C["text3"],
+                 wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(SP["s"], 0))
 
-        # Progress bar (hidden until creation starts)
-        self._progress = StagedProgressBar(
-            parent,
-            [(name, w) for name, w, _ in STAGES],
-        )
+        # Progress row: bar + Cancel (bar is built per run — the stage list
+        # depends on the protection mode)
+        self._prog_row = tk.Frame(parent, bg=C["bg"])
+        self._progress: StagedProgressBar | None = None
+        self._cancel_btn = FlatButton(self._prog_row, "Cancel", self._request_cancel,
+                                      primary=False, small=True)
 
-        # Create button
-        self._create_btn = FlatButton(parent, "Create Encrypted Volume",
-                                       self._do_create)
-        self._create_btn.pack(fill="x", pady=(18, 0))
+        # Create button + inline error (M23)
+        self._create_btn = FlatButton(parent, f"Create volume {ICON['arrow']}",
+                                      self._do_create)
+        self._create_btn.pack(fill="x", pady=(SP["l"], 0))
+        self._err = tk.Label(parent, text="", font=F["caption"], bg=C["bg"],
+                             fg=C["error"], anchor="w", justify="left",
+                             wraplength=self._WRAP)
+        self._err.pack(fill="x", pady=(SP["s"], 0))
 
     def _on_auth_change(self):
-        mode = self._auth_var.get()
-        if mode == "password":
+        if self._auth_var.get() == "password":
             self._shamir_frame.pack_forget()
-            self._pw_frame.pack(fill="x", pady=(14, 0))
+            self._pw_frame.pack(fill="x")
+            self._after(self._pw_entry.focus_set)
         else:
             self._pw_frame.pack_forget()
-            self._shamir_frame.pack(fill="x", pady=(14, 0))
+            self._shamir_frame.pack(fill="x")
+            self._after(self._n_entry.focus_set)
 
     def _browse_save_location(self):
         p = filedialog.asksaveasfilename(
@@ -212,17 +421,69 @@ class VolumeManagerApp(tk.Toplevel):
             defaultextension=".qcv",
             filetypes=[("QuantaCrypt Volume", "*.qcv"), ("All files", "*")],
             initialdir=os.path.expanduser("~"),
+            parent=self,
         )
         if p:
             self._loc_var.set(p)
 
+    def _fail_create(self, msg: str, focus: tk.Widget | None = None):
+        self._err.config(text=msg, fg=C["error"])
+        if focus is not None:
+            focus.focus_set()
+
     def _do_create(self):
+        if self._busy:
+            return
+        self._err.config(text="")
         path = self._loc_var.get().strip()
         if not path:
-            messagebox.showwarning("Missing location",
-                                   "Choose where to save the volume.",
-                                   parent=self)
+            self._fail_create("Choose where to save the volume.", self._loc_entry)
             return
+        if not path.lower().endswith(".qcv"):
+            path += ".qcv"
+            self._loc_var.set(path)
+
+        # Credentials first (Q32) — never ask "overwrite?" for a form that
+        # is about to be rejected anyway.
+        auth = self._auth_var.get()
+        pw = ""
+        n = k = 0
+        if auth == "password":
+            pw, pw2 = self._pw_var.get(), self._pw2_var.get()
+            if not pw:
+                self._fail_create("Enter a password.", self._pw_entry)
+                return
+            if pw != pw2:
+                self._fail_create("The two passwords don't match.", self._pw2_entry)
+                return
+            try:
+                from zxcvbn import zxcvbn as _zx
+                score = _zx(pw)["score"]
+            except ImportError:
+                score = 4  # estimator missing — skip the check
+            if score < 2 and not confirm(
+                    self, "Weak password",
+                    "This password is rated Weak and could be guessed. A longer "
+                    "password mixing words, numbers and symbols is safer.\n\n"
+                    "Use it anyway?",
+                    yes="Use it anyway", no="Choose another", danger=True):
+                self._pw_entry.focus_set()
+                return
+        else:
+            try:
+                n = int(self._n_var.get().strip())
+                k = int(self._k_var.get().strip())
+            except ValueError:
+                self._fail_create("Enter whole numbers for total shares and "
+                                  "required shares.", self._n_entry)
+                return
+            if n < 2 or n > 20:
+                self._fail_create("Total shares must be between 2 and 20.", self._n_entry)
+                return
+            if k < 2 or k > n:
+                self._fail_create(f"Required shares must be between 2 and {n}.",
+                                  self._k_entry)
+                return
 
         # create_volume_* opens the path with "wb" — immediate truncation.
         # The Browse dialog confirms overwrites, but a typed path gets no
@@ -241,7 +502,8 @@ class VolumeManagerApp(tk.Toplevel):
                     return
         except Exception:
             pass  # fuse_ops unavailable → nothing can be mounted
-        if os.path.exists(path):
+        existed = os.path.exists(path)
+        if existed:
             # The in-process check above can't see another app instance or
             # a script: probe the cross-process mount flock too (acquired
             # and immediately released — creation itself is guarded by the
@@ -261,7 +523,6 @@ class VolumeManagerApp(tk.Toplevel):
                 return
             except Exception:
                 pass  # probe unavailable → fall through to the prompt
-        if os.path.exists(path):
             if not messagebox.askyesno(
                     "Overwrite volume?",
                     f"{os.path.basename(path)} already exists.\n\n"
@@ -271,86 +532,119 @@ class VolumeManagerApp(tk.Toplevel):
                     icon="warning", default="no", parent=self):
                 return
 
-        auth = self._auth_var.get()
-
-        if auth == "password":
-            pw = self._pw_var.get()
-            pw2 = self._pw2_var.get()
-            if not pw:
-                messagebox.showwarning("Missing password",
-                                       "Enter a password.", parent=self)
-                return
-            if pw != pw2:
-                messagebox.showwarning("Mismatch",
-                                       "Passwords do not match.", parent=self)
-                return
-        else:
-            try:
-                n = int(self._n_var.get())
-                k = int(self._k_var.get())
-            except ValueError:
-                messagebox.showwarning("Invalid",
-                                       "N and K must be integers.", parent=self)
-                return
-            if k < 2 or k > n:
-                messagebox.showwarning("Invalid",
-                                       "K must be between 2 and N.", parent=self)
-                return
-
-        # Disable button, show progress
+        # Freeze the form, show the progress row
+        stages = STAGES_PASSWORD if auth == "password" else STAGES_SHAMIR
+        self._busy = True
+        self._busy_what = "create"
+        self._cancel_event.clear()
         self._create_btn.enable(False)
-        self._progress.pack(fill="x", pady=(12, 0))
+        if self._progress is not None:
+            self._progress.destroy()
+        self._progress = StagedProgressBar(self._prog_row, stages)
+        self._cancel_btn.pack(side="right", padx=(SP["s"], 0), anchor="n")
+        self._cancel_btn.enable(True)
+        self._progress.pack(side="left", fill="x", expand=True)
+        self._prog_row.pack(fill="x", pady=(SP["m"], 0), before=self._create_btn)
         self._progress.start()
+        self._cancel_btn.focus_set()
+        started = time.time()
+
+        def _discard_partial():
+            # Only remove what THIS run wrote: a pre-existing file that was
+            # never truncated (cancel during the KDF) must survive.
+            try:
+                if not existed or os.path.getmtime(path) >= started:
+                    os.remove(path)
+            except OSError:
+                pass
 
         def _worker():
             try:
                 if auth == "password":
                     meta = vol.create_volume_single(path, pw, progress_cb=_progress)
-                    self.after(0, lambda: self._on_create_done(path, meta))
+                    shares = None
                 else:
                     meta, shares = vol.create_volume_shamir(
                         path, n, k, progress_cb=_progress)
-                    self.after(0, lambda: self._on_create_done(
-                        path, meta, shares=shares))
             except Exception as e:
-                self.after(0, lambda exc=e: self._on_create_error(exc))
+                if self._cancel_event.is_set():
+                    _discard_partial()
+                    self._after(self._on_create_cancelled)
+                else:
+                    self._after(lambda exc=e: self._on_create_error(exc))
+                return
+            if self._cancel_event.is_set():
+                _discard_partial()
+                self._after(self._on_create_cancelled)
+                return
+            self._after(lambda: self._on_create_done(path, meta, shares=shares))
 
         def _progress(msg):
-            idx, label = _find_stage(msg)
+            idx, label = _find_stage(msg, stages)
             if idx is not None:
-                self.after(0, lambda: self._progress.advance(idx, label))
+                self._after(lambda: self._progress.advance(idx, label))
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _request_cancel(self):
+        """The core has no cancel hook, so 'Cancel' means: let the current
+        step finish, then delete whatever was written."""
+        if not self._busy or self._busy_what != "create":
+            return
+        self._cancel_event.set()
+        self._cancel_btn.enable(False)
+        self._err.config(text="Cancelling — finishing the current step, then "
+                              "deleting the unfinished volume…", fg=C["text3"])
+
+    def _end_create_busy(self):
+        self._busy = False
+        self._busy_what = ""
+        self._prog_row.pack_forget()
+        self._create_btn.enable(True)
+
+    def _on_create_cancelled(self):
+        if self._progress is not None:
+            self._progress.stop()
+        self._end_create_busy()
+        self._err.config(text="Creation cancelled — nothing was kept.", fg=C["text3"])
+        self._loc_entry.focus_set()
+
     def _on_create_done(self, path: str, meta: dict, shares: list | None = None):
-        self._progress.complete()
-        notify("Volume Created",
-               f"Encrypted volume saved to {os.path.basename(path)}")
+        if self._progress is not None:
+            self._progress.complete()
+        self._end_create_busy()
+        self._pw_var.set("")
+        self._pw2_var.set("")
+        name = os.path.basename(path)
+        notify("Volume Created", f"Encrypted volume saved to {name}")
+        RecentVolumes.add(path, meta)
 
         if shares:
-            # Show shares in a dialog
             self._show_shares_dialog(shares, meta)
-        else:
-            messagebox.showinfo(
-                "Volume Created",
-                f"Your encrypted volume has been created:\n{path}\n\n"
-                "You can mount it using the Mount tab.",
-                parent=self,
-            )
-        self._create_btn.enable(True)
+
+        # Q31: offer to mount it right here instead of pointing at a "tab"
+        self._err.config(text=f"{ICON['ok']} Created {name}", fg=C["success"])
+        if confirm(self, "Volume created",
+                   f"{name} is ready.\n\nMount it now?",
+                   yes="Mount now", no="Later", default_no=False):
+            self._mount_path_var.set(path)
+            self._mount_pw_var.set("")
+            self._mode_var.set("mount")
 
     def _on_create_error(self, err):
-        self._progress.stop()
-        self._create_btn.enable(True)
+        if self._progress is not None:
+            self._progress.stop()
+        self._end_create_busy()
         # Accept either an exception or a raw string; translate to a
         # user-friendly message before displaying.
-        if isinstance(err, BaseException):
-            msg = friendly_error(err)
-        else:
-            msg = str(err)
-        messagebox.showerror("Volume creation failed", msg, parent=self)
+        msg = friendly_error(err) if isinstance(err, BaseException) else str(err)
+        self._err.config(text=f"Couldn't create the volume — {msg}", fg=C["error"])
+        self._loc_entry.focus_set()
 
     def _show_shares_dialog(self, shares: list[str], meta: dict):
+        """Modal 'save your shares' screen (M21): per-share Copy with the
+        clipboard countdown, Save all shares… to a 0600 file, Escape/close
+        behave like the primary button."""
         win = tk.Toplevel(self)
         win.title("Recovery Shares")
         win.configure(bg=C["bg"])
@@ -358,371 +652,508 @@ class VolumeManagerApp(tk.Toplevel):
         win.transient(self)
         win.grab_set()
 
-        P = 24
+        P = SP["xl"]
         k = meta.get("threshold", 2)
-        n = meta.get("total", 3)
+        n = meta.get("total", len(shares))
 
         tk.Label(win, text="Save Your Recovery Shares", font=F["heading"],
-                 bg=C["bg"], fg=C["text"]).pack(padx=P, pady=(20, 4))
+                 bg=C["bg"], fg=C["text"]).pack(padx=P, pady=(SP["xl"], SP["xs"]))
         tk.Label(win, text=f"You need {k} of {n} shares to unlock this volume.",
                  font=F["body"], bg=C["bg"], fg=C["text3"]).pack(padx=P)
         tk.Label(win, text="Give each share to a different person. Never store "
                            "all shares together.",
-                 font=F["caption"], bg=C["bg"], fg=C["warning"]).pack(padx=P, pady=(8, 12))
+                 font=F["caption"], bg=C["bg"], fg=C["warning"]).pack(
+            padx=P, pady=(SP["s"], SP["m"]))
+
+        timer_lbl = tk.Label(win, text="", font=F["small"], bg=C["bg"], fg=C["text3"])
+        saved_lbl = tk.Label(win, text="", font=F["small"], bg=C["bg"], fg=C["success"],
+                             wraplength=self._WRAP, justify="left")
+        # Owned by the root so the 60 s clipboard clear outlives this window
+        timer = ClipboardTimer(self.master, timer_lbl)
+
+        def _copy(share: str, btn: FlatButton):
+            try:
+                win.clipboard_clear()
+                win.clipboard_append(share)
+            except tk.TclError:
+                btn.set_text(f"{ICON['err']} Failed")
+                return
+            btn.set_text(f"{ICON['ok']} Copied")
+            win.after(1500, lambda: btn.set_text("Copy") if btn.winfo_exists() else None)
+            timer.start()
 
         for i, share in enumerate(shares):
-            frame = tk.Frame(win, bg=C["surface"],
-                             highlightbackground=C["border"], highlightthickness=1)
-            frame.pack(fill="x", padx=P, pady=(0, 6))
-            tk.Label(frame, text=f"Share {i + 1}",
-                     font=F["body_b"], bg=C["surface"], fg=C["text"]).pack(
-                anchor="w", padx=12, pady=(8, 2))
-            txt = tk.Text(frame, height=2, wrap="word", font=F["mono_s"],
+            inner = card(win, padx=SP["m"], pady=SP["s"])
+            inner.outer.pack(fill="x", padx=P, pady=(0, SP["xs"] + 2))
+            top = tk.Frame(inner, bg=C["surface"])
+            top.pack(fill="x")
+            tk.Label(top, text=f"Share {i + 1} of {n}", font=F["body_b"],
+                     bg=C["surface"], fg=C["text"]).pack(side="left")
+            holder: dict = {}
+            copy_btn = FlatButton(top, "Copy",
+                                  lambda s=share, h=holder: _copy(s, h["btn"]),
+                                  primary=False, small=True)
+            holder["btn"] = copy_btn
+            copy_btn.pack(side="right")
+            txt = tk.Text(inner, height=2, wrap="word", font=F["mono_s"],
                           bg=C["surface2"], fg=C["text"], relief="flat",
-                          insertbackground=C["accent"])
+                          insertbackground=C["accent_text"])
             txt.insert("1.0", share)
             txt.config(state="disabled")
-            txt.pack(fill="x", padx=12, pady=(0, 8))
+            txt.pack(fill="x", pady=(SP["xs"], 0))
             bind_context_menu(txt)
 
-        FlatButton(win, "I've saved all shares", win.destroy).pack(
-            padx=P, pady=(8, 20))
+        timer_lbl.pack(padx=P, anchor="w")
+        saved_lbl.pack(padx=P, anchor="w")
+
+        def _save_all():
+            base = os.path.splitext(os.path.basename(self._loc_var.get().strip()))[0] or "volume"
+            p = filedialog.asksaveasfilename(
+                title="Save all shares",
+                defaultextension=".txt",
+                initialfile=f"{base}.shares.txt",
+                filetypes=[("Text", "*.txt"), ("All files", "*")],
+                parent=win,
+            )
+            if not p:
+                return
+            lines = [f"QuantaCrypt recovery shares — {k} of {n} needed", ""]
+            for i, share in enumerate(shares):
+                lines += [f"Share {i + 1} of {n}:", share, ""]
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                os.chmod(p, 0o600)
+            except OSError as e:
+                alert(win, "Couldn't save the shares", friendly_error(e))
+                return
+            saved_lbl.config(text=f"{ICON['ok']} Saved all {n} shares to "
+                                  f"{os.path.basename(p)} — keep that file somewhere "
+                                  "safe, then split it up.")
+
+        def _finish():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=C["bg"])
+        btns.pack(fill="x", padx=P, pady=(SP["s"], SP["xl"]))
+        done_btn = FlatButton(btns, "I've saved all shares", _finish)
+        done_btn.pack(side="right")
+        FlatButton(btns, "Save all shares…", _save_all,
+                   primary=False).pack(side="right", padx=(0, SP["s"]))
+
+        win.bind("<Escape>", lambda e: _finish())
+        win.protocol("WM_DELETE_WINDOW", _finish)
 
         win.update_idletasks()
         cx = self.winfo_x() + self.winfo_width() // 2
         cy = self.winfo_y() + self.winfo_height() // 2
         w, h = win.winfo_width(), win.winfo_height()
         win.geometry(f"+{cx - w // 2}+{cy - h // 2}")
+        done_btn.focus_set()
+        win.wait_window()
 
     # ── Mount Panel ──────────────────────────────────────────────────────────
 
-    def _build_mount_panel(self, parent: tk.Frame, P: int):
-        # FUSE check — show setup screen if components are missing
-        from quantacrypt.core.fuse_ops import check_fuse_components
-        components = check_fuse_components()
-
-        all_ok = all(c["ok"] for c in components.values())
-
-        if not all_ok:
+    def _build_mount_panel(self, parent: tk.Frame):
+        self._setup_frame: tk.Frame | None = None
+        self._mount_inner: tk.Frame | None = None
+        if not self._fuse_ok:
             self._setup_frame = tk.Frame(parent, bg=C["bg"])
             self._setup_frame.pack(fill="both", expand=True)
-            self._build_setup_screen(self._setup_frame, components)
-
+            self._build_setup_screen(self._setup_frame, self._components)
             # Mount UI container (built but hidden until setup is done)
             self._mount_inner = tk.Frame(parent, bg=C["bg"])
             self._build_mount_ui(self._mount_inner)
             return
-
-        # Everything available — build mount UI directly
-        self._setup_frame = None
-        self._mount_inner = None
         self._build_mount_ui(parent)
 
-    def _build_setup_screen(self, parent: tk.Frame,
-                            components: dict[str, dict]):
+    # ── Setup screen ─────────────────────────────────────────────────────────
+
+    _COMPONENT_LABELS = {
+        "fuse_backend": "Disk mounting support (macFUSE or FUSE-T)"
+                        if sys.platform == "darwin" else "Disk mounting support (FUSE)",
+        "fusepy": "Mounting helper (fusepy)",
+    }
+
+    def _build_setup_screen(self, parent: tk.Frame, components: dict[str, dict]):
         """Guided dependency setup screen shown when FUSE components are missing."""
         tk.Label(parent, text="Setup Required", font=F["heading"],
-                 bg=C["bg"], fg=C["warning"]).pack(pady=(12, 4))
-        tk.Label(parent, text="Encrypted volumes need a couple of components "
-                               "to mount as real drives.",
+                 bg=C["bg"], fg=C["warning"]).pack(pady=(SP["m"], SP["xs"]))
+        tk.Label(parent, text="Encrypted volumes need two components to mount "
+                              "as real drives.",
                  font=F["body"], bg=C["bg"], fg=C["text3"],
-                 wraplength=420, justify="center").pack(pady=(0, 16))
+                 wraplength=self._WRAP, justify="center").pack(pady=(0, SP["l"]))
 
-        # Component rows
         self._comp_widgets: dict[str, dict] = {}
-
-        for key, label, install_cmd, install_label, hint in [
-            ("fuse_backend",
-             "FUSE backend",
-             None,  # platform-specific — handled in _install_fuse_backend
-             "Install…",
-             "macOS: macFUSE or FUSE-T  •  Linux: libfuse"),
-            ("fusepy",
-             "fusepy (Python package)",
-             [sys.executable, "-m", "pip", "install", "fusepy"],
-             "Install fusepy",
-             "pip install fusepy"),
-        ]:
+        for key in ("fuse_backend", "fusepy"):
             info = components.get(key, {"ok": False, "detail": "unknown"})
-            row = tk.Frame(parent, bg=C["surface"],
-                           highlightbackground=C["border"],
-                           highlightthickness=1)
-            row.pack(fill="x", pady=(0, 8))
+            self._comp_widgets[key] = self._build_component_row(parent, key, info)
 
-            top = tk.Frame(row, bg=C["surface"])
-            top.pack(fill="x", padx=14, pady=(10, 0))
+        self._recheck_btn = FlatButton(parent, "Check again",
+                                       self._recheck_dependencies, primary=False)
+        self._recheck_btn.pack(fill="x", pady=(SP["m"], 0))
+        self._recheck_lbl = tk.Label(parent, text="", font=F["caption"], bg=C["bg"],
+                                     fg=C["text3"], wraplength=self._WRAP, justify="left")
+        self._recheck_lbl.pack(anchor="w", pady=(SP["xs"], 0))
 
-            # Status icon + label
-            icon = "✓" if info["ok"] else "✗"
-            icon_color = C["success"] if info["ok"] else C["error"]
-            tk.Label(top, text=icon, font=F["body_b"],
-                     bg=C["surface"], fg=icon_color).pack(side="left")
-            tk.Label(top, text=f"  {label}", font=F["body_b"],
-                     bg=C["surface"], fg=C["text"]).pack(side="left")
+    def _build_component_row(self, parent: tk.Frame, key: str, info: dict) -> dict:
+        inner = card(parent, padx=SP["m"], pady=SP["s"])
+        inner.outer.pack(fill="x", pady=(0, SP["s"]))
+        ok = bool(info.get("ok"))
 
-            # Detail text
-            detail_lbl = tk.Label(row, text=info["detail"], font=F["caption"],
-                                   bg=C["surface"], fg=C["text3"])
-            detail_lbl.pack(anchor="w", padx=14, pady=(2, 0))
+        top = tk.Frame(inner, bg=C["surface"])
+        top.pack(fill="x")
+        icon_lbl = tk.Label(top, text=ICON["ok"] if ok else ICON["err"], font=F["body_b"],
+                            bg=C["surface"], fg=C["success"] if ok else C["error"])
+        icon_lbl.pack(side="left")
+        tk.Label(top, text=f"  {self._COMPONENT_LABELS[key]}", font=F["body_b"],
+                 bg=C["surface"], fg=C["text"]).pack(side="left")
 
-            # Install button (only if not already available)
-            btn = None
-            if not info["ok"]:
-                btn_frame = tk.Frame(row, bg=C["surface"])
-                btn_frame.pack(anchor="w", padx=14, pady=(6, 10))
-                if key == "fuse_backend":
-                    btn = FlatButton(
-                        btn_frame, install_label,
-                        lambda: self._install_fuse_backend(),
-                        small=True)
-                    btn.pack(side="left")
-                elif getattr(sys, "frozen", False):
-                    # In a PyInstaller bundle sys.executable IS the GUI app —
-                    # "-m pip" would just respawn QuantaCrypt.  fusepy ships
-                    # inside the bundle, so a missing import means the
-                    # install is broken, not incomplete.
-                    hint = "fusepy ships with the app — reinstall QuantaCrypt to restore it."
-                else:
-                    btn = FlatButton(
-                        btn_frame, install_label,
-                        lambda c=install_cmd, k=key: self._run_install(c, k),
-                        small=True)
-                    btn.pack(side="left")
+        detail_lbl = tk.Label(inner, text=info.get("detail", ""), font=F["caption"],
+                              bg=C["surface"], fg=C["success"] if ok else C["text3"],
+                              wraplength=self._WRAP - SP["xl"], justify="left")
+        detail_lbl.pack(anchor="w", pady=(2, 0))
 
-                hint_lbl = tk.Label(btn_frame, text=hint, font=F["caption"],
-                                     bg=C["surface"], fg=C["text3"])
-                hint_lbl.pack(side="left", padx=(10, 0))
+        # Instructions / command block, rendered IN the row (never a messagebox)
+        cmd_box = tk.Text(inner, height=1, wrap="none", font=F["mono_s"],
+                          bg=C["surface2"], fg=C["text"], relief="flat",
+                          insertbackground=C["accent_text"])
+        bind_context_menu(cmd_box)
+
+        btn_row = tk.Frame(inner, bg=C["surface"])
+        btn = extra = None
+        if not ok:
+            btn_row.pack(fill="x", pady=(SP["s"], 0))
+            if key == "fuse_backend":
+                btn = FlatButton(btn_row, "How to install…",
+                                 self._install_fuse_backend, small=True)
+                btn.pack(side="left")
+            elif getattr(sys, "frozen", False):
+                # In a PyInstaller bundle sys.executable IS the GUI app —
+                # "-m pip" would just respawn QuantaCrypt.  fusepy ships
+                # inside the bundle, so a missing import means the
+                # install is broken, not incomplete.
+                detail_lbl.config(text="The helper ships inside the app — this copy "
+                                       "is damaged. Download QuantaCrypt again to fix it.")
+                btn = FlatButton(btn_row, "Get QuantaCrypt again",
+                                 lambda: webbrowser.open(_RELEASES_URL), small=True)
+                btn.pack(side="left")
             else:
-                # Pad bottom for installed components
-                tk.Frame(row, bg=C["surface"], height=10).pack()
+                cmd = [sys.executable, "-m", "pip", "install", "fusepy"]
+                btn = FlatButton(btn_row, "Install helper",
+                                 lambda c=cmd: self._run_install(c, "fusepy"), small=True)
+                btn.pack(side="left")
+                self._set_cmd_box(cmd_box, "pip install fusepy")
+                cmd_box.pack(fill="x", pady=(SP["s"], 0))
 
-            self._comp_widgets[key] = {
-                "row": row, "icon_lbl": top.winfo_children()[0],
-                "detail_lbl": detail_lbl, "btn": btn,
-            }
+        return {"row": inner, "icon_lbl": icon_lbl, "detail_lbl": detail_lbl,
+                "btn": btn, "btn_row": btn_row, "cmd_box": cmd_box, "extra": extra}
 
-        # Recheck button
-        self._recheck_btn = FlatButton(
-            parent, "Recheck dependencies",
-            self._recheck_dependencies, primary=False)
-        self._recheck_btn.pack(fill="x", pady=(12, 0))
+    @staticmethod
+    def _set_cmd_box(box: tk.Text, text: str):
+        lines = text.count("\n") + 1
+        box.config(state="normal", height=lines)
+        box.delete("1.0", "end")
+        box.insert("1.0", text)
+        box.config(state="disabled")
+
+    # Elapsed-seconds ticker for long-running "Installing…" states
+    def _start_ticker(self, key: str, base: str):
+        self._stop_ticker(key)
+        t = {"start": time.time(), "base": base, "job": None}
+        self._tickers[key] = t
+
+        def _tick():
+            if key not in self._tickers or not self.winfo_exists():
+                return
+            secs = int(time.time() - t["start"])
+            try:
+                self._comp_widgets[key]["detail_lbl"].config(
+                    text=f"{base} {secs}s", fg=C["warning"])
+            except Exception:
+                return
+            t["job"] = self.after(1000, _tick)
+        _tick()
+
+    def _stop_ticker(self, key: str):
+        t = self._tickers.pop(key, None)
+        if t and t.get("job") is not None:
+            try:
+                self.after_cancel(t["job"])
+            except Exception:
+                pass
 
     def _run_install(self, cmd: list[str], component_key: str):
         """Run a pip install command in a background thread."""
         widgets = self._comp_widgets[component_key]
         if widgets["btn"]:
             widgets["btn"].enable(False)
-        widgets["detail_lbl"].config(text="Installing…", fg=C["warning"])
+        self._start_ticker(component_key, "Installing…")
 
         def _worker():
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=120)
                 if result.returncode == 0:
-                    self.after(0, lambda: self._on_install_ok(component_key))
+                    self._after(lambda: self._on_install_ok(component_key))
                 else:
-                    err = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Unknown error"
-                    self.after(0, lambda: self._on_install_fail(
-                        component_key, err))
+                    err = (result.stderr.strip().splitlines()[-1]
+                           if result.stderr.strip() else "Unknown error")
+                    self._after(lambda: self._on_install_fail(component_key, err))
             except Exception as e:
-                self.after(0, lambda: self._on_install_fail(
-                    component_key, str(e)))
+                self._after(lambda: self._on_install_fail(component_key, str(e)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _install_fuse_backend(self):
-        """Guide the user to install a FUSE backend (requires admin)."""
+        """Show install instructions IN the row; on macOS with Homebrew offer
+        to open Terminal with the command."""
         widgets = self._comp_widgets["fuse_backend"]
+        box: tk.Text = widgets["cmd_box"]
+        btn_row: tk.Frame = widgets["btn_row"]
+        if widgets["btn"]:
+            widgets["btn"].enable(False)
+
         if sys.platform == "darwin":
-            msg = (
-                "A FUSE backend requires administrator privileges to install.\n\n"
-                "Option 1 — FUSE-T (recommended, kext-free):\n"
-                "  brew install --cask fuse-t\n\n"
-                "Option 2 — macFUSE:\n"
-                "  brew install --cask macfuse\n\n"
-                "After installing, click \"Recheck dependencies\" below."
-            )
-            # Try to open Terminal with the brew command
-            answer = messagebox.askyesno(
-                "Install FUSE backend",
-                f"{msg}\n\nWould you like to open Terminal with the "
-                "install command?",
-                parent=self,
-            )
-            if answer:
-                try:
-                    subprocess.Popen([
-                        "osascript", "-e",
-                        'tell app "Terminal" to do script '
-                        '"brew install --cask fuse-t"',
-                    ])
-                    widgets["detail_lbl"].config(
-                        text="Check Terminal — install in progress…",
-                        fg=C["warning"])
-                except Exception:
-                    messagebox.showinfo(
-                        "Manual install needed",
-                        "Could not open Terminal automatically.\n"
-                        "Please run the command manually:\n\n"
-                        "  brew install --cask fuse-t",
-                        parent=self,
-                    )
+            if shutil.which("brew"):
+                cmd = "brew install --cask fuse-t"
+                widgets["detail_lbl"].config(
+                    text="Needs an administrator password. FUSE-T is recommended "
+                         "(no kernel extension); macFUSE also works: "
+                         "brew install --cask macfuse", fg=C["text3"])
+                self._set_cmd_box(box, cmd)
+                box.pack(fill="x", pady=(SP["s"], 0))
+
+                def _open_terminal():
+                    try:
+                        subprocess.Popen([
+                            "osascript", "-e",
+                            f'tell app "Terminal" to do script "{cmd}"',
+                        ])
+                    except Exception:
+                        widgets["detail_lbl"].config(
+                            text="Couldn't open Terminal — copy the command above "
+                                 "and run it yourself.", fg=C["error"])
+                        return
+                    self._start_ticker("fuse_backend",
+                                       "Check Terminal — install in progress…")
+                    term_btn.enable(False)
+
+                term_btn = FlatButton(btn_row, "Open in Terminal", _open_terminal,
+                                      primary=False, small=True)
+                term_btn.pack(side="left", padx=(SP["s"], 0))
+                widgets["extra"] = term_btn
+            else:
+                widgets["detail_lbl"].config(
+                    text="Homebrew isn't installed. Download an installer instead "
+                         "(needs an administrator password):", fg=C["text3"])
+                self._set_cmd_box(box, f"FUSE-T   {_FUSE_T_URL}\nmacFUSE  {_MACFUSE_URL}")
+                box.pack(fill="x", pady=(SP["s"], 0))
+        elif sys.platform == "win32":
+            widgets["detail_lbl"].config(
+                text="Encrypted volumes aren't supported on Windows yet.",
+                fg=C["warning"])
         else:
-            msg = (
-                "A FUSE backend requires administrator privileges to install.\n\n"
-                "Run this command in a terminal:\n"
-                "  sudo apt install libfuse-dev\n\n"
-                "After installing, click \"Recheck dependencies\" below."
-            )
-            messagebox.showinfo("Install FUSE backend", msg, parent=self)
+            widgets["detail_lbl"].config(
+                text="Install FUSE with your package manager (needs sudo):",
+                fg=C["text3"])
+            self._set_cmd_box(
+                box,
+                "sudo apt install libfuse-dev      # Debian / Ubuntu\n"
+                "sudo dnf install fuse fuse-devel  # Fedora\n"
+                "sudo pacman -S fuse2              # Arch")
+            box.pack(fill="x", pady=(SP["s"], 0))
+        self._recheck_lbl.config(text="When it's installed, click Check again.")
 
     def _on_install_ok(self, component_key: str):
+        self._stop_ticker(component_key)
         widgets = self._comp_widgets[component_key]
-        widgets["icon_lbl"].config(text="✓", fg=C["success"])
-        widgets["detail_lbl"].config(text="Installed successfully", fg=C["success"])
+        widgets["icon_lbl"].config(text=ICON["ok"], fg=C["success"])
+        widgets["detail_lbl"].config(text="Installed", fg=C["success"])
         if widgets["btn"]:
             widgets["btn"].pack_forget()
-        # Auto-recheck
+        widgets["cmd_box"].pack_forget()
         self._recheck_dependencies()
 
     def _on_install_fail(self, component_key: str, err: str):
+        self._stop_ticker(component_key)
         widgets = self._comp_widgets[component_key]
         widgets["detail_lbl"].config(text=f"Install failed: {err}", fg=C["error"])
         if widgets["btn"]:
             widgets["btn"].enable(True)
 
     def _recheck_dependencies(self):
-        """Re-run component checks and update the setup screen or switch to mount UI."""
+        """Re-run component checks; update rows or switch to the mount UI."""
         from quantacrypt.core.fuse_ops import check_fuse_components
         components = check_fuse_components()
-
+        self._components = components
         all_ok = all(c["ok"] for c in components.values())
 
-        # Update existing component widgets
+        missing = []
         for key, info in components.items():
-            if key in self._comp_widgets:
-                w = self._comp_widgets[key]
-                icon = "✓" if info["ok"] else "✗"
-                icon_color = C["success"] if info["ok"] else C["error"]
-                w["icon_lbl"].config(text=icon, fg=icon_color)
-                w["detail_lbl"].config(
-                    text=info["detail"],
-                    fg=C["success"] if info["ok"] else C["text3"])
-                if info["ok"] and w["btn"]:
+            w = self._comp_widgets.get(key)
+            if not w:
+                continue
+            ok = bool(info["ok"])
+            w["icon_lbl"].config(text=ICON["ok"] if ok else ICON["err"],
+                                 fg=C["success"] if ok else C["error"])
+            if ok:
+                self._stop_ticker(key)
+                w["detail_lbl"].config(text=info["detail"], fg=C["success"])
+                if w["btn"]:
                     w["btn"].pack_forget()
+                if w.get("extra"):
+                    w["extra"].pack_forget()
+                w["cmd_box"].pack_forget()
+            else:
+                missing.append(self._COMPONENT_LABELS[key].split(" (")[0])
+                if key not in self._tickers:
+                    w["detail_lbl"].config(text=info["detail"], fg=C["text3"])
 
         if all_ok:
-            # Hide setup, show mount UI
+            self._fuse_ok = True
             self._setup_frame.pack_forget()
-            self._recheck_btn.pack_forget()
             self._mount_inner.pack(fill="both", expand=True)
+            self._fuse_warn.outer.pack_forget()
+            self._focus_first()
+        else:
+            self._recheck_lbl.config(
+                text=f"Checked just now — still missing: {', '.join(missing)}.")
+
+    # ── Mount UI ─────────────────────────────────────────────────────────────
 
     def _build_mount_ui(self, parent: tk.Frame):
         """Build the actual volume mount/unmount controls."""
-        # Volume file selection
         tk.Label(parent, text="Volume file (.qcv)", font=F["body_b"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(8, 0))
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["s"], 0))
         row = tk.Frame(parent, bg=C["bg"])
-        row.pack(fill="x", pady=(4, 0))
+        row.pack(fill="x", pady=(SP["xs"], 0))
         self._mount_path_var = tk.StringVar()
-        self._mount_path_var.trace_add("write",
-                                        lambda *_: self._on_volume_selected())
-        styled_entry(row, textvariable=self._mount_path_var).pack(
-            side="left", fill="x", expand=True)
+        self._mount_path_var.trace_add("write", lambda *_: self._on_volume_selected())
+        self._mount_path_entry = styled_entry(row, textvariable=self._mount_path_var)
+        self._mount_path_entry.pack(side="left", fill="x", expand=True)
+        # "Not a valid .qcv" only once the user leaves the field — not per keystroke
+        self._mount_path_entry.bind(
+            "<FocusOut>", lambda e: self._on_volume_selected(show_errors=True))
+        self._mount_path_entry.bind("<Return>", lambda e: self._do_mount())
         FlatButton(row, "Browse…", self._browse_volume,
-                   primary=False, small=True).pack(side="left", padx=(8, 0))
+                   primary=False, small=True).pack(side="left", padx=(SP["s"], 0))
 
-        # Volume info hint (shown after a valid .qcv is selected)
         self._vol_info_lbl = tk.Label(parent, text="", font=F["caption"],
-                                       bg=C["bg"], fg=C["text3"])
-        self._vol_info_lbl.pack(anchor="w", pady=(2, 0))
+                                      bg=C["bg"], fg=C["text3"], anchor="w",
+                                      wraplength=self._WRAP, justify="left")
+        self._vol_info_lbl.pack(fill="x", pady=(2, 0))
 
         # Mount point
         tk.Label(parent, text="Mount point", font=F["body_b"],
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(10, 0))
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["s"], 0))
         row2 = tk.Frame(parent, bg=C["bg"])
-        row2.pack(fill="x", pady=(4, 0))
-        self._mount_point_var = tk.StringVar(value="/Volumes/QuantaCrypt")
-        styled_entry(row2, textvariable=self._mount_point_var).pack(
-            side="left", fill="x", expand=True)
+        row2.pack(fill="x", pady=(SP["xs"], 0))
+        self._mount_point_var = tk.StringVar()
+        self._mount_point_entry = styled_entry(row2, textvariable=self._mount_point_var)
+        self._mount_point_entry.pack(side="left", fill="x", expand=True)
+        self._mount_point_entry.bind("<Return>", lambda e: self._do_mount())
         FlatButton(row2, "Choose…", self._browse_mount_point,
-                   primary=False, small=True).pack(side="left", padx=(8, 0))
+                   primary=False, small=True).pack(side="left", padx=(SP["s"], 0))
+        tk.Label(parent, text="Filled in from the volume name — a folder in your "
+                              "home directory that appears as a drive while mounted.",
+                 font=F["caption"], bg=C["bg"], fg=C["text3"],
+                 wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(2, 0))
 
-        # Auth mode for mounting
+        # Unlock mode
         self._mount_auth_var = tk.StringVar(value="password")
         self._auth_frame = tk.Frame(parent, bg=C["bg"])
-        self._auth_frame.pack(fill="x", pady=(12, 0))
-        self._auth_label = tk.Label(self._auth_frame, text="Authentication",
-                                     font=F["body_b"],
-                                     bg=C["bg"], fg=C["text"])
-        self._auth_label.pack(anchor="w")
+        self._auth_frame.pack(fill="x", pady=(SP["m"], 0))
+        tk.Label(self._auth_frame, text="Unlock with", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
         self._auth_seg = SegmentedControl(
             self._auth_frame,
-            [("password", "Password"), ("shamir", "Shares")],
+            [("password", "Password"), ("shamir", "Split key")],
             self._mount_auth_var)
-        self._auth_seg.pack(fill="x", pady=(6, 0))
-        self._mount_auth_var.trace_add("write",
-                                        lambda *_: self._on_mount_auth_change())
+        self._auth_seg.pack(fill="x", pady=(SP["xs"], 0))
+        self._mount_auth_var.trace_add("write", lambda *_: self._on_mount_auth_change())
 
         # Password input
         self._mount_pw_frame = tk.Frame(parent, bg=C["bg"])
-        self._mount_pw_frame.pack(fill="x", pady=(10, 0))
+        self._mount_pw_frame.pack(fill="x", pady=(SP["s"], 0))
+        tk.Label(self._mount_pw_frame, text="Password", font=F["body_b"],
+                 bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        pw_row = tk.Frame(self._mount_pw_frame, bg=C["bg"])
+        pw_row.pack(fill="x", pady=(SP["xs"], 0))
         self._mount_pw_var = tk.StringVar()
-        styled_entry(self._mount_pw_frame, textvariable=self._mount_pw_var,
-                     show="●").pack(fill="x")
+        self._mount_pw_entry = styled_entry(pw_row, textvariable=self._mount_pw_var, show="•")
+        self._mount_pw_entry.pack(side="left", fill="x", expand=True)
+        self._mount_pw_entry.bind("<Return>", lambda e: self._do_mount())
+        self._mount_pw_show = FlatButton(
+            pw_row, "Show",
+            lambda: self._toggle_show(self._mount_pw_entry, self._mount_pw_show),
+            primary=False, small=True)
+        self._mount_pw_show.pack(side="left", padx=(SP["s"], 0))
 
         # Shares input (hidden by default)
         self._mount_shares_frame = tk.Frame(parent, bg=C["bg"])
-        tk.Label(self._mount_shares_frame, text="Paste shares (one per line)",
+        tk.Label(self._mount_shares_frame, text="Recovery shares",
+                 font=F["body_b"], bg=C["bg"], fg=C["text"]).pack(anchor="w")
+        tk.Label(self._mount_shares_frame, text="Paste one share per line.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
         self._mount_shares_text = tk.Text(
             self._mount_shares_frame, height=4, wrap="word",
             font=F["mono_s"], bg=C["surface2"], fg=C["text"],
-            relief="flat", insertbackground=C["accent"])
-        self._mount_shares_text.pack(fill="x", pady=(4, 0))
+            relief="flat", insertbackground=C["accent_text"])
+        self._mount_shares_text.pack(fill="x", pady=(SP["xs"], 0))
         bind_context_menu(self._mount_shares_text)
 
-        # Mount button
-        self._mount_btn = FlatButton(parent, "Mount Volume", self._do_mount)
-        self._mount_btn.pack(fill="x", pady=(18, 0))
+        # Progress bar (M24) — packed only while a mount runs
+        self._mount_prog = StagedProgressBar(parent, _MOUNT_STAGES)
 
-        # Status label
+        # Mount button + inline error + status
+        self._mount_btn = FlatButton(parent, f"Mount volume {ICON['arrow']}", self._do_mount)
+        self._mount_btn.pack(fill="x", pady=(SP["l"], 0))
+        self._mount_err = tk.Label(parent, text="", font=F["caption"], bg=C["bg"],
+                                   fg=C["error"], anchor="w", justify="left",
+                                   wraplength=self._WRAP)
+        self._mount_err.pack(fill="x", pady=(SP["s"], 0))
         self._mount_status = tk.Label(parent, text="", font=F["caption"],
-                                       bg=C["bg"], fg=C["text3"])
-        self._mount_status.pack(anchor="w", pady=(8, 0))
+                                      bg=C["bg"], fg=C["text3"], anchor="w",
+                                      wraplength=self._WRAP, justify="left")
+        self._mount_status.pack(fill="x")
 
         # ── Mounted volumes list ──
         self._mounted_list_frame = tk.Frame(parent, bg=C["bg"])
-        self._mounted_list_frame.pack(fill="x", pady=(8, 0))
-        self._refresh_mounted_list()
+        self._mounted_list_frame.pack(fill="x", pady=(SP["s"], 0))
+        self._refresh_mounted_list(force=True)
 
-    def _on_volume_selected(self):
-        """Called when the volume path field changes.
+    def _default_mount_point(self, volume_path: str) -> str:
+        base = os.path.splitext(os.path.basename(volume_path))[0] or "Volume"
+        return os.path.expanduser(os.path.join("~", "QuantaCrypt Volumes", base))
 
-        Auto-detects auth mode from the volume's unencrypted auth params,
-        switches the UI to Password or Shares accordingly, and generates
-        a smart mount-point default from the filename.
-        """
+    def _on_volume_selected(self, show_errors: bool = False):
+        """Volume path changed: detect the unlock mode from the cleartext auth
+        params, show size, and suggest a mount point (without clobbering one
+        the user typed)."""
         path = self._mount_path_var.get().strip()
         if not path or not os.path.isfile(path):
-            self._vol_info_lbl.config(text="")
+            if show_errors and path:
+                self._vol_info_lbl.config(text="That file doesn't exist.", fg=C["error"])
+            else:
+                self._vol_info_lbl.config(text="")
             return
 
         try:
             _header, auth_params = vol.read_volume_auth_params(path)
         except (ValueError, OSError):
-            self._vol_info_lbl.config(text="Not a valid .qcv file", fg=C["error"])
+            if show_errors:
+                self._vol_info_lbl.config(text="Not a valid .qcv file", fg=C["error"])
+            else:
+                self._vol_info_lbl.config(text="")
             return
 
         mode = auth_params.get("mode", "single")
-
-        # File size hint
         try:
-            size_hint = f"  ({fmt_size(os.path.getsize(path))})"
+            size_hint = f"  ·  file on disk {fmt_size(os.path.getsize(path))}"
         except OSError:
             size_hint = ""
 
-        # Auto-switch auth mode toggle
         if mode == "shamir":
             self._mount_auth_var.set("shamir")
             k = auth_params.get("threshold", "?")
@@ -733,62 +1164,78 @@ class VolumeManagerApp(tk.Toplevel):
         else:
             self._mount_auth_var.set("password")
             self._vol_info_lbl.config(
-                text=f"Password-protected volume{size_hint}",
-                fg=C["text3"])
+                text=f"Password-protected volume{size_hint}", fg=C["text3"])
 
-        # Smart mount point from filename (e.g. "Secrets.qcv" → "/Volumes/Secrets")
-        basename = os.path.splitext(os.path.basename(path))[0]
-        if basename:
-            if sys.platform == "darwin":
-                mp = f"/Volumes/{basename}"
-            else:
-                mp = os.path.join("/tmp", f"qcv-{basename}")
-            self._mount_point_var.set(mp)
+        # Q25: suggest ~/QuantaCrypt Volumes/<name>, but only over an empty
+        # field or our own previous suggestion — never over a user edit.
+        current = self._mount_point_var.get().strip()
+        if not current or current == self._auto_mp:
+            self._auto_mp = self._default_mount_point(path)
+            self._mount_point_var.set(self._auto_mp)
 
     def _on_mount_auth_change(self):
-        mode = self._mount_auth_var.get()
-        if mode == "password":
+        if self._mount_auth_var.get() == "password":
             self._mount_shares_frame.pack_forget()
-            self._mount_pw_frame.pack(fill="x", pady=(10, 0))
+            self._mount_pw_frame.pack(fill="x", pady=(SP["s"], 0), after=self._auth_frame)
         else:
             self._mount_pw_frame.pack_forget()
-            self._mount_shares_frame.pack(fill="x", pady=(10, 0))
+            self._mount_shares_frame.pack(fill="x", pady=(SP["s"], 0), after=self._auth_frame)
 
     def _browse_volume(self):
         p = filedialog.askopenfilename(
             title="Select encrypted volume",
             filetypes=[("QuantaCrypt Volume", "*.qcv"), ("All files", "*")],
             initialdir=os.path.expanduser("~"),
+            parent=self,
         )
         if p:
             self._mount_path_var.set(p)
+            self._on_volume_selected(show_errors=True)
+            self._focus_first()
 
     def _browse_mount_point(self):
-        p = filedialog.askdirectory(title="Select mount point")
+        p = filedialog.askdirectory(title="Select mount point", parent=self)
         if p:
             self._mount_point_var.set(p)
 
+    def _fail_mount(self, msg: str, focus: tk.Widget | None = None):
+        self._mount_err.config(text=msg)
+        if focus is not None:
+            focus.focus_set()
+
     def _do_mount(self):
+        if self._busy:
+            return
+        self._mount_err.config(text="")
         vol_path = self._mount_path_var.get().strip()
         mount_point = self._mount_point_var.get().strip()
 
         if not vol_path or not os.path.isfile(vol_path):
-            messagebox.showwarning("Missing volume",
-                                   "Select a valid .qcv file.", parent=self)
+            self._fail_mount("Select a valid .qcv file.", self._mount_path_entry)
             return
         if not mount_point:
-            messagebox.showwarning("Missing mount point",
-                                   "Choose a mount point directory.", parent=self)
+            self._fail_mount("Choose a mount point.", self._mount_point_entry)
             return
-
-        self._mount_btn.enable(False)
-        self._mount_status.config(text="Reading volume…", fg=C["text3"])
 
         # Tk widget reads are not thread-safe — capture credential state on
         # the main thread before handing off to the worker (same pattern as
         # the encryptor/decryptor wizards).
         pw = self._mount_pw_var.get()
         shares_text = self._mount_shares_text.get("1.0", "end").strip()
+        if self._mount_auth_var.get() == "password" and not pw:
+            self._fail_mount("Enter the password.", self._mount_pw_entry)
+            return
+        if self._mount_auth_var.get() == "shamir" and not shares_text:
+            self._fail_mount("Paste your recovery shares.", self._mount_shares_text)
+            return
+
+        self._busy = True
+        self._busy_what = "mount"
+        self._mount_btn.enable(False)
+        self._set_status("", expire=False)
+        self._mount_prog.pack(fill="x", pady=(SP["m"], 0), before=self._mount_btn)
+        self._mount_prog.start()
+        self._mount_prog.advance(0)
 
         # Emergency-save signal handlers can only be installed from the
         # main thread; the mount itself runs on a worker (see fuse_ops
@@ -796,165 +1243,265 @@ class VolumeManagerApp(tk.Toplevel):
         from quantacrypt.core.fuse_ops import install_shutdown_handlers
         install_shutdown_handlers()
 
+        def _stage(i):
+            self._after(lambda: self._mount_prog.advance(i))
+
         def _worker():
             try:
                 # Read unencrypted auth params (no key needed)
                 header, auth_params = vol.read_volume_auth_params(vol_path)
                 mode = auth_params.get("mode", "single")
 
-                # Derive key from credentials + auth params
+                _stage(1)
                 if mode == "single":
                     if not pw:
-                        self.after(0, lambda: self._mount_error("Enter password."))
+                        self._after(lambda: self._mount_error("Enter the password."))
                         return
-                    self.after(0, lambda: self._mount_status.config(
-                        text="Deriving key (this takes a few seconds)…",
-                        fg=C["text3"]))
                     final_key = vol.derive_volume_key_single(pw, auth_params)
                 else:
                     if not shares_text:
-                        self.after(0, lambda: self._mount_error(
+                        self._after(lambda: self._mount_error(
                             "Paste your recovery shares."))
                         return
                     share_lines = [
                         s.strip() for s in shares_text.splitlines() if s.strip()
                     ]
-                    self.after(0, lambda: self._mount_status.config(
-                        text="Recovering key from shares…", fg=C["text3"]))
-                    final_key = vol.derive_volume_key_shamir(
-                        share_lines, auth_params)
+                    final_key = vol.derive_volume_key_shamir(share_lines, auth_params)
 
                 # Mount via FUSE (mount_volume opens the volume internally)
-                self.after(0, lambda: self._mount_status.config(
-                    text="Mounting…", fg=C["text3"]))
+                _stage(2)
                 from quantacrypt.core.fuse_ops import mount_volume
                 fuse_obj = mount_volume(vol_path, final_key, mount_point)
 
                 suspicious = fuse_obj.volume.journal_suspicious
-                self.after(0, lambda: self._on_mount_done(
-                    mount_point, suspicious=suspicious))
+                self._after(lambda: self._on_mount_done(
+                    vol_path, mount_point, auth_params, suspicious=suspicious))
 
             except Exception as e:
-                self.after(0, lambda exc=e: self._mount_error(exc))
+                self._after(lambda exc=e: self._mount_error(exc, mount_point))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_mount_done(self, mount_point: str, suspicious: bool = False):
+    def _end_mount_busy(self):
+        self._busy = False
+        self._busy_what = ""
         self._mount_btn.enable(True)
-        self._mount_status.config(
-            text=f"Mounted at {mount_point}", fg=C["success"])
-        notify("Volume Mounted",
-               f"Encrypted volume mounted at {mount_point}")
-        self._refresh_mounted_list()
-        if suspicious:
-            # open() found a fully-present journal record failing
-            # authentication — the shape of tampering or rollback, not of
-            # a crash.  Warn BEFORE the user writes: the first save
-            # truncates the suspicious tail, destroying the evidence.
-            messagebox.showwarning(
-                "Volume integrity warning",
-                "This volume's change journal ends in data that fails "
-                "authentication.  A crash normally leaves a truncated "
-                "tail, not a complete unreadable record — this pattern "
-                "can indicate tampering or a rollback to an older "
-                "version.\n\n"
-                "The volume was mounted using its last verifiable state. "
-                "If you did not expect this, unmount now and keep a copy "
-                "of the .qcv file before writing anything.",
-                parent=self,
-            )
 
-    def _mount_error(self, msg):
-        self._mount_btn.enable(True)
-        self._mount_status.config(text="", fg=C["text3"])
-        if isinstance(msg, BaseException):
-            msg = friendly_error(msg)
-        messagebox.showerror("Mount failed", msg, parent=self)
+    def _on_mount_done(self, vol_path: str, mount_point: str, auth_params: dict,
+                       suspicious: bool = False):
+        self._mount_prog.complete()
+        self._after(lambda: self._mount_prog.pack_forget(), 1200)
+        self._end_mount_busy()
+        self._mount_pw_var.set("")
+        self._mount_shares_text.delete("1.0", "end")
+        RecentVolumes.add(vol_path, auth_params)
+        self._set_status(f"{ICON['ok']} Mounted at {mount_point}", C["success"])
+        self._refresh_mounted_list(force=True)
+        if not suspicious:
+            notify("Volume Mounted", f"Encrypted volume mounted at {mount_point}")
+            return
+        # open() found a fully-present journal record failing
+        # authentication — the shape of tampering or rollback, not of
+        # a crash.  Warn BEFORE the user writes: the first save
+        # truncates the suspicious tail, destroying the evidence.
+        name = os.path.basename(vol_path)
+        if confirm(
+                self, "This volume may have been altered",
+                f"{name}'s records don't match what QuantaCrypt last wrote — "
+                "it may have been altered or swapped for an older copy. It was "
+                "mounted using the last state that checks out.\n\n"
+                "If you didn't expect this, unmount now and keep a copy of the "
+                ".qcv file before writing anything.",
+                yes="Unmount now", no="Keep mounted", danger=True):
+            self._do_unmount(mount_point, confirmed=True)
 
-    def _do_unmount(self, mount_point: str):
-        """Unmount a specific volume and refresh the list."""
-        try:
-            from quantacrypt.core.fuse_ops import unmount_volume
-            unmount_volume(mount_point)
-            self._mount_status.config(
-                text=f"Unmounted {mount_point}", fg=C["success"])
-        except Exception as e:
-            messagebox.showerror("Unmount failed", friendly_error(e), parent=self)
-        self._refresh_mounted_list()
-
-    @staticmethod
-    def _reveal_path(path: str):
-        """Open a path in the platform file manager."""
-        try:
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", path])
-            elif sys.platform == "win32":
-                subprocess.Popen(["explorer", path])
+    def _mount_error(self, msg, mount_point: str = ""):
+        self._mount_prog.stop()
+        self._mount_prog.pack_forget()
+        self._end_mount_busy()
+        focus = None
+        if isinstance(msg, PermissionError) and mount_point:
+            # Q25: user processes can't create folders under /Volumes on
+            # modern macOS — name the fix instead of "Access denied".
+            name = os.path.basename(mount_point.rstrip("/")) or "<name>"
+            if sys.platform == "darwin" and mount_point.startswith("/Volumes"):
+                msg = ("macOS doesn't let apps create folders in /Volumes. Use a "
+                       "folder in your home directory, e.g. "
+                       f"~/QuantaCrypt Volumes/{name}.")
             else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception:
-            pass
+                msg = (f"Couldn't create the mount point folder at {mount_point} — "
+                       "pick a folder you're allowed to write to.")
+            focus = self._mount_point_entry
+        elif isinstance(msg, BaseException):
+            msg = f"Couldn't mount — {friendly_error(msg)}"
+            if "password" in msg.lower() or "share" in msg.lower():
+                focus = (self._mount_pw_entry if self._mount_auth_var.get() == "password"
+                         else self._mount_shares_text)
+        self._fail_mount(str(msg), focus)
 
-    def _refresh_mounted_list(self):
-        """Rebuild the list of currently mounted volumes."""
-        for w in self._mounted_list_frame.winfo_children():
-            w.destroy()
+    # ── Unmount ──────────────────────────────────────────────────────────────
 
-        from quantacrypt.core.fuse_ops import get_mounted_volumes
-        mounted = get_mounted_volumes()
-        if not mounted:
+    def _do_unmount(self, mount_point: str, *, confirmed: bool = False):
+        """Confirm → unmount on a worker thread → row shows 'Unmounting…'."""
+        if mount_point in self._unmounting:
+            return
+        from quantacrypt.core.fuse_ops import get_mounted_volumes, unmount_volume
+        info = get_mounted_volumes().get(mount_point, {})
+        name = os.path.basename(info.get("volume_path", "")) or os.path.basename(mount_point)
+        if not confirmed and not confirm(
+                self, f"Unmount {name}?",
+                f"Anything still open from {mount_point} may lose unsaved work. "
+                "Close those files first.",
+                yes="Unmount", no="Keep mounted", danger=True):
             return
 
-        rule(self._mounted_list_frame, pady=8)
-        tk.Label(self._mounted_list_frame, text="MOUNTED VOLUMES",
-                 font=F["small"], bg=C["bg"], fg=C["text3"]).pack(
-            anchor="w", pady=(0, 6))
+        self._unmounting.add(mount_point)
+        self._row_notes.pop(mount_point, None)
+        row = self._rows.get(mount_point)
+        if row:
+            self._set_row_busy(row, "Unmounting…")
+
+        def _worker():
+            try:
+                unmount_volume(mount_point)
+                err = None
+            except Exception as e:
+                err = e
+            self._after(lambda: self._on_unmount_done(mount_point, name, err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_unmount_done(self, mount_point: str, name: str, err: BaseException | None):
+        self._unmounting.discard(mount_point)
+        if err is None:
+            self._set_status(f"{ICON['ok']} Unmounted {name}", C["success"])
+            self._empty_note = f"Unmounted {name}."
+            self._refresh_mounted_list(force=True)
+            return
+        detail = friendly_error(err)
+        self._row_notes[mount_point] = (
+            f"{ICON['err']} Couldn't unmount — something is still using it.", C["error"])
+        self._refresh_mounted_list(force=True)
+        self._set_status(f"Couldn't unmount {name}", C["error"])
+        alert(self, f"Couldn't unmount {name}",
+              f"Something is still using {name}. Close any Finder windows or apps "
+              "opened from it, then try Unmount again.\n\n"
+              f"{detail}")
+
+    @staticmethod
+    def _set_row_busy(row: dict, text: str):
+        for b in row["buttons"]:
+            b.enable(False)
+        row["note"].config(text=text, fg=C["text3"])
+        row["note"].pack(anchor="w", pady=(2, 0))
+
+    def _reveal_mount(self, mount_point: str):
+        if not reveal_path(mount_point):
+            self._row_notes[mount_point] = (
+                f"Couldn't open the file manager — it's at {mount_point}", C["warning"])
+            self._refresh_mounted_list(force=True)
+
+    # ── Mounted list ─────────────────────────────────────────────────────────
+
+    def _schedule_refresh(self):
+        self._refresh_job = self.after(self._REFRESH_MS, self._poll_mounted)
+
+    def _poll_mounted(self):
+        self._refresh_job = None
+        if not self.winfo_exists():
+            return
+        try:
+            self._refresh_mounted_list()
+        except Exception:
+            pass
+        self._schedule_refresh()
+
+    @staticmethod
+    def _stats_text(info: dict) -> str:
+        vc = info.get("volume")
+        if vc is None:
+            return ""
+        try:
+            stats = vc.stat()
+        except Exception:
+            return "Size unavailable"
+        parts = []
+        fc = stats.get("file_count", 0)
+        dc = stats.get("dir_count", 0)
+        parts.append(f"{fc} file{'s' if fc != 1 else ''}")
+        if dc:
+            parts.append(f"{dc} folder{'s' if dc != 1 else ''}")
+        parts.append(fmt_size(stats.get("total_plaintext_size", 0)))
+        cs = stats.get("container_size", 0)
+        if cs:
+            parts.append(f"file on disk {fmt_size(cs)}")
+        return "  ·  ".join(parts)
+
+    def _refresh_mounted_list(self, force: bool = False):
+        """Rebuild the mounted-volumes list when the set of mounts changed
+        (external ejects disappear); otherwise just refresh the stats lines
+        so hover/focus on the row buttons is not disturbed."""
+        from quantacrypt.core.fuse_ops import get_mounted_volumes
+        mounted = get_mounted_volumes()
+        key = tuple(sorted(mounted))
+        if not force and key == self._last_mounted_key:
+            for mp, row in self._rows.items():
+                if mp in mounted:
+                    row["stats"].config(text=self._stats_text(mounted[mp]))
+            return
+        self._last_mounted_key = key
+
+        for w in self._mounted_list_frame.winfo_children():
+            w.destroy()
+        self._rows = {}
+
+        section_label(self._mounted_list_frame, "MOUNTED VOLUMES", padx=0)
+        if not mounted:
+            note = self._empty_note
+            self._empty_note = ""
+            tk.Label(self._mounted_list_frame,
+                     text=f"No volumes mounted. {note}".strip(),
+                     font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
+            return
 
         for mp, info in mounted.items():
             vol_name = os.path.basename(info.get("volume_path", "?"))
-            row = tk.Frame(self._mounted_list_frame, bg=C["surface"],
-                           highlightbackground=C["border"],
-                           highlightthickness=1)
-            row.pack(fill="x", pady=(0, 4))
+            inner = card(self._mounted_list_frame, padx=SP["m"], pady=SP["s"])
+            inner.outer.pack(fill="x", pady=(0, SP["xs"]))
 
-            # Top row: name, mount point, buttons
-            inner = tk.Frame(row, bg=C["surface"])
-            inner.pack(fill="x", padx=12, pady=(8, 0))
+            top = tk.Frame(inner, bg=C["surface"])
+            top.pack(fill="x")
+            names = tk.Frame(top, bg=C["surface"])
+            names.pack(side="left", fill="x", expand=True)
+            tk.Label(names, text=vol_name, font=F["body_b"],
+                     bg=C["surface"], fg=C["text"]).pack(anchor="w")
+            tk.Label(names, text=mp, font=F["caption"],
+                     bg=C["surface"], fg=C["text3"]).pack(anchor="w")
 
-            tk.Label(inner, text=vol_name, font=F["caption"],
-                     bg=C["surface"], fg=C["text"]).pack(side="left")
-            tk.Label(inner, text=mp, font=F["small"],
-                     bg=C["surface"], fg=C["text3"]).pack(
-                side="left", padx=(8, 0))
-
-            btn_frame = tk.Frame(inner, bg=C["surface"])
+            btn_frame = tk.Frame(top, bg=C["surface"])
             btn_frame.pack(side="right")
-            FlatButton(btn_frame, "Reveal",
-                       lambda p=mp: self._reveal_path(p),
-                       primary=False, small=True).pack(side="left", padx=(0, 4))
-            FlatButton(btn_frame, "Unmount",
-                       lambda p=mp: self._do_unmount(p),
-                       primary=False, small=True).pack(side="left")
+            reveal_btn = FlatButton(btn_frame, REVEAL_LABEL,
+                                    lambda p=mp: self._reveal_mount(p),
+                                    primary=False, small=True)
+            reveal_btn.pack(side="left", padx=(0, SP["xs"]))
+            unmount_btn = FlatButton(btn_frame, "Unmount",
+                                     lambda p=mp: self._do_unmount(p),
+                                     primary=False, small=True)
+            unmount_btn.pack(side="left")
 
-            # Stats row: file count, dir count, sizes
-            vc = info.get("volume")
-            if vc is not None:
-                try:
-                    stats = vc.stat()
-                    parts = []
-                    fc = stats.get("file_count", 0)
-                    dc = stats.get("dir_count", 0)
-                    parts.append(f"{fc} file{'s' if fc != 1 else ''}")
-                    if dc:
-                        parts.append(f"{dc} folder{'s' if dc != 1 else ''}")
-                    pt = stats.get("total_plaintext_size", 0)
-                    parts.append(fmt_size(pt))
-                    cs = stats.get("container_size", 0)
-                    if cs:
-                        parts.append(f"container {fmt_size(cs)}")
-                    stats_text = "  ·  ".join(parts)
-                    tk.Label(row, text=stats_text, font=F["small"],
-                             bg=C["surface"], fg=C["text3"]).pack(
-                        anchor="w", padx=12, pady=(2, 8))
-                except Exception:
-                    tk.Frame(row, bg=C["surface"], height=8).pack()
+            stats = tk.Label(inner, text=self._stats_text(info), font=F["small"],
+                             bg=C["surface"], fg=C["text3"])
+            stats.pack(anchor="w", pady=(2, 0))
+            # Row-level feedback (unmount/reveal outcome) lives in the row
+            note = tk.Label(inner, text="", font=F["small"], bg=C["surface"],
+                            fg=C["text3"], wraplength=self._WRAP - SP["xl"],
+                            justify="left")
+
+            row = {"buttons": (reveal_btn, unmount_btn), "stats": stats, "note": note}
+            self._rows[mp] = row
+            if mp in self._unmounting:
+                self._set_row_busy(row, "Unmounting…")
+            elif mp in self._row_notes:
+                text, fg = self._row_notes.pop(mp)
+                note.config(text=text, fg=fg)
+                note.pack(anchor="w", pady=(2, 0))
