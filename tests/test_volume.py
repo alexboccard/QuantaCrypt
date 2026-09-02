@@ -413,12 +413,22 @@ class TestVolumeContainer:
         with pytest.raises(FileNotFoundError):
             open_volume.rename("/nope.txt", "/also-nope.txt")
 
-    def test_rename_to_existing_raises(self, open_volume):
+    def test_rename_to_existing_replaces(self, open_volume):
+        """POSIX rename(2): an existing regular-file destination is
+        atomically replaced (editor atomic-save, macOS ._ sidecars)."""
         vc = open_volume
         vc.write_file("/a.txt", b"a")
         vc.write_file("/b.txt", b"b")
-        with pytest.raises(FileExistsError):
-            vc.rename("/a.txt", "/b.txt")
+        vc.rename("/a.txt", "/b.txt")
+        assert vc.get_entry("/a.txt") is None
+        assert vc.read_file("/b.txt") == b"a"
+
+    def test_rename_onto_directory_raises(self, open_volume):
+        vc = open_volume
+        vc.write_file("/a.txt", b"a")
+        vc.mkdir("/d")
+        with pytest.raises(IsADirectoryError):
+            vc.rename("/a.txt", "/d/")
 
     def test_read_nonexistent_raises(self, open_volume):
         with pytest.raises(FileNotFoundError):
@@ -1096,20 +1106,30 @@ class TestFUSEEdgeCases:
         assert buf is not None
         assert bytes(buf) == b"truncate"
 
-    def test_open_uses_cache(self, fuse_fs):
-        """open() uses cached data when available."""
+    def test_read_uses_chunk_cache(self, fuse_fs):
+        """Reads populate and reuse the chunk-granular LRU cache.
+
+        open() no longer materializes the plaintext (partial-range reads);
+        the first read decrypts the covering chunk and caches it under the
+        vpath+NUL+index key, and a repeat read is served from that entry.
+        """
         fd = fuse_fs.create("/cached.txt", 0o100644)
         fuse_fs.write("/cached.txt", b"cached content", 0, fd)
         fuse_fs.flush("/cached.txt", fd)
         fuse_fs.release("/cached.txt", fd)
 
-        # Data should be in cache from flush
-        assert fuse_fs.cache.get("/cached.txt") is not None
-
-        # Reopen — should hit cache path
+        # Nothing pre-cached, no buffer materialized by open()
         fd2 = fuse_fs.open("/cached.txt", 0)
+        assert "/cached.txt" not in fuse_fs._file_buffers
+        assert fuse_fs.cache.get("/cached.txt\x000") is None
+
         data = fuse_fs.read("/cached.txt", 100, 0, fd2)
         assert data == b"cached content"
+        # Chunk 0 is now cached; a second read returns the same bytes
+        assert fuse_fs.cache.get("/cached.txt\x000") is not None
+        assert fuse_fs.read("/cached.txt", 6, 0, fd2) == b"cached"
+        # Still no whole-file buffer for a read-only consumer
+        assert "/cached.txt" not in fuse_fs._file_buffers
         fuse_fs.release("/cached.txt", fd2)
 
     def test_getattr_reports_buffer_size(self, fuse_fs):
@@ -1444,7 +1464,7 @@ class TestDoubleMountPrevention:
         finally:
             _mounted_volumes.pop(mp, None)
 
-    def test_different_volumes_allowed(self, tmp_dir):
+    def test_different_volumes_allowed(self, tmp_dir, monkeypatch):
         """mount_volume allows mounting different volume files."""
         path1 = os.path.join(tmp_dir, "vol1.qcv")
         path2 = os.path.join(tmp_dir, "vol2.qcv")
@@ -1461,13 +1481,17 @@ class TestDoubleMountPrevention:
             "fuse": None,
         }
         try:
-            # Different volume should not trigger double-mount check
-            # (will fail at FUSE import, which is expected — we just verify
-            # it gets past the double-mount check)
+            # Different volume should not trigger double-mount check — we
+            # only verify it gets PAST that check.  Force the availability
+            # probe to fail deterministically so the test doesn't depend on
+            # whether fusepy / a FUSE backend happens to be installed.
+            import quantacrypt.core.fuse_ops as fops
+            monkeypatch.setattr(
+                fops, "check_fuse_available",
+                lambda: (False, "fusepy is not installed (forced by test)"),
+            )
             key2 = vol.derive_volume_key_single(password, meta2)
             mp2 = os.path.join(tmp_dir, "mnt2")
-            # This will raise RuntimeError from check_fuse_available (no fusepy),
-            # NOT from double-mount prevention
             with pytest.raises(RuntimeError, match="fusepy"):
                 mount_volume(path2, key2, mp2)
         finally:
@@ -1475,6 +1499,19 @@ class TestDoubleMountPrevention:
 
 
 # ── Unmount tests ────────────────────────────────────────────────────────────
+
+def _patched_unmount_subprocess(returncode=0, stderr=""):
+    """Patch subprocess.run for unmount tests — no real mount exists, so the
+    OS unmount tool would (correctly) fail and unmount_volume would refuse
+    to drop tracking.  returncode simulates the tool's exit status."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    return patch(
+        "subprocess.run",
+        return_value=SimpleNamespace(returncode=returncode, stderr=stderr,
+                                     stdout=""),
+    )
+
 
 class TestUnmountVolume:
     """Tests for unmount_volume."""
@@ -1497,7 +1534,8 @@ class TestUnmountVolume:
             "fuse": None,
         }
         assert vc.is_dirty
-        unmount_volume(mp)
+        with _patched_unmount_subprocess():
+            unmount_volume(mp)
         assert not vc.is_dirty
         assert mp not in _mounted_volumes
 
@@ -1528,7 +1566,8 @@ class TestUnmountVolume:
             "fuse": None,
         }
         assert not vc.is_dirty
-        unmount_volume(mp)
+        with _patched_unmount_subprocess():
+            unmount_volume(mp)
         assert mp not in _mounted_volumes
 
     def test_unmount_save_failure_keeps_tracking(self, tmp_dir):
@@ -2377,36 +2416,1194 @@ class TestGracefulShutdown:
         _mounted_volumes.clear()
 
     def test_ensure_shutdown_registers_once(self):
-        """_ensure_shutdown_handlers only registers once."""
+        """_ensure_shutdown_handlers only registers each half once."""
         import quantacrypt.core.fuse_ops as fops
 
-        # Reset the flag
-        original = fops._shutdown_registered
-        fops._shutdown_registered = False
+        orig_atexit = fops._atexit_registered
+        orig_signals = fops._signals_registered
+        fops._atexit_registered = False
+        fops._signals_registered = False
+        try:
+            with patch("quantacrypt.core.fuse_ops.atexit.register") \
+                    as mock_atexit, \
+                 patch("quantacrypt.core.fuse_ops.signal.signal") \
+                    as mock_signal:
+                _ensure_shutdown_handlers()
+                assert mock_atexit.call_count == 1
+                assert mock_signal.call_count == 2  # SIGTERM + SIGINT
 
-        with patch("quantacrypt.core.fuse_ops.atexit.register") as mock_atexit, \
-             patch("quantacrypt.core.fuse_ops.signal.signal"):
-            _ensure_shutdown_handlers()
-            assert mock_atexit.call_count == 1
-
-            # Second call should be a no-op
-            _ensure_shutdown_handlers()
-            assert mock_atexit.call_count == 1
-
-        fops._shutdown_registered = original
+                # Second call should be a no-op for both halves
+                _ensure_shutdown_handlers()
+                assert mock_atexit.call_count == 1
+                assert mock_signal.call_count == 2
+        finally:
+            fops._atexit_registered = orig_atexit
+            fops._signals_registered = orig_signals
 
     def test_ensure_shutdown_handles_non_main_thread(self):
-        """_ensure_shutdown_handlers handles signal error on non-main thread."""
+        """A failed off-main-thread signal install must NOT latch.
+
+        Regression for the review's F-008: the old single flag recorded the
+        worker thread's failed signal.signal() as done, so the GUI (which
+        always mounts on a worker) never got SIGTERM emergency-save
+        handlers.  The signal half must stay pending until a main-thread
+        call succeeds.
+        """
         import quantacrypt.core.fuse_ops as fops
 
-        original = fops._shutdown_registered
-        fops._shutdown_registered = False
+        orig_atexit = fops._atexit_registered
+        orig_signals = fops._signals_registered
+        fops._atexit_registered = False
+        fops._signals_registered = False
+        try:
+            with patch("quantacrypt.core.fuse_ops.atexit.register") \
+                    as mock_atexit, \
+                 patch("quantacrypt.core.fuse_ops.signal.signal",
+                       side_effect=ValueError("not main thread")):
+                # Should not raise even though signal.signal fails
+                _ensure_shutdown_handlers()
+                assert mock_atexit.call_count == 1
+            # atexit half latched; signal half must remain pending
+            assert fops._atexit_registered is True
+            assert fops._signals_registered is False
 
-        with patch("quantacrypt.core.fuse_ops.atexit.register") as mock_atexit, \
-             patch("quantacrypt.core.fuse_ops.signal.signal",
-                   side_effect=ValueError("not main thread")):
-            # Should not raise even though signal.signal fails
-            _ensure_shutdown_handlers()
-            assert mock_atexit.call_count == 1
+            # A later (main-thread) call installs the handlers and latches
+            with patch("quantacrypt.core.fuse_ops.atexit.register") \
+                    as mock_atexit2, \
+                 patch("quantacrypt.core.fuse_ops.signal.signal") \
+                    as mock_signal:
+                fops.install_shutdown_handlers()
+                assert mock_atexit2.call_count == 0  # already registered
+                assert mock_signal.call_count == 2
+            assert fops._signals_registered is True
+        finally:
+            fops._atexit_registered = orig_atexit
+            fops._signals_registered = orig_signals
 
-        fops._shutdown_registered = original
+
+# ── Post-review regression tests (journal crash-safety cluster) ─────────────
+
+class TestJournalCrashSafety:
+    """Regression tests for the review's data-loss cluster: F-004 (saves
+    after a crash-truncated tail must remain reachable), F-008 (tamper-vs-
+    crash classification), F-005 (failed compact must be retryable), and
+    F-006 (delete/rename of persisted paths must not resurrect).  See
+    docs/design/volume-journal-crash-safety-fixes.md."""
+
+    def _open(self, tmp_dir, name="crash.qcv", pw="crash-pw"):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        return path, final_key
+
+    def test_saves_after_truncated_tail_survive_reopen(self, tmp_dir):
+        """F-004: after crash recovery, new saves must truncate the garbage
+        tail and land where replay can reach them — pre-fix they were
+        appended past the garbage and silently lost on every future open."""
+        path, key = self._open(tmp_dir)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/a.txt", b"alpha" * 200)
+        vc.save()
+        vc.write_file("/b.txt", b"beta" * 200)
+        vc.save()
+        # Crash shape: chop 10 bytes off the tail (inside /b's record).
+        with open(path, "r+b") as f:
+            f.truncate(os.path.getsize(path) - 10)
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/a.txt") == b"alpha" * 200
+        assert "/b.txt" not in vc2.dir_index
+        assert vc2.journal_suspicious is False  # truncation == crash shape
+
+        # The save after recovery is what pre-fix versions lost forever.
+        vc2.write_file("/c.txt", b"gamma" * 200)
+        vc2.save()
+
+        vc3 = vol.VolumeContainer(path, key)
+        vc3.open()
+        assert vc3.read_file("/a.txt") == b"alpha" * 200
+        assert vc3.read_file("/c.txt") == b"gamma" * 200
+        assert "/b.txt" not in vc3.dir_index
+
+    def test_complete_record_corruption_flags_suspicious(self, tmp_dir):
+        """F-008: a fully-present journal record that fails auth is the
+        tamper/corruption shape and must be flagged — unlike crash tails,
+        which run out of bytes at EOF."""
+        path, key = self._open(tmp_dir, "tamper.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/a.txt", b"alpha")
+        vc.save()
+        second_record_start = vc._journal_end  # /b's record starts here
+        vc.write_file("/b.txt", b"beta")
+        vc.save()
+        # Flip a byte inside /b's record header ciphertext (record fully
+        # present on disk — auth failure, not truncation).
+        with open(path, "r+b") as f:
+            f.seek(second_record_start + 20)
+            raw = f.read(1)
+            f.seek(second_record_start + 20)
+            f.write(bytes([raw[0] ^ 0xFF]))
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/a.txt") == b"alpha"
+        assert "/b.txt" not in vc2.dir_index
+        assert vc2.journal_suspicious is True
+
+    def test_failed_compact_is_retryable(self, tmp_dir, monkeypatch):
+        """F-005: a compact that fails mid-write (disk full) must leave both
+        disk and memory intact — reads keep working and a retry succeeds.
+        Pre-fix, dir_index offsets were mutated before writing, so the
+        retry copied garbage byte ranges and destroyed the container."""
+        path, key = self._open(tmp_dir, "retry.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/a.txt", b"A" * 5000)
+        vc.write_file("/b.txt", b"B" * 5000)
+        vc.compact()  # both files into the baseline
+        vc.write_file("/c.txt", b"C" * 5000)  # pending in _file_data
+
+        def boom(fd):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(vol.os, "fsync", boom)
+        with pytest.raises(OSError):
+            vc.compact()
+        monkeypatch.undo()
+
+        # In-memory state untouched: reads still resolve the right bytes,
+        # and no partial .tmp is left beside the original.
+        assert vc.read_file("/a.txt") == b"A" * 5000
+        assert not os.path.exists(path + ".tmp")
+
+        # The natural next step — retry — must succeed and preserve all.
+        vc.compact()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/a.txt") == b"A" * 5000
+        assert vc2.read_file("/b.txt") == b"B" * 5000
+        assert vc2.read_file("/c.txt") == b"C" * 5000
+
+    def test_delete_of_persisted_file_stays_deleted(self, tmp_dir):
+        """F-006: edit-then-delete of a path that persists on disk must
+        emit a tombstone — pre-fix both ops were coalesced away and the
+        old file resurrected on remount."""
+        path, key = self._open(tmp_dir, "tombstone.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/x.txt", b"original")
+        vc.save()  # /x persists in the journal
+        vc.write_file("/x.txt", b"edited")
+        vc.delete("/x.txt")
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert "/x.txt" not in vc2.dir_index
+
+    def test_rename_of_persisted_file_leaves_no_ghost(self, tmp_dir):
+        """F-006: edit-then-rename of a persisted path must tombstone the
+        old name — pre-fix remount showed both the new file and a
+        resurrected old one with pre-edit content."""
+        path, key = self._open(tmp_dir, "ghost.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/x.txt", b"original")
+        vc.save()
+        vc.write_file("/x.txt", b"edited")
+        vc.rename("/x.txt", "/y.txt")
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert "/x.txt" not in vc2.dir_index
+        assert vc2.read_file("/y.txt") == b"edited"
+
+    def test_unpersisted_write_delete_still_drops_both(self, tmp_dir):
+        """Coalescing still drops write+delete pairs for paths that never
+        reached disk (no pointless tombstones)."""
+        path, key = self._open(tmp_dir, "droppair.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        size_before = os.path.getsize(path)
+        vc.write_file("/tmp.txt", b"scratch")
+        vc.delete("/tmp.txt")
+        vc.save()
+        assert os.path.getsize(path) == size_before  # nothing emitted
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.dir_index == {}
+
+
+class TestFUSEDurability:
+    """F-001: FUSE flush/fsync must persist to the on-disk journal at the
+    moment the kernel is told data is flushed, not at unmount."""
+
+    def _make(self, tmp_dir):
+        path = os.path.join(tmp_dir, "durable.qcv")
+        meta = vol.create_volume_single(path, "durapw")
+        key = vol.derive_volume_key_single("durapw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, QuantaCryptFUSE(vc)
+
+    def test_flush_persists_to_disk_immediately(self, tmp_dir):
+        path, key, fs = self._make(tmp_dir)
+        fd = fs.create("/doc.txt", 0o100644)
+        fs.write("/doc.txt", b"must survive a crash", 0, fd)
+        fs.flush("/doc.txt", fd)
+        # Simulated crash: no release, no unmount, no save_all_dirty —
+        # a completely fresh container must already see the write.
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/doc.txt") == b"must survive a crash"
+
+    def test_fsync_op_persists(self, tmp_dir):
+        path, key, fs = self._make(tmp_dir)
+        fd = fs.create("/f.txt", 0o100644)
+        fs.write("/f.txt", b"fsynced", 0, fd)
+        assert fs.fsync("/f.txt", 0, fd) == 0
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/f.txt") == b"fsynced"
+
+    def test_unlink_persists_to_disk_immediately(self, tmp_dir):
+        path, key, fs = self._make(tmp_dir)
+        fd = fs.create("/gone.txt", 0o100644)
+        fs.write("/gone.txt", b"data", 0, fd)
+        fs.flush("/gone.txt", fd)
+        fs.release("/gone.txt", fd)
+        fs.unlink("/gone.txt")
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert "/gone.txt" not in vc2.dir_index
+
+    def test_flush_bounds_file_data_memory(self, tmp_dir):
+        """Persisting on flush clears the container's pending-blob dict —
+        pre-fix it retained every blob written during the mount session."""
+        path, key, fs = self._make(tmp_dir)
+        fd = fs.create("/big.bin", 0o100644)
+        fs.write("/big.bin", b"Z" * 100_000, 0, fd)
+        fs.flush("/big.bin", fd)
+        assert fs.volume._file_data == {}
+
+
+class TestFuseOperationsContract:
+    """F-007: fusepy dispatches by *calling* the operations object — only a
+    fuse.Operations subclass survives a real mount (a plain class 'mounts'
+    and then fails every op with EINVAL)."""
+
+    def test_subclasses_fuse_operations(self):
+        fuse = pytest.importorskip("fuse")
+        assert issubclass(QuantaCryptFUSE, fuse.Operations)
+
+    def test_chmod_and_utimens(self, tmp_dir):
+        path = os.path.join(tmp_dir, "attr.qcv")
+        meta = vol.create_volume_single(path, "attrpw")
+        key = vol.derive_volume_key_single("attrpw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fd = fs.create("/m.txt", 0o100644)
+        fs.release("/m.txt", fd)
+        assert fs.chmod("/m.txt", 0o100600) == 0
+        assert fs.getattr("/m.txt")["st_mode"] == 0o100600
+        assert fs.utimens("/m.txt", (1000, 2000)) == 0
+        assert fs.getattr("/m.txt")["st_mtime"] == 2000
+        with pytest.raises(OSError):
+            fs.chmod("/nope.txt", 0o600)
+        with pytest.raises(OSError):
+            fs.utimens("/nope.txt", None)
+
+
+class TestRenameReplaceAndErrno:
+    """F-015 + F-021 regressions, promoted to blockers by the live-mount
+    validation: macOS renames AppleDouble sidecars over existing paths, and
+    errno-less exceptions make fusepy return garbage error values to the
+    kernel (`e.errno > 0` on None → TypeError inside fusepy's wrapper)."""
+
+    def _open(self, tmp_dir, name="rr.qcv", pw="rr-pw"):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, pw)
+        final_key = vol.derive_volume_key_single(pw, meta)
+        return path, final_key
+
+    def test_rename_over_persisted_dest_emits_tombstone(self, tmp_dir):
+        """Replacing a persisted destination must tombstone it, or replay
+        resurrects the old content on the next open (F-006 interaction)."""
+        path, key = self._open(tmp_dir)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/final.txt", b"old-version")
+        vc.save()  # destination persists
+        vc.write_file("/final.txt.tmp", b"new-version")
+        vc.rename("/final.txt.tmp", "/final.txt")
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert "/final.txt.tmp" not in vc2.dir_index
+        assert vc2.read_file("/final.txt") == b"new-version"
+
+    def test_container_exceptions_carry_errno(self, tmp_dir):
+        """Every VolumeContainer refusal must have a real errno for the
+        FUSE layer (fusepy maps OSError to -e.errno)."""
+        path, key = self._open(tmp_dir, "errno.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/f.txt", b"x")
+        vc.mkdir("/d")
+        vc.write_file("/d/child.txt", b"y")
+
+        with pytest.raises(FileNotFoundError) as ei:
+            vc.read_file("/nope")
+        assert ei.value.errno == errno.ENOENT
+        with pytest.raises(IsADirectoryError) as ei:
+            vc.read_file("/d/")
+        assert ei.value.errno == errno.EISDIR
+        with pytest.raises(FileNotFoundError) as ei:
+            vc.delete("/nope")
+        assert ei.value.errno == errno.ENOENT
+        with pytest.raises(OSError) as ei:
+            vc.delete("/d/")
+        assert ei.value.errno == errno.ENOTEMPTY
+        with pytest.raises(FileNotFoundError) as ei:
+            vc.rename("/nope", "/other")
+        assert ei.value.errno == errno.ENOENT
+        with pytest.raises(IsADirectoryError) as ei:
+            vc.rename("/f.txt", "/d/")
+        assert ei.value.errno == errno.EISDIR
+
+    def test_fuse_rename_over_open_dest_drops_stale_buffer(self, tmp_dir):
+        """FUSE rename over an existing path must not leave the replaced
+        destination's old bytes in the buffer/cache layer."""
+        path, key = self._open(tmp_dir, "stale.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fd_b = fs.create("/b.txt", 0o100644)
+        fs.write("/b.txt", b"old-dest", 0, fd_b)
+        fs.flush("/b.txt", fd_b)
+        fs.release("/b.txt", fd_b)
+        fd_a = fs.create("/a.txt", 0o100644)
+        fs.write("/a.txt", b"new-content", 0, fd_a)
+        fs.flush("/a.txt", fd_a)
+        fs.release("/a.txt", fd_a)
+        # Open dest so it has a live buffer, then rename over it.
+        fd = fs.open("/b.txt", os.O_RDONLY)
+        fs.rename("/a.txt", "/b.txt")
+        assert fs.read("/b.txt", 100, 0, fd) == b"new-content"
+
+
+# ── Review run 2 regression tests (Medium+ fix batch) ───────────────────────
+# See docs/design/review-2026-09-medium-fixes.md.
+
+class TestCoalescingReplaySimulation:
+    """F-002: tombstone decisions must simulate on-replay existence, not
+    consult the stale last-save snapshot — a rename of a baseline path in
+    the same batch materializes its destination on replay."""
+
+    def _open(self, tmp_dir, name):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, "coal-pw")
+        key = vol.derive_volume_key_single("coal-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, vc
+
+    def test_baseline_rename_then_write_delete_stays_deleted(self, tmp_dir):
+        # write /x; save; [rename /x→/y; write /y; delete /y]; save
+        path, key, vc = self._open(tmp_dir, "resA.qcv")
+        vc.write_file("/x.txt", b"old content")
+        vc.save()
+        vc.rename("/x.txt", "/y.txt")
+        vc.write_file("/y.txt", b"new content")
+        vc.delete("/y.txt")
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.get_entry("/y.txt") is None, \
+            "deleted file resurrected with renamed-in baseline content"
+        assert vc2.get_entry("/x.txt") is None
+
+    def test_baseline_rename_then_write_rename_leaves_no_ghost(self, tmp_dir):
+        # write /x; save; [rename /x→/y; write /y; rename /y→/z]; save
+        path, key, vc = self._open(tmp_dir, "resB.qcv")
+        vc.write_file("/x.txt", b"old content")
+        vc.save()
+        vc.rename("/x.txt", "/y.txt")
+        vc.write_file("/y.txt", b"new content")
+        vc.rename("/y.txt", "/z.txt")
+        vc.save()
+
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.get_entry("/y.txt") is None, \
+            "intermediate rename destination resurrected on replay"
+        assert vc2.get_entry("/x.txt") is None
+        assert vc2.read_file("/z.txt") == b"new content"
+
+    def test_unpersisted_write_delete_still_drops_both(self, tmp_dir):
+        # Never-persisted pair must still coalesce away (no spurious
+        # tombstones for paths nothing materializes).
+        path, key, vc = self._open(tmp_dir, "resC.qcv")
+        vc.write_file("/tmp.txt", b"scratch")
+        vc.delete("/tmp.txt")
+        assert vc._coalesce_pending_ops() == []
+
+
+class TestDirectoryRename:
+    """F-001: renaming a directory must re-key the whole subtree —
+    previously it failed ENOENT through FUSE, and the naive fix would
+    have orphaned every child."""
+
+    def _open(self, tmp_dir, name):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, "dir-pw")
+        key = vol.derive_volume_key_single("dir-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, vc
+
+    def _populate(self, vc):
+        vc.mkdir("/docs")
+        vc.mkdir("/docs/sub")
+        vc.write_file("/docs/a.txt", b"alpha")
+        vc.write_file("/docs/sub/b.txt", b"beta")
+
+    def test_container_rename_dir_rekeys_subtree(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "dren.qcv")
+        self._populate(vc)
+        vc.rename("/docs", "/papers")  # slash-less, as FUSE passes it
+        assert vc.get_entry("/docs/") is None
+        assert vc.get_entry("/docs/a.txt") is None
+        assert vc.get_entry("/papers/") is not None
+        assert vc.read_file("/papers/a.txt") == b"alpha"
+        assert vc.read_file("/papers/sub/b.txt") == b"beta"
+
+    def test_container_rename_dir_persists_across_reopen(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "drenp.qcv")
+        self._populate(vc)
+        vc.save()
+        vc.rename("/docs", "/papers")
+        vc.save()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.get_entry("/docs/") is None
+        assert vc2.get_entry("/docs/sub/b.txt") is None
+        assert vc2.read_file("/papers/a.txt") == b"alpha"
+        assert vc2.read_file("/papers/sub/b.txt") == b"beta"
+
+    def test_container_rename_dir_slash_suffixed_key(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "drens.qcv")
+        self._populate(vc)
+        vc.rename("/docs/", "/papers/")
+        assert vc.read_file("/papers/a.txt") == b"alpha"
+
+    def test_container_rename_dir_refusals(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "drenr.qcv")
+        self._populate(vc)
+        vc.mkdir("/existing")
+        vc.write_file("/afile.txt", b"x")
+        with pytest.raises(FileExistsError) as ei:
+            vc.rename("/docs", "/existing")
+        assert ei.value.errno == errno.EEXIST
+        with pytest.raises(NotADirectoryError) as ei:
+            vc.rename("/docs", "/afile.txt")
+        assert ei.value.errno == errno.ENOTDIR
+        with pytest.raises(OSError) as ei:
+            vc.rename("/docs", "/docs/inner")
+        assert ei.value.errno == errno.EINVAL
+        # Unchanged after refusals
+        assert vc.read_file("/docs/a.txt") == b"alpha"
+
+    def test_fuse_rename_dir_moves_children_and_buffers(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "drenf.qcv")
+        fs = QuantaCryptFUSE(vc)
+        fs.mkdir("/docs", 0o755)
+        fd = fs.create("/docs/a.txt", 0o100644)
+        fs.write("/docs/a.txt", b"flushed", 0, fd)
+        fs.flush("/docs/a.txt", fd)
+        # Leave a second, dirty-but-unflushed file to prove buffer re-key
+        fd2 = fs.create("/docs/dirty.txt", 0o100644)
+        fs.write("/docs/dirty.txt", b"pending", 0, fd2)
+
+        fs.rename("/docs", "/papers")
+
+        assert "a.txt" in fs.readdir("/papers")
+        with pytest.raises(OSError) as ei:
+            fs.getattr("/docs")
+        assert ei.value.errno == errno.ENOENT
+        # Dirty buffer moved with the directory; flush persists at new path
+        assert "/papers/dirty.txt" in fs._dirty_files
+        assert "/docs/dirty.txt" not in fs._file_buffers
+        fs.flush("/papers/dirty.txt", fd2)
+        fs.release("/papers/dirty.txt", fd2)
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/papers/dirty.txt") == b"pending"
+        assert vc2.read_file("/papers/a.txt") == b"flushed"
+
+    def test_fuse_rename_dir_with_pending_unlink_child_refuses(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "drenu.qcv")
+        fs = QuantaCryptFUSE(vc)
+        fs.mkdir("/docs", 0o755)
+        fd = fs.create("/docs/open.txt", 0o100644)
+        fs.write("/docs/open.txt", b"held", 0, fd)
+        fs.flush("/docs/open.txt", fd)
+        fs.unlink("/docs/open.txt")  # deferred: fd still open
+        with pytest.raises(OSError) as ei:
+            fs.rename("/docs", "/papers")
+        assert ei.value.errno == errno.EBUSY
+        fs.release("/docs/open.txt", fd)
+        fs.rename("/docs", "/papers")  # succeeds once the fd is closed
+
+
+class TestRenameOntoPendingUnlink:
+    """F-005: rename onto a path in _pending_unlink must refuse (EBUSY) —
+    letting it land makes the renamed file invisible, drops its writes,
+    and deletes it when the unlinked file's last fd closes."""
+
+    def _fs(self, tmp_dir):
+        path = os.path.join(tmp_dir, "rpul.qcv")
+        meta = vol.create_volume_single(path, "rpul-pw")
+        key = vol.derive_volume_key_single("rpul-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, QuantaCryptFUSE(vc)
+
+    def test_rename_onto_pending_unlink_dest_refuses(self, tmp_dir):
+        path, key, fs = self._fs(tmp_dir)
+        fd_b = fs.create("/b.txt", 0o100644)
+        fs.write("/b.txt", b"doomed", 0, fd_b)
+        fs.flush("/b.txt", fd_b)
+        fd_a = fs.create("/a.txt", 0o100644)
+        fs.write("/a.txt", b"live data", 0, fd_a)
+        fs.flush("/a.txt", fd_a)
+        fs.release("/a.txt", fd_a)
+
+        fs.unlink("/b.txt")  # deferred: fd_b still open
+        with pytest.raises(OSError) as ei:
+            fs.rename("/a.txt", "/b.txt")
+        assert ei.value.errno == errno.EBUSY
+        # Source untouched by the refusal
+        assert fs.getattr("/a.txt")["st_size"] == len(b"live data")
+
+        # Once the old fd closes the rename proceeds and the file survives
+        fs.release("/b.txt", fd_b)
+        fs.rename("/a.txt", "/b.txt")
+        fd = fs.open("/b.txt", os.O_RDONLY)
+        assert fs.read("/b.txt", 100, 0, fd) == b"live data"
+        fs.release("/b.txt", fd)
+
+
+class TestUnmountResultChecking:
+    """F-007: a failed OS unmount must keep the volume tracked (emergency
+    save + double-mount guard both depend on tracking) and surface the
+    tool's stderr."""
+
+    def test_failed_unmount_keeps_tracking_and_raises(self, tmp_dir):
+        path = os.path.join(tmp_dir, "ufail.qcv")
+        meta = vol.create_volume_single(path, "ufail-pw")
+        key = vol.derive_volume_key_single("ufail-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        mp = os.path.join(tmp_dir, "ufmnt")
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc, "thread": None, "fuse": None,
+        }
+        try:
+            with _patched_unmount_subprocess(returncode=1,
+                                             stderr="Resource busy"):
+                with pytest.raises(RuntimeError, match="Resource busy"):
+                    unmount_volume(mp)
+            assert mp in _mounted_volumes, \
+                "failed unmount must not drop tracking (two-writer hazard)"
+        finally:
+            _mounted_volumes.pop(mp, None)
+
+
+class TestFuseLockReentrancy:
+    """F-017: the FUSE ops lock must be reentrant — a SIGTERM handler
+    running _emergency_save_all on the main thread while that thread
+    already holds the lock (unmount → save_all_dirty) would otherwise
+    self-deadlock."""
+
+    def test_save_all_dirty_reentrant_under_held_lock(self, tmp_dir):
+        path = os.path.join(tmp_dir, "rlock.qcv")
+        meta = vol.create_volume_single(path, "rlock-pw")
+        key = vol.derive_volume_key_single("rlock-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fd = fs.create("/f.txt", 0o100644)
+        fs.write("/f.txt", b"data", 0, fd)
+        with fs._lock:  # simulate signal arriving inside a locked section
+            fs.save_all_dirty()  # deadlocks in <10ms with a plain Lock
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/f.txt") == b"data"
+
+
+class TestReadFileRange:
+    """F-009: read_file_range decrypts only the chunks covering the range
+    and must agree byte-for-byte with read_file."""
+
+    def _volume_with_file(self, tmp_dir, data, name="range.qcv"):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, "range-pw")
+        key = vol.derive_volume_key_single("range-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/big.bin", data)
+        vc.save()
+        return path, key, vc
+
+    def test_ranges_match_full_read(self, tmp_dir):
+        cs = vol.VOLUME_CHUNK_SIZE
+        data = bytes((i * 31 + 7) % 251 for i in range(cs * 2 + 12345))
+        path, key, vc = self._volume_with_file(tmp_dir, data)
+        # Fresh container so the range path reads from disk, not _file_data
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        full = vc2.read_file("/big.bin", verify_hash=True)
+        assert full == data
+        cases = [
+            (0, 10),                      # start of chunk 0
+            (cs - 5, 10),                 # crosses chunk 0→1 boundary
+            (cs, cs),                     # exactly chunk 1
+            (cs + 17, cs + 100),          # unaligned, crosses 1→2
+            (len(data) - 7, 100),         # runs past EOF → truncated
+            (0, len(data)),               # whole file
+        ]
+        for off, size in cases:
+            assert vc2.read_file_range("/big.bin", off, size) == \
+                data[off:off + size], f"range mismatch at {off}+{size}"
+        assert vc2.read_file_range("/big.bin", len(data), 10) == b""
+        assert vc2.read_file_range("/big.bin", len(data) + 99, 1) == b""
+        assert vc2.read_file_range("/big.bin", 0, 0) == b""
+
+    def test_range_from_pending_write_buffer(self, tmp_dir):
+        # Unsaved writes live in _file_data; ranges must read them too.
+        cs = vol.VOLUME_CHUNK_SIZE
+        data = os.urandom(cs + 500)
+        path = os.path.join(tmp_dir, "rangemem.qcv")
+        meta = vol.create_volume_single(path, "range-pw")
+        key = vol.derive_volume_key_single("range-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.write_file("/mem.bin", data)  # NOT saved
+        assert vc.read_file_range("/mem.bin", cs - 3, 10) == data[cs - 3:cs + 7]
+
+    def test_empty_file_range(self, tmp_dir):
+        path, key, vc = self._volume_with_file(tmp_dir, b"", "rempty.qcv")
+        assert vc.read_file_range("/big.bin", 0, 100) == b""
+
+    def test_negative_args_raise(self, tmp_dir):
+        path, key, vc = self._volume_with_file(tmp_dir, b"abc", "rneg.qcv")
+        with pytest.raises(ValueError):
+            vc.read_file_range("/big.bin", -1, 10)
+        with pytest.raises(ValueError):
+            vc.read_file_range("/big.bin", 0, -1)
+
+    def test_missing_and_dir_errno(self, tmp_dir):
+        path, key, vc = self._volume_with_file(tmp_dir, b"abc", "rerr.qcv")
+        vc.mkdir("/d")
+        with pytest.raises(FileNotFoundError) as ei:
+            vc.read_file_range("/nope.bin", 0, 1)
+        assert ei.value.errno == errno.ENOENT
+        with pytest.raises(IsADirectoryError) as ei:
+            vc.read_file_range("/d/", 0, 1)
+        assert ei.value.errno == errno.EISDIR
+
+    def test_corrupt_chunk_detected_only_when_read(self, tmp_dir):
+        cs = vol.VOLUME_CHUNK_SIZE
+        data = os.urandom(cs * 2 + 100)
+        path, key, vc = self._volume_with_file(tmp_dir, data, "rcorrupt.qcv")
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        entry = vc2.get_entry("/big.bin")
+        stride = 8 + cs + 16
+        # Flip a ciphertext byte inside chunk 1
+        abs_off = vc2._data_offset + entry["data_offset"] + stride + 8 + 50
+        with open(path, "r+b") as f:
+            f.seek(abs_off)
+            b = f.read(1)
+            f.seek(abs_off)
+            f.write(bytes([b[0] ^ 0xFF]))
+        # Chunk 0 still reads fine; chunk 1 fails authentication
+        assert vc2.read_file_range("/big.bin", 0, 100) == data[:100]
+        with pytest.raises(ValueError, match="Authentication failed"):
+            vc2.read_file_range("/big.bin", cs + 10, 10)
+
+    def test_fuse_read_cross_chunk_without_buffer(self, tmp_dir):
+        cs = vol.VOLUME_CHUNK_SIZE
+        data = os.urandom(cs + 2048)
+        path, key, vc = self._volume_with_file(tmp_dir, data, "rfuse.qcv")
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        fs = QuantaCryptFUSE(vc2)
+        fd = fs.open("/big.bin", os.O_RDONLY)
+        assert fs.read("/big.bin", 4096, cs - 1000, fd) == \
+            data[cs - 1000:cs - 1000 + 4096]
+        assert "/big.bin" not in fs._file_buffers, \
+            "read-only access must not materialize the whole plaintext"
+        fs.release("/big.bin", fd)
+
+    def test_fuse_first_write_materializes_existing_content(self, tmp_dir):
+        # open() no longer eagerly loads; the first write must, or bytes
+        # outside the written range would be zeroed.
+        data = b"0123456789abcdef"
+        path, key, vc = self._volume_with_file(tmp_dir, data, "rwmat.qcv")
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        fs = QuantaCryptFUSE(vc2)
+        fd = fs.open("/big.bin", os.O_RDWR)
+        fs.write("/big.bin", b"XY", 4, fd)
+        fs.flush("/big.bin", fd)
+        fs.release("/big.bin", fd)
+        vc3 = vol.VolumeContainer(path, key)
+        vc3.open()
+        assert vc3.read_file("/big.bin") == b"0123XY6789abcdef"
+
+
+# ── Run-3 regression tests ──────────────────────────────────────────────────
+# See the "Run 3 addendum" in docs/design/review-2026-09-medium-fixes.md.
+
+class TestSelfRename:
+    """R3 F-002: rename(x, x) on a file must be a POSIX no-op, not a
+    delete-then-crash."""
+
+    def _open(self, tmp_dir, name):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, "self-pw")
+        key = vol.derive_volume_key_single("self-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, vc
+
+    def test_self_rename_baseline_file_is_noop(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "selfb.qcv")
+        vc.write_file("/keep.txt", b"precious")
+        vc.save()
+        pending_before = len(vc._pending_ops)
+        vc.rename("/keep.txt", "/keep.txt")  # must not raise
+        assert len(vc._pending_ops) == pending_before, \
+            "self-rename must not queue any journal op"
+        assert vc.read_file("/keep.txt") == b"precious"
+        vc.save()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/keep.txt") == b"precious"
+
+    def test_self_rename_in_session_write_is_noop(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "selfs.qcv")
+        vc.write_file("/fresh.txt", b"unsaved")
+        vc.rename("/fresh.txt", "/fresh.txt")
+        assert vc.read_file("/fresh.txt") == b"unsaved"
+        vc.save()
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/fresh.txt") == b"unsaved"
+
+    def test_self_rename_dir_is_noop(self, tmp_dir):
+        path, key, vc = self._open(tmp_dir, "selfd.qcv")
+        vc.mkdir("/d")
+        vc.write_file("/d/x.txt", b"x")
+        vc.rename("/d", "/d")
+        assert vc.read_file("/d/x.txt") == b"x"
+
+
+class TestOpenFdRekeyOnRename:
+    """R3 F-003: fd→vpath tracking must follow renames — otherwise
+    unlink-after-rename of an open file bypasses the deferred-unlink
+    machinery and eagerly deletes a live file."""
+
+    def _fs(self, tmp_dir, name):
+        path = os.path.join(tmp_dir, name)
+        meta = vol.create_volume_single(path, "fdrk-pw")
+        key = vol.derive_volume_key_single("fdrk-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, QuantaCryptFUSE(vc)
+
+    def test_unlink_after_rename_defers_while_fd_open(self, tmp_dir):
+        path, key, fs = self._fs(tmp_dir, "fdrk.qcv")
+        fd = fs.create("/a.txt", 0o100644)
+        fs.write("/a.txt", b"still alive", 0, fd)
+        fs.flush("/a.txt", fd)
+        fs.rename("/a.txt", "/b.txt")
+        fs.unlink("/b.txt")  # fd still open → must DEFER, not delete
+        assert "/b.txt" in fs._pending_unlink, \
+            "unlink of a renamed-while-open file must defer to last close"
+        # The live fd keeps its view until release
+        assert fs.read("/b.txt", 100, 0, fd) == b"still alive"
+        fs.release("/b.txt", fd)
+        # Now the deferred delete ran
+        assert fs.volume.get_entry("/b.txt") is None
+
+    def test_second_fd_survives_first_release_after_rename(self, tmp_dir):
+        path, key, fs = self._fs(tmp_dir, "fdrk2.qcv")
+        fd1 = fs.create("/a.txt", 0o100644)
+        fs.write("/a.txt", b"shared view", 0, fd1)
+        fs.flush("/a.txt", fd1)
+        fd2 = fs.open("/a.txt", os.O_RDONLY)
+        fs.rename("/a.txt", "/b.txt")
+        fs.release("/b.txt", fd1)
+        # fd2 is still open on the renamed file: its buffer must survive
+        assert fs.read("/b.txt", 100, 0, fd2) == b"shared view"
+        fs.release("/b.txt", fd2)
+
+    def test_dir_rename_rekeys_child_fds(self, tmp_dir):
+        path, key, fs = self._fs(tmp_dir, "fdrk3.qcv")
+        fs.mkdir("/docs", 0o755)
+        fd = fs.create("/docs/f.txt", 0o100644)
+        fs.write("/docs/f.txt", b"child", 0, fd)
+        fs.flush("/docs/f.txt", fd)
+        fs.rename("/docs", "/papers")
+        fs.unlink("/papers/f.txt")
+        assert "/papers/f.txt" in fs._pending_unlink
+        fs.release("/papers/f.txt", fd)
+        assert fs.volume.get_entry("/papers/f.txt") is None
+
+
+class TestFuseImportGuardsOSError:
+    """R3 F-007: fusepy raises EnvironmentError (OSError), not ImportError,
+    when the package imports but no libfuse backend loads — the guards
+    must survive it and report a helpful message."""
+
+    def _with_fuse_import_raising(self, exc):
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fuse":
+                raise exc
+            return real_import(name, *args, **kwargs)
+
+        return patch("builtins.__import__", side_effect=fake_import)
+
+    def test_check_fuse_available_survives_oserror(self):
+        from quantacrypt.core.fuse_ops import check_fuse_available
+        with self._with_fuse_import_raising(OSError("Unable to find libfuse")):
+            ok, msg = check_fuse_available()
+        assert ok is False
+        assert "libfuse" in msg and "backend" in msg
+
+    def test_check_fuse_components_survives_oserror(self):
+        from quantacrypt.core.fuse_ops import check_fuse_components
+        with self._with_fuse_import_raising(OSError("Unable to find libfuse")):
+            result = check_fuse_components()
+        assert result["fusepy"]["ok"] is False
+        assert "backend" in result["fusepy"]["detail"]
+
+
+# ── Run-4 regression tests ──────────────────────────────────────────────────
+# See the "Run 4 addendum" in docs/design/review-2026-09-medium-fixes.md.
+
+class TestFuseSelfRename:
+    """R4 F-001: FUSE-layer rename(a, a) must not destroy the unflushed
+    write buffer (the container-level guard can't help — the FUSE layer
+    mutated its own state first)."""
+
+    def _fs(self, tmp_dir):
+        path = os.path.join(tmp_dir, "fself.qcv")
+        meta = vol.create_volume_single(path, "fself-pw")
+        key = vol.derive_volume_key_single("fself-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return path, key, QuantaCryptFUSE(vc)
+
+    def test_self_rename_preserves_buffer_and_dirty_flag(self, tmp_dir):
+        path, key, fs = self._fs(tmp_dir)
+        fd = fs.create("/a.txt", 0o100644)
+        fs.write("/a.txt", b"hello world", 0, fd)
+        fs.rename("/a.txt", "/a.txt")
+        assert fs.read("/a.txt", 100, 0, fd) == b"hello world"
+        assert "/a.txt" in fs._dirty_files
+        fs.flush("/a.txt", fd)
+        fs.release("/a.txt", fd)
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.read_file("/a.txt") == b"hello world"
+
+
+class TestRenameOntoSlashlessDir:
+    """R4 F-007: rename(file → existing dir) with the slash-less
+    destination FUSE actually passes must refuse EISDIR — not install
+    durable /d + /d/ twin keys."""
+
+    def test_slashless_dir_dest_raises_eisdir(self, tmp_dir):
+        path = os.path.join(tmp_dir, "twin.qcv")
+        meta = vol.create_volume_single(path, "twin-pw")
+        key = vol.derive_volume_key_single("twin-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        vc.mkdir("/d")
+        vc.write_file("/d/child.txt", b"reachable")
+        vc.write_file("/a.txt", b"x")
+        with pytest.raises(IsADirectoryError) as ei:
+            vc.rename("/a.txt", "/d")
+        assert ei.value.errno == errno.EISDIR
+        # No twin key was created; the namespace is intact
+        assert "/d" not in vc.dir_index
+        assert vc.get_entry("/d/") is not None
+        assert vc.read_file("/d/child.txt") == b"reachable"
+        assert vc.read_file("/a.txt") == b"x"
+
+
+class TestFailedUnmountKeepsPendingUnlink:
+    """R4 F-005: a failed OS unmount leaves the mount serving — the
+    pre-unmount save must NOT apply/clear the unlink-limbo set, or a
+    later flush resurrects deleted files."""
+
+    def test_pending_unlink_survives_failed_unmount(self, tmp_dir):
+        path = os.path.join(tmp_dir, "pu.qcv")
+        meta = vol.create_volume_single(path, "pu-pw")
+        key = vol.derive_volume_key_single("pu-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fd = fs.create("/swap.txt", 0o100644)
+        fs.write("/swap.txt", b"scratch", 0, fd)
+        fs.flush("/swap.txt", fd)
+        fs.unlink("/swap.txt")  # deferred: fd still open
+        assert "/swap.txt" in fs._pending_unlink
+
+        mp = os.path.join(tmp_dir, "pumnt")
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc, "thread": None, "fuse": fs,
+        }
+        try:
+            with _patched_unmount_subprocess(returncode=1, stderr="busy"):
+                with pytest.raises(RuntimeError):
+                    unmount_volume(mp)
+            # Mount still live: the limbo state must be intact so the
+            # deferred delete still happens on last close.
+            assert "/swap.txt" in fs._pending_unlink
+            fs.write("/swap.txt", b"more scratch", 0, fd)
+            fs.flush("/swap.txt", fd)  # must NOT resurrect
+            fs.release("/swap.txt", fd)
+            assert fs.volume.get_entry("/swap.txt") is None
+            vc2 = vol.VolumeContainer(path, key)
+            vc2.open()
+            assert vc2.get_entry("/swap.txt") is None, \
+                "unlinked-while-open file resurrected after failed unmount"
+        finally:
+            _mounted_volumes.pop(mp, None)
+
+    def test_successful_unmount_applies_pending_unlinks(self, tmp_dir):
+        path = os.path.join(tmp_dir, "pu2.qcv")
+        meta = vol.create_volume_single(path, "pu-pw")
+        key = vol.derive_volume_key_single("pu-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fd = fs.create("/swap.txt", 0o100644)
+        fs.write("/swap.txt", b"scratch", 0, fd)
+        fs.flush("/swap.txt", fd)
+        fs.unlink("/swap.txt")
+
+        mp = os.path.join(tmp_dir, "pu2mnt")
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc, "thread": None, "fuse": fs,
+        }
+        with _patched_unmount_subprocess():
+            unmount_volume(mp)
+        assert mp not in _mounted_volumes
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert vc2.get_entry("/swap.txt") is None
+
+
+class TestCrossProcessVolumeLock:
+    """R4 F-006: a mount holds an flock on the <volume>.lock sidecar so a
+    second PROCESS can't become a second writer on the same journal."""
+
+    def test_lock_acquire_and_conflict(self, tmp_dir):
+        import fcntl
+        from quantacrypt.core.fuse_ops import (
+            _acquire_volume_lock, _release_volume_lock, _volume_locks,
+        )
+        vpath = os.path.join(tmp_dir, "locked.qcv")
+        with open(vpath, "wb") as f:
+            f.write(b"stub")
+        fd = _acquire_volume_lock(vpath)
+        try:
+            assert os.path.exists(vpath + ".lock")
+            # A second holder (simulating another process's attempt on the
+            # same file via an independent fd) must fail LOCK_NB.
+            fd2 = os.open(vpath + ".lock", os.O_RDWR)
+            with pytest.raises(OSError):
+                fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(fd2)
+        finally:
+            _volume_locks["__test__"] = fd
+            _release_volume_lock("__test__")
+        # Released: a fresh acquire succeeds
+        fd3 = _acquire_volume_lock(vpath)
+        os.close(fd3)
+
+    def test_second_acquire_raises_runtime_error(self, tmp_dir):
+        from quantacrypt.core.fuse_ops import _acquire_volume_lock
+        vpath = os.path.join(tmp_dir, "locked2.qcv")
+        with open(vpath, "wb") as f:
+            f.write(b"stub")
+        fd = _acquire_volume_lock(vpath)
+        try:
+            with pytest.raises(RuntimeError,
+                               match="mounted by another process"):
+                _acquire_volume_lock(vpath)
+        finally:
+            os.close(fd)
+
+
+# ── Run-5 regression tests ──────────────────────────────────────────────────
+# See the "Run 5 addendum" in docs/design/review-2026-09-medium-fixes.md.
+
+class TestVolumeLockCanonicalization:
+    """R5 F-004: aliased paths to the same volume must contend for the
+    SAME lock file."""
+
+    def test_symlink_alias_contends_on_same_lock(self, tmp_dir):
+        from quantacrypt.core.fuse_ops import _acquire_volume_lock
+        vpath = os.path.join(tmp_dir, "canon.qcv")
+        with open(vpath, "wb") as f:
+            f.write(b"stub")
+        alias = os.path.join(tmp_dir, "alias.qcv")
+        os.symlink(vpath, alias)
+        fd = _acquire_volume_lock(vpath)
+        try:
+            with pytest.raises(RuntimeError,
+                               match="mounted by another process"):
+                _acquire_volume_lock(alias)
+        finally:
+            os.close(fd)
+
+
+class TestDeadMountReaping:
+    """R5 F-007: a mount whose FUSE worker exited (external eject) must be
+    reaped — tracking dropped, flock released — instead of blocking every
+    remount until app restart."""
+
+    def _dead_thread(self):
+        import threading
+        t = threading.Thread(target=lambda: None)
+        t.start()
+        t.join()
+        return t
+
+    def test_get_mounted_volumes_reaps_dead_entries(self, tmp_dir):
+        from quantacrypt.core.fuse_ops import (
+            _acquire_volume_lock, _volume_locks, get_mounted_volumes,
+        )
+        path = os.path.join(tmp_dir, "reap.qcv")
+        meta = vol.create_volume_single(path, "reap-pw")
+        key = vol.derive_volume_key_single("reap-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        mp = os.path.join(tmp_dir, "reapmnt")
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc,
+            "thread": self._dead_thread(), "fuse": None,
+        }
+        _volume_locks[mp] = _acquire_volume_lock(path)
+        try:
+            mounted = get_mounted_volumes()
+            assert mp not in mounted, "dead mount must be reaped"
+            assert mp not in _mounted_volumes
+            assert mp not in _volume_locks
+            # The flock is free again — a remount can proceed
+            fd = _acquire_volume_lock(path)
+            os.close(fd)
+        finally:
+            _mounted_volumes.pop(mp, None)
+
+    def test_live_and_injected_entries_survive_reaping(self, tmp_dir):
+        from quantacrypt.core.fuse_ops import get_mounted_volumes
+        path = os.path.join(tmp_dir, "keep.qcv")
+        meta = vol.create_volume_single(path, "keep-pw")
+        key = vol.derive_volume_key_single("keep-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        mp = os.path.join(tmp_dir, "keepmnt")
+        # thread None = direct API / test injection: liveness unknowable,
+        # must be left alone
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc, "thread": None, "fuse": None,
+        }
+        try:
+            assert mp in get_mounted_volumes()
+        finally:
+            _mounted_volumes.pop(mp, None)
+
+
+class TestUnmountCleanupNotStranded:
+    """R5 F-007 (R2 refinement): apply_pending_unlinks() failing after a
+    successful OS unmount must not strand tracking + flock."""
+
+    def test_tracking_dropped_even_if_unlink_apply_fails(self, tmp_dir):
+        from unittest.mock import MagicMock
+        path = os.path.join(tmp_dir, "strand.qcv")
+        meta = vol.create_volume_single(path, "strand-pw")
+        key = vol.derive_volume_key_single("strand-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        fs = QuantaCryptFUSE(vc)
+        fs.apply_pending_unlinks = MagicMock(
+            side_effect=OSError("disk full"))
+        mp = os.path.join(tmp_dir, "strandmnt")
+        _mounted_volumes[mp] = {
+            "volume_path": path, "volume": vc, "thread": None, "fuse": fs,
+        }
+        try:
+            with _patched_unmount_subprocess():
+                with pytest.raises(OSError, match="disk full"):
+                    unmount_volume(mp)
+            assert mp not in _mounted_volumes, \
+                "cleanup failure must not strand a torn-down mount"
+        finally:
+            _mounted_volumes.pop(mp, None)
+
+
+# ── Run-8 regression test ───────────────────────────────────────────────────
+
+class TestStatfsHostFreeSpace:
+    """R8 F-001: statfs must report the HOST filesystem's free space —
+    the old max(container, 1 GB) − plaintext formula collapsed to ~zero
+    free once a volume held ≈1 GB, and Finder then refused all copies."""
+
+    def _fs(self, tmp_dir):
+        path = os.path.join(tmp_dir, "sfs.qcv")
+        meta = vol.create_volume_single(path, "sfs-pw")
+        key = vol.derive_volume_key_single("sfs-pw", meta)
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        return QuantaCryptFUSE(vc)
+
+    def test_free_space_tracks_host_not_container(self, tmp_dir):
+        fs = self._fs(tmp_dir)
+        st = fs.statfs("/")
+        host = os.statvfs(tmp_dir)
+        host_free = host.f_bavail * host.f_frsize
+        reported_free = st["f_bavail"] * st["f_frsize"]
+        # Within 5% of the live host value (disk churns between calls)
+        assert abs(reported_free - host_free) < max(host_free * 0.05, 1 << 26)
+        assert st["f_blocks"] >= st["f_bavail"]
+
+    def test_large_volume_does_not_collapse_to_zero_free(self, tmp_dir, monkeypatch):
+        fs = self._fs(tmp_dir)
+        # Simulate a volume already holding 2 GB of plaintext
+        monkeypatch.setattr(fs.volume, "stat", lambda: {
+            "container_size": 2 << 30, "total_plaintext_size": 2 << 30,
+            "file_count": 10, "dir_count": 1,
+        })
+        st = fs.statfs("/")
+        free_bytes = st["f_bavail"] * st["f_frsize"]
+        assert free_bytes > 1 << 30, \
+            "a large volume must not advertise a full disk"

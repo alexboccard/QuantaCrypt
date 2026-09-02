@@ -101,9 +101,16 @@ keyframe scans, archive tools seeking the central directory, etc.).
 
 ## Status
 
-Not implemented. This is the biggest remaining FUSE-latency item; it
-requires a new public method on `VolumeContainer` and a non-trivial
-rework of `QuantaCryptFUSE.open()` / `read()` / `write()` behaviour. We
-keep the existing eager-open path for now — RAM is bounded at one file
-at a time and the full-buffer approach is measurably correct across all
-current tests.
+Implemented 2026-09-01 (review finding F-009). Deviations from the design
+above:
+
+- `VolumeContainer.read_file_range()` exploits the deterministic chunk
+  stride (`8 + chunk_size + 16` for every non-last chunk) to seek straight
+  to a chunk instead of walking headers.
+- The chunk LRU key is `f"{vpath}\x00{chunk_index}"` (NUL can't appear in a
+  validated vpath), so a path's — or a renamed directory subtree's — cached
+  chunks are droppable with one `invalidate_prefix` call.
+- `write()` (not `open()`) does the lazy full-plaintext materialization,
+  exactly as designed; `truncate()` already did.
+- Chunk-granular *write-back* remains out of scope (needs a journal record
+  that can patch ranges — a format rev).

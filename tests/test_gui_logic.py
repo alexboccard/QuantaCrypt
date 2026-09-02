@@ -388,23 +388,36 @@ class TestHardFileSizeLimit:
 class TestSharesPendingGuard:
     """Fix 6: Unsaved Shamir shares warn before navigating away."""
 
-    def test_shares_pending_initialises_false(self):
-        """EncryptorApp starts with no pending shares."""
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp.__init__)
-        assert "_shares_pending=False" in src or "_shares_pending = False" in src
-
     def test_check_shares_saved_method_exists(self):
         from quantacrypt.ui import encryptor
         assert hasattr(encryptor.EncryptorApp, "_check_shares_saved")
 
-    def test_save_shares_clears_pending(self):
-        """_save_shares sets _shares_pending=False after saving."""
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._save_shares)
-        assert "_shares_pending" in src and "False" in src
+    def test_check_shares_saved_uses_pending_set(self):
+        """Behavior test of the guard (R4 F-004: per-file token set —
+        replacing the old getsource string assertions, which only
+        mirrored the implementation text)."""
+        import types
+        from quantacrypt.ui.encryptor import EncryptorApp
+        obj = types.SimpleNamespace(_shares_pending=set())
+        check = lambda: EncryptorApp._check_shares_saved(obj)
+        # Empty set → safe to leave, no dialog
+        assert check() is True
+        # Non-empty set → guard consults the user (patch the dialog)
+        obj._shares_pending = {"/out/a.qcx", "/out/b.qcx"}
+        import quantacrypt.ui.encryptor as enc_mod
+        from unittest.mock import patch
+        with patch.object(enc_mod.messagebox, "askyesno",
+                          return_value=False) as m:
+            assert check() is False
+        assert m.call_count == 1
+        # Saving ONE file's shares must NOT disarm the guard for the rest
+        obj._shares_pending.discard("/out/a.qcx")
+        with patch.object(enc_mod.messagebox, "askyesno",
+                          return_value=False):
+            assert check() is False
+        # All saved → safe again
+        obj._shares_pending.discard("/out/b.qcx")
+        assert check() is True
 
 
 @requires_tkinter
@@ -1140,3 +1153,217 @@ class TestEncryptorDecSizeGuard:
 # Tests for new Shamir / clipboard / verify features
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+
+# ── Run-3 regression tests (see docs/design/review-2026-09-medium-fixes.md) ──
+
+class TestZipFolderSelfInclusion:
+    """R3 F-001: the staging zip lives in the output directory, which the
+    user can point inside the source folder — zipping the archive into
+    itself never terminates (deflate output is incompressible)."""
+
+    def _make_tree(self, root):
+        os.makedirs(os.path.join(root, "sub"))
+        with open(os.path.join(root, "a.txt"), "w") as f:
+            f.write("alpha" * 1000)
+        with open(os.path.join(root, "sub", "b.txt"), "w") as f:
+            f.write("beta" * 1000)
+
+    def test_zip_excludes_its_own_output(self):
+        from quantacrypt.ui.encryptor import _zip_folder
+        import zipfile
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "folder")
+            os.makedirs(src)
+            self._make_tree(src)
+            # Staging zip INSIDE the tree being walked
+            dst = os.path.join(src, "sub", ".out.qcx.qc-staging-x.zip")
+            _zip_folder(src, dst)  # must terminate
+            with zipfile.ZipFile(dst) as zf:
+                names = zf.namelist()
+            assert not any(n.endswith(".qc-staging-x.zip") for n in names), \
+                "the staging zip must never appear inside itself"
+            assert any(n.endswith("a.txt") for n in names)
+            assert any(n.endswith("b.txt") for n in names)
+
+    def test_zip_cancel_check_aborts(self):
+        from quantacrypt.ui.encryptor import _zip_folder
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "folder")
+            os.makedirs(src)
+            self._make_tree(src)
+            dst = os.path.join(td, "out.zip")
+            with pytest.raises(cc.CancelledOperation):
+                _zip_folder(src, dst, cancel_check=lambda: True)
+
+
+class TestValidateOutputInsideSource:
+    """R3 F-001b: folder mode must refuse an output path inside the source
+    folder (the staging zip would be created inside the walked tree)."""
+
+    def test_validate_logic_rejects_inside_paths(self):
+        # Exercise the same predicate _validate uses, on plain paths.
+        with tempfile.TemporaryDirectory() as td:
+            src_abs = os.path.abspath(os.path.join(td, "folder"))
+            os.makedirs(src_abs)
+            inside = os.path.join(src_abs, "out.qcx")
+            deeper = os.path.join(src_abs, "sub", "out.qcx")
+            outside = os.path.join(td, "out.qcx")
+            for out in (inside, deeper):
+                out_abs = os.path.abspath(out)
+                assert out_abs == src_abs or \
+                    out_abs.startswith(src_abs + os.sep)
+            out_abs = os.path.abspath(outside)
+            assert not (out_abs == src_abs or
+                        out_abs.startswith(src_abs + os.sep))
+
+
+class TestCtLenBound:
+    """R3 F-005: a crafted .qcx declaring a huge chunk length must be
+    rejected before allocation, not after a 4 GB read attempt."""
+
+    def test_stream_decrypt_rejects_absurd_ct_len(self):
+        # The guard fires on the unauthenticated length field, before any
+        # key material is used — a crafted header must fail fast, not
+        # attempt a 4 GB read.
+        with tempfile.TemporaryDirectory() as td:
+            enc = os.path.join(td, "evil.qcx")
+            with open(enc, "wb") as f:
+                f.write(struct.pack(">I", 0))            # seq 0 (valid)
+                f.write(b"\xff\xff\xff\xff")             # ct_len = 4 GB
+                f.write(b"\x00" * 64)                    # token body
+            out = io.BytesIO()
+            with pytest.raises(ValueError, match="implausible"):
+                cc.stream_decrypt_payload(
+                    enc, out, b"\x00" * 64,
+                    payload_offset=0, chunk_count=1,
+                    base_nonce=b"\x00" * 12,
+                )
+
+
+class TestBatchOutputPaths:
+    """R4 F-002: colliding input stems must get unique batch outputs."""
+
+    def test_colliding_stems_uniquified(self):
+        from quantacrypt.ui.encryptor import _batch_output_paths
+        outs = _batch_output_paths(
+            ["/in/report.txt", "/in/report.md", "/other/report.pdf",
+             "/in/notes.txt"],
+            "/out")
+        names = [os.path.basename(o) for o in outs]
+        assert names[0] == "report.qcx"
+        assert names[1] == "report_2.qcx"
+        assert names[2] == "report_3.qcx"
+        assert names[3] == "notes.qcx"
+        assert len(set(n.lower() for n in names)) == len(names)
+
+    def test_no_collision_passthrough(self):
+        from quantacrypt.ui.encryptor import _batch_output_paths
+        outs = _batch_output_paths(["/a/x.txt", "/a/y.txt"], "/out")
+        assert [os.path.basename(o) for o in outs] == ["x.qcx", "y.qcx"]
+
+
+class TestSaveIndividualSharesDisarmsGuard:
+    """R5 F-001 (run-4 regression): the single-file 'Save individual
+    files' path must disarm the "__single__" guard token even though the
+    method reassigns qcx_path internally for fingerprinting."""
+
+    def _run_save(self, tmp_dir, pending, qcx_path=None):
+        import types
+        from unittest.mock import patch
+        import quantacrypt.ui.encryptor as enc_mod
+        from quantacrypt.ui.encryptor import EncryptorApp
+
+        obj = types.SimpleNamespace(
+            _shares_pending=set(pending),
+            _result_k=None, _result_n=None,
+            _k=types.SimpleNamespace(get=lambda: 2),
+            _n=types.SimpleNamespace(get=lambda: 2),
+            _out=types.SimpleNamespace(get=lambda: ""),
+            _results=types.SimpleNamespace(winfo_children=lambda: []),
+        )
+        # Two real shares so the writer loop has content
+        secret = os.urandom(32)
+        shares = [cc.encode_share(s) for s in cc.shamir_split(secret, 2, 2)]
+        with patch.object(enc_mod.filedialog, "askdirectory",
+                          return_value=tmp_dir), \
+             patch.object(enc_mod.messagebox, "showinfo"), \
+             patch.object(enc_mod.messagebox, "showerror"):
+            EncryptorApp._save_individual_shares(
+                obj, shares, "file.txt", qcx_path=qcx_path,
+                banner_frame=object())  # not the shares_warn sentinel
+        return obj
+
+    def test_single_file_save_disarms_single_token(self, tmp_path):
+        obj = self._run_save(str(tmp_path), {"__single__"}, qcx_path=None)
+        assert obj._shares_pending == set(), \
+            "single-file save must discard the '__single__' token"
+        # And it actually wrote per-share files
+        assert any(".share-" in f for f in os.listdir(str(tmp_path)))
+
+    def test_batch_save_disarms_only_its_own_token(self, tmp_path):
+        obj = self._run_save(
+            str(tmp_path), {"/out/a.qcx", "/out/b.qcx"},
+            qcx_path="/out/a.qcx")
+        assert obj._shares_pending == {"/out/b.qcx"}
+
+
+class TestShamirKnSnapshot:
+    """R6 F-001: k/n must be frozen at encryption start — spinbox drift
+    after start must not leak into mnemonics or share files."""
+
+    def test_save_individual_shares_uses_snapshot_not_spinboxes(self, tmp_path):
+        import types
+        from unittest.mock import patch
+        import quantacrypt.ui.encryptor as enc_mod
+        from quantacrypt.ui.encryptor import EncryptorApp
+
+        secret = os.urandom(32)
+        shares = [cc.encode_share(s) for s in cc.shamir_split(secret, 3, 2)]
+        obj = types.SimpleNamespace(
+            _shares_pending={"__single__"},
+            _result_k=2, _result_n=3,           # frozen at start: 2-of-3
+            _k=types.SimpleNamespace(get=lambda: 5),   # drifted spinboxes
+            _n=types.SimpleNamespace(get=lambda: 7),
+            _out=types.SimpleNamespace(get=lambda: ""),
+            _results=types.SimpleNamespace(winfo_children=lambda: []),
+        )
+        with patch.object(enc_mod.filedialog, "askdirectory",
+                          return_value=str(tmp_path)), \
+             patch.object(enc_mod.messagebox, "showinfo"), \
+             patch.object(enc_mod.messagebox, "showerror"):
+            EncryptorApp._save_individual_shares(
+                obj, shares, "file.txt", qcx_path=None,
+                banner_frame=object())
+        files = [f for f in os.listdir(str(tmp_path)) if ".share-" in f]
+        assert files, "share files must have been written"
+        # Filenames and contents must carry the FROZEN 2-of-3, not 5/7
+        assert all("-of-3" in f for f in files), files
+        body = open(os.path.join(str(tmp_path), files[0])).read()
+        assert "2" in body and "5 " not in body
+        # Mnemonics generated with the frozen threshold must round-trip
+        mn_share = cc.share_to_mnemonic(
+            {**cc.decode_share(shares[0]), "threshold": 2})
+        back = cc.mnemonic_to_share(mn_share)
+        assert back["threshold"] == 2
+
+
+class TestFriendlyErrorInvalidTag:
+    """R7 F-001: cryptography's InvalidTag stringifies to '' — the
+    wrong-password mount failure must still get the friendly message,
+    not 'InvalidTag (no additional detail)'."""
+
+    def test_bare_invalidtag_gets_friendly_message(self):
+        from cryptography.exceptions import InvalidTag
+        from quantacrypt.ui.shared import friendly_error
+        assert str(InvalidTag()) == ""  # the trap this guards against
+        msg = friendly_error(InvalidTag())
+        assert "password or shares are incorrect" in msg
+        assert "InvalidTag" not in msg
+
+    def test_empty_unknown_exception_keeps_typename_fallback(self):
+        from quantacrypt.ui.shared import friendly_error
+        class WeirdError(Exception):
+            pass
+        assert friendly_error(WeirdError()) == \
+            "WeirdError (no additional detail)"

@@ -52,6 +52,11 @@ HIDDEN = [
     "kyber_py", "kyber_py.kyber",
     "shamirs", "shamirs.shamirs",
     "mnemonic",
+    # fusepy (module name "fuse") must ship in the bundle or the frozen app
+    # can never mount volumes — check_fuse_available() fails permanently and
+    # the in-app pip installer can't run inside a PyInstaller bundle.  The
+    # FUSE *backend* (macFUSE / FUSE-T) is still detected at runtime.
+    "fuse",
     "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
     # tkinterdnd2 must be in hidden imports so PyInstaller collects the
     # package. The native tkdnd/ directory is also bundled via --add-data below

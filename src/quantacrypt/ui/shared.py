@@ -247,8 +247,11 @@ def friendly_error(exc: BaseException) -> str:
 
     # ValueErrors from our own crypto / format code already carry good
     # messages; pass the message through but filter InvalidTag jargon.
+    # cryptography's InvalidTag stringifies to "" — match the TYPE name
+    # too, or the mainline wrong-password mount failure falls through to
+    # the bare "InvalidTag (no additional detail)" fallback.
     msg = str(exc)
-    lower = msg.lower()
+    lower = (msg or type(exc).__name__).lower()
     if "invalidtag" in lower or "authentication" in lower:
         return ("The password or shares are incorrect, or the file has been "
                 "modified since it was encrypted.")

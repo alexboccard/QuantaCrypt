@@ -35,13 +35,41 @@ def _folder_stats(folder):
     return count, total
 
 
-def _zip_folder(folder, dst_path, progress_cb=None):
+def _batch_output_paths(paths, out_dir):
+    """Map each batch input to a UNIQUE <stem>.qcx in out_dir.
+
+    Inputs with colliding stems (report.txt + report.md) must not map to
+    the same output — the second os.replace would silently destroy the
+    first file's ciphertext while both show as succeeded.  Collisions get
+    the decryptor-style _2 suffix.
+    """
+    outs, used = [], set()
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        cand, i = stem, 2
+        while (cand + ".qcx").lower() in used:
+            cand = f"{stem}_{i}"
+            i += 1
+        used.add((cand + ".qcx").lower())
+        outs.append(os.path.join(out_dir, cand + ".qcx"))
+    return outs
+
+
+def _zip_folder(folder, dst_path, progress_cb=None, cancel_check=None):
     """Zip folder into dst_path with paths relative to folder's parent.
 
     The top-level directory name is preserved inside the archive.
     Fires progress_cb(msg) every file.  Returns bytes written.
+    Raises crypto.CancelledOperation when cancel_check() goes true.
     """
+    from quantacrypt.core.crypto import CancelledOperation
     parent = os.path.dirname(os.path.abspath(folder))
+    # The staging zip may live inside the tree being walked (it is created
+    # in the output directory, which the user can point into the source
+    # folder).  Zipping the archive into itself never terminates: deflate
+    # output is incompressible, so the writer stays ahead of the reader
+    # until the disk fills.
+    dst_abs = os.path.abspath(dst_path)
     total_files, _ = _folder_stats(folder)
     done = 0
     with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
@@ -49,7 +77,11 @@ def _zip_folder(folder, dst_path, progress_cb=None):
             dirnames.sort()
             filenames.sort()
             for fn in filenames:
+                if cancel_check and cancel_check():
+                    raise CancelledOperation("Compression cancelled")
                 full = os.path.join(dirpath, fn)
+                if os.path.abspath(full) == dst_abs:
+                    continue
                 arcname = os.path.relpath(full, parent)
                 zf.write(full, arcname)
                 done += 1
@@ -179,7 +211,17 @@ class EncryptorApp(tk.Toplevel):
         self._n=tk.IntVar(value=3); self._k=tk.IntVar(value=2)
         self._pw1v=tk.StringVar(); self._pw2v=tk.StringVar()
         self._embed_dec=tk.BooleanVar(value=False)
-        self._shares_pending=False   # True after Shamir encrypt until shares saved/dismissed
+        # Shamir k/n frozen at encryption start.  The spinboxes stay live
+        # widgets after _freeze()/_thaw(), so re-reading them when writing
+        # mnemonics/share files would bake post-start drift into recovery
+        # material the decryptor then rejects.
+        self._result_k: int | None = None
+        self._result_n: int | None = None
+        # Set of tokens (one per encrypted file with unsaved Shamir shares;
+        # "__single__" in single-file mode).  Empty set = safe to leave.
+        # A set, not a bool: in batch mode each file has its OWN shares,
+        # and saving one file's must not disarm the guard for the rest.
+        self._shares_pending: set = set()
         self._pending_shares=[]
         self._scroll_job=None  # Track pending scroll so _reset can cancel it
         self._busy=False; self._on_close=on_close
@@ -383,8 +425,9 @@ class EncryptorApp(tk.Toplevel):
             font=F["small"], bg=C["bg"], fg=C["text3"], anchor="w")
         self._out_hint.pack(fill="x", padx=P, pady=(4, 0))
 
-        # 5. Embed decryptor — only shown when a binary is available or app is frozen
-        if getattr(sys,"frozen",False) or self._find_dec():
+        # 5. Embed decryptor — only shown when a usable standalone binary
+        # exists (never in frozen builds; see _find_dec)
+        if self._find_dec():
             section_label(b,"5  PORTABLE FILE",padx=P)
             embed_row=tk.Frame(b,bg=C["bg"]); embed_row.pack(fill="x",padx=P)
             self._embed_chk=tk.Checkbutton(
@@ -886,6 +929,15 @@ class EncryptorApp(tk.Toplevel):
             if not self._is_folder and os.path.exists(out) and os.path.samefile(self._path,out):
                 return "Output path is the same as the input — choose a different location"
         except OSError: pass
+        if self._is_folder:
+            # The plaintext staging zip is created in the output directory;
+            # placing the output inside the source tree would zip staging
+            # artifacts into themselves (see _zip_folder) and bloat the
+            # archive with its own output.
+            src_abs = os.path.abspath(self._path)
+            out_abs = os.path.abspath(out)
+            if out_abs == src_abs or out_abs.startswith(src_abs + os.sep):
+                return "Output must be outside the folder being encrypted"
         # Validate output directory exists and is writable
         out_dir = os.path.dirname(os.path.abspath(out)) or "."
         if not os.path.isdir(out_dir):
@@ -903,6 +955,11 @@ class EncryptorApp(tk.Toplevel):
 
     def _start(self):
         if self._busy: return
+        # Starting a new encryption clears the results area — including any
+        # unsaved Shamir share cards from the previous run.  Same guard as
+        # _reset()/_close(); consenting (or having saved) disarms it.
+        if not self._check_shares_saved(): return
+        self._shares_pending = set()
         # Batch mode: encrypt each file individually with the same settings
         if self._src_type.get() == "batch":
             self._start_batch(); return
@@ -955,6 +1012,9 @@ class EncryptorApp(tk.Toplevel):
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
         # Capture all Tk widget state on the main thread before spawning worker
+        # Freeze k/n for every later share-artifact path (see __init__).
+        self._result_k = self._k.get()
+        self._result_n = self._n.get()
         params = {
             "path":      self._path,
             "out":       out,
@@ -976,10 +1036,11 @@ class EncryptorApp(tk.Toplevel):
             self.after(50, lambda: self._cv.yview_moveto(1.0))
             return
         out_dir = self._batch_out_var.get().strip()
-        # Warn about overwrite for any files that would be clobbered
+        # Unique per-input output names (collision-suffixed), then warn
+        # about overwriting anything that already exists on disk.
+        batch_outs = _batch_output_paths(self._batch_paths, out_dir)
         would_overwrite = []
-        for p in self._batch_paths:
-            dest = os.path.join(out_dir, os.path.splitext(os.path.basename(p))[0] + ".qcx")
+        for dest in batch_outs:
             if os.path.exists(dest):
                 would_overwrite.append(os.path.basename(dest))
         if would_overwrite:
@@ -994,8 +1055,11 @@ class EncryptorApp(tk.Toplevel):
         self._prog.start(); self._freeze(); self._wiz.set_step(4)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
+        self._result_k = self._k.get()
+        self._result_n = self._n.get()
         batch_params = {
             "paths":   list(self._batch_paths),
+            "outs":    batch_outs,
             "out_dir": out_dir,
             "mode":    self._mode.get(),
             "pw":      self._pw1v.get(),
@@ -1010,10 +1074,8 @@ class EncryptorApp(tk.Toplevel):
         out_dir = bp["out_dir"]
         succeeded, failed = [], []
         total = len(bp["paths"])
-        for i, path in enumerate(bp["paths"], 1):
+        for i, (path, out) in enumerate(zip(bp["paths"], bp["outs"]), 1):
             orig = os.path.basename(path)
-            stem = os.path.splitext(orig)[0]
-            out  = os.path.join(out_dir, stem + ".qcx")
             tmp  = out + ".tmp"
             self.after(0, self._prog.advance, STAGE_COMPRESS,
                        f"Encrypting file {i} of {total}: {orig}")
@@ -1101,7 +1163,7 @@ class EncryptorApp(tk.Toplevel):
                             highlightbackground=C["warning"], highlightthickness=1)
             warn.pack(fill="x", pady=(8,0))
             w_hdr = tk.Frame(warn, bg=C["surface"]); w_hdr.pack(fill="x", padx=14, pady=(10,4))
-            k = self._k.get()
+            k = self._result_k or self._k.get()
             tk.Label(w_hdr,
                      text=f"Save key shares — {len(files_with_shares)} file{'s' if len(files_with_shares)!=1 else ''} need share distribution",
                      font=F["body_b"], bg=C["surface"], fg=C["warning"]).pack(anchor="w")
@@ -1132,7 +1194,7 @@ class EncryptorApp(tk.Toplevel):
                 for i, sh in enumerate(shares, 1):
                     mn = mnemonics[i-1] if i-1 < len(mnemonics) else None
                     ShareCard(sec, i, sh, mnemonic=mn).pack(fill="x", padx=8, pady=(0,6))
-            self._shares_pending = True
+            self._shares_pending = {op for op, _sh in files_with_shares}
         btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", padx=14, pady=(6,12))
         FlatButton(btn_row, "Encrypt another batch →", self._reset,
                    primary=False, small=True).pack(side="left")
@@ -1160,11 +1222,22 @@ class EncryptorApp(tk.Toplevel):
                 orig        = folder_name + ".zip"
                 self.after(0, self._prog.advance, STAGE_COMPRESS,
                            f"Compressing {folder_name}/…")
-                fd, zip_tmp = tempfile.mkstemp(suffix=".zip")
+                # Stage the plaintext zip next to the OUTPUT file, not in
+                # $TMPDIR: the system temp dir may sit on a different,
+                # unencrypted volume, and a crash mid-encryption would
+                # strand the full plaintext archive there invisibly.  In
+                # the output directory a leftover is at least on the
+                # volume the user chose for the ciphertext, visible next
+                # to the expected result.  mkstemp gives it 0600.
+                fd, zip_tmp = tempfile.mkstemp(
+                    prefix=f".{os.path.basename(out)}.qc-staging-",
+                    suffix=".zip",
+                    dir=os.path.dirname(os.path.abspath(out)) or None)
                 os.close(fd)
                 _zip_folder(p["path"], zip_tmp,
                             progress_cb=lambda msg: self.after(
-                                0, self._prog.advance, STAGE_COMPRESS, msg))
+                                0, self._prog.advance, STAGE_COMPRESS, msg),
+                            cancel_check=self._cancel_event.is_set)
                 src_path = zip_tmp
             else:
                 orig     = os.path.basename(p["path"])
@@ -1229,7 +1302,12 @@ class EncryptorApp(tk.Toplevel):
             p["pw"] = None
 
     def _find_dec(self):
-        if getattr(sys,"frozen",False): return sys.executable
+        # Frozen builds are onedir: sys.executable depends on the adjacent
+        # _internal tree, so embedding it produces a .qcx that can't run
+        # standalone — and appending payload bytes invalidates the arm64
+        # code signature ("killed: 9").  No embed until a dedicated onefile
+        # decryptor artifact exists.
+        if getattr(sys,"frozen",False): return None
         d=os.path.dirname(os.path.abspath(__file__))
         for name in [".quantacrypt-decryptor","quantacrypt-decryptor","quantacrypt"]:
             for base in [d,os.path.join(d,"dist")]:
@@ -1293,9 +1371,10 @@ class EncryptorApp(tk.Toplevel):
         if not shares:
             self.after(50, lambda: self._cv.yview_moveto(1.0))
             return
-        self._shares_pending = True   # guard: warn if user navigates away
+        self._shares_pending = {"__single__"}   # guard: warn if user navigates away
         self._pending_shares = shares  # keep ref for save dialog
-        k=self._k.get(); n=self._n.get()
+        k = self._result_k or self._k.get()
+        n = self._result_n or self._n.get()
         self._shares_warn=tk.Frame(self._results,bg=C["surface"],highlightbackground=C["warning"],highlightthickness=1)
         warn = self._shares_warn
         warn.pack(fill="x",pady=(0,10))
@@ -1386,7 +1465,7 @@ class EncryptorApp(tk.Toplevel):
             try: self.after_cancel(self._scroll_job)
             except Exception: pass
             self._scroll_job = None
-        self._shares_pending=False; self._pending_shares=[]
+        self._shares_pending=set(); self._pending_shares=[]
         self._path=None; self._is_folder=False; self._batch_paths=[]
         self._src_type.set("file")   # restore toggle to File mode
         self._out.delete(0,"end")
@@ -1466,8 +1545,14 @@ class EncryptorApp(tk.Toplevel):
             initialdir=out_dir,
             title="Choose a folder to save individual share files")
         if not folder: return
-        k = self._k.get(); n = self._n.get()
+        k = self._result_k or self._k.get()
+        n = self._result_n or self._n.get()
         stem = os.path.splitext(orig)[0] if orig else "shares"
+        # The pending-guard token must be captured NOW: qcx_path is
+        # reassigned just below for fingerprint purposes, and discarding
+        # the reassigned value would leave the single-file "__single__"
+        # token armed forever.
+        pending_token = qcx_path or "__single__"
         # Compute fingerprint of the .qcx file so recipients can match their share
         if qcx_path is None:
             qcx_path = self._out.get().strip()
@@ -1521,9 +1606,11 @@ class EncryptorApp(tk.Toplevel):
             messagebox.showerror("Save failed",
                 f"Could not write share file:\n{e}\n\n"
                 f"Saved {len(saved)} of {n} files before the error.")
-            if saved: self._shares_pending = False
+            # Partial save: some recipients' files are missing, so this
+            # file's shares stay pending (the leave-guard dialog still
+            # offers "Leave anyway?" as the escape hatch).
             return
-        self._shares_pending = False
+        self._shares_pending.discard(pending_token)
         # Dim ShareCards (single-file mode — they live in self._results directly)
         if banner_frame is getattr(self, "_shares_warn", None):
             try:
@@ -1559,7 +1646,8 @@ class EncryptorApp(tk.Toplevel):
         p=filedialog.asksaveasfilename(initialdir=out_dir,
             initialfile=os.path.splitext(orig)[0]+".shares.txt",defaultextension=".txt")
         if not p: return
-        k=self._k.get(); n=self._n.get()
+        k = self._result_k or self._k.get()
+        n = self._result_n or self._n.get()
         mnemonics = []
         for s in shares:
             try:
@@ -1593,7 +1681,7 @@ class EncryptorApp(tk.Toplevel):
                 f"Could not write shares file:\n{_e}\n\n"
                 "Your shares have NOT been saved. Please try a different location.")
             return
-        self._shares_pending=False   # shares are now saved
+        self._shares_pending.discard("__single__")   # shares are now saved
         # Update the warning banner to confirm save succeeded
         try:
             for w in self._shares_warn.winfo_children(): w.destroy()

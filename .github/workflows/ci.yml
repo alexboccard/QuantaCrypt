@@ -1,0 +1,31 @@
+name: CI
+
+# Release builds (release.yml) only run on v* tags — without this workflow,
+# day-to-day pushes and Dependabot PRs land on master with zero automated
+# testing and the 95% coverage gate is honor-system.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # --cov-fail-under=95 explicitly, rather than trusting pytest-cov to
+      # pick fail_under up from pyproject.toml — the gate must not hinge on
+      # config-discovery behavior.
+      - name: Run tests with coverage gate
+        run: python -m pytest --tb=short -q --cov-fail-under=95

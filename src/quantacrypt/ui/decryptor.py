@@ -1346,6 +1346,13 @@ class DecryptorApp(tk.Toplevel):
                 if seq != 0:
                     raise ValueError(f"First chunk has unexpected sequence number {seq} — file may be corrupt")
                 ct_len = _struct.unpack(">I", f.read(4))[0]
+                # Unauthenticated, attacker-controlled length — bound the
+                # allocation (same guard as stream_decrypt_payload).
+                if ct_len > cc.CHUNK_SIZE + 16:
+                    raise ValueError(
+                        f"Chunk declares an implausible size ({ct_len} "
+                        "bytes) — file may be corrupt"
+                    )
                 ct = f.read(ct_len)
             nonce = cc._chunk_nonce(base_nonce, 0)
             chunk_count = meta["payload_chunk_count"]

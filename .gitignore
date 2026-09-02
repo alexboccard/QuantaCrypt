@@ -54,3 +54,7 @@ weekly-audit-*.md
 *.tmp
 BUG_REPORT.md
 pytest-cache-files-*/
+
+# Code-review working files (finding lists must never reach the public repo)
+.review/
+.review-archive-*/

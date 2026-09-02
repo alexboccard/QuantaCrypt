@@ -24,8 +24,10 @@ nonces, sizes, and content hashes.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
+import logging
 import os
 import secrets
 import struct
@@ -58,6 +60,8 @@ from quantacrypt.core.crypto import (
     _chunk_aad,
 )
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+logger = logging.getLogger(__name__)
 
 # ── Volume constants ────────────────────────────────────────────────────────
 
@@ -287,15 +291,24 @@ def _read_journal_records(
     final_key: bytes,
     start_offset: int,
     end_offset: int,
-) -> list[tuple[dict, int, int]]:
+) -> tuple[list[tuple[dict, int, int]], int, bool]:
     """Read all journal records between *start_offset* and *end_offset*.
 
-    Returns a list of (header_dict, body_offset, body_length) tuples.
-    Stops silently at a truncated or corrupt record — the tail is treated
-    as an incomplete append (crash during save), not an error.
+    Returns ``(records, valid_end, suspicious)``:
+      * *records* — list of (header_dict, body_offset, body_length) tuples.
+      * *valid_end* — absolute offset just past the last valid record: the
+        effective end of the journal.  Appends must resume (and truncate)
+        here, never at raw EOF, or records written after a crash-garbage
+        tail become permanently unreachable to replay.
+      * *suspicious* — True when replay stopped at bytes that do NOT look
+        like a crash-truncated tail.  A crash during save can only leave a
+        record that runs out of bytes at EOF (records are written
+        sequentially, then fsync'd); a fully-present record that fails
+        authentication means corruption or deliberate rollback/tampering.
     """
     aes = AESGCM(derive_aes_key(final_key))
     records: list[tuple[dict, int, int]] = []
+    suspicious = False
     with open(path, "rb") as f:
         f.seek(start_offset)
         pos = start_offset
@@ -308,6 +321,9 @@ def _read_journal_records(
                 break
             ct_len = struct.unpack(">I", raw_len)[0]
             if ct_len < _JOURNAL_MIN_HEADER_CT or ct_len > _JOURNAL_MAX_HEADER_CT:
+                # These 4 bytes were fully present but are not a plausible
+                # record length — garbage where a header should be.
+                suspicious = True
                 break
             ct = f.read(ct_len)
             if len(ct) < ct_len:
@@ -317,25 +333,28 @@ def _read_journal_records(
                 header_plain = aes.decrypt(nonce, ct, aad)
                 header = json.loads(header_plain)
             except Exception:
-                # Truncated / corrupt / wrong-key / record-at-wrong-offset.
-                # The last successful record is the effective end of the
-                # journal; replay stops here.
+                # A complete record failing authentication is not the crash
+                # shape (that runs out of bytes at EOF) — flag it.
+                suspicious = True
                 break
             if not isinstance(header, dict):
+                suspicious = True
                 break
             body_length = int(header.get("body_length", 0))
-            if body_length < 0 or body_length > end_offset - pos:
+            if body_length < 0:
+                suspicious = True
                 break
             body_offset = pos + 12 + 4 + ct_len
             # Skip the body without reading it — blobs are loaded lazily
             # via VolumeContainer._get_blob() at their absolute offsets.
             next_pos = body_offset + body_length
             if next_pos > end_offset:
+                # Body truncated at EOF — the benign crash shape.
                 break
             f.seek(next_pos)
             records.append((header, body_offset, body_length))
             pos = next_pos
-    return records
+    return records, pos, suspicious
 
 
 # ── Per-file chunk encryption (for volume data section) ─────────────────────
@@ -638,6 +657,20 @@ class VolumeContainer:
         # can emit them as journal records in one append.
         self._baseline_size: int = 0
         self._journal_start: int = 0
+        # Absolute offset just past the last VALID journal record.  Appends
+        # seek+truncate here (not EOF) so a crash-garbage tail can never
+        # orphan subsequent saves — replay stops at the first bad record,
+        # so anything written past it would be silently unreachable.
+        self._journal_end: int = 0
+        # True when open() found a complete journal record that failed
+        # authentication — the tamper/corruption shape, as opposed to the
+        # benign run-out-of-bytes-at-EOF crash shape.
+        self.journal_suspicious: bool = False
+        # Paths known to exist on disk (baseline or journal) as of the last
+        # successful open/save/compact.  Coalescing consults this to decide
+        # whether a delete/rename needs a tombstone record: dropping the
+        # record is only safe for paths created purely in-session.
+        self._persisted_paths: set[str] = set()
         self._pending_ops: list[dict] = []
         self._dirty = False
 
@@ -750,8 +783,13 @@ class VolumeContainer:
         # or corrupt tail is treated as an incomplete append (crash during
         # save): we stop replay at the last valid record and the volume
         # remains consistent.
+        self._journal_end = self._journal_start
         if self.header.get("version", 1) >= 2 and self._file_size > self._journal_start:
             self._replay_journal()
+
+        # Everything materialised so far exists on disk; coalescing needs
+        # this snapshot to emit tombstones for later deletes/renames.
+        self._persisted_paths = set(self.dir_index)
 
     def _replay_journal(self) -> None:
         """Apply journal records to the in-memory dir_index.
@@ -760,12 +798,24 @@ class VolumeContainer:
         Each record header is encrypted under ``final_key``; a record whose
         header fails to decrypt (truncated, corrupt, or never fully flushed)
         terminates replay, which is treated as an incomplete append — the
-        container state up to that point is consistent.
+        container state up to that point is consistent.  Records the end of
+        the valid journal in ``_journal_end`` and flags a non-crash-shaped
+        stop (complete record failing auth) via ``journal_suspicious``.
         """
-        records = _read_journal_records(
+        records, valid_end, suspicious = _read_journal_records(
             self.path, self.final_key,
             self._journal_start, self._file_size,
         )
+        self._journal_end = valid_end
+        self.journal_suspicious = suspicious
+        if suspicious:
+            logger.warning(
+                "Volume %s: journal replay stopped at offset %d with %d "
+                "unreadable bytes remaining that do not look like a crash-"
+                "truncated tail — possible corruption or tampering; state "
+                "reverted to the last valid record",
+                self.path, valid_end, self._file_size - valid_end,
+            )
         for header, body_offset, body_length in records:
             op_type = header.get("type")
             vpath = header.get("vpath")
@@ -874,11 +924,16 @@ class VolumeContainer:
         a ``content_hash``, the SHA-256 of the decrypted data is checked
         against it.  A mismatch raises ``ValueError``.
         """
+        # All exceptions here carry an errno: fusepy maps OSError to
+        # -e.errno, and its error wrapper does ``e.errno > 0`` — an
+        # errno-less exception (errno is None) raises TypeError inside
+        # fusepy and returns a garbage error value to the kernel.
         if vpath not in self.dir_index:
-            raise FileNotFoundError(f"No such file in volume: {vpath}")
+            raise FileNotFoundError(
+                errno.ENOENT, f"No such file in volume: {vpath}")
         entry = self.dir_index[vpath]
         if entry.get("type") == "dir":
-            raise IsADirectoryError(f"Is a directory: {vpath}")
+            raise IsADirectoryError(errno.EISDIR, f"Is a directory: {vpath}")
 
         chunk_count = entry.get("chunk_count", 0)
         size = entry.get("size", 0)
@@ -933,6 +988,113 @@ class VolumeContainer:
                 )
 
         return plaintext
+
+    def _get_blob_range(
+        self, vpath: str, entry: dict, start: int, length: int,
+    ) -> bytes:
+        """Return *length* blob bytes at blob-relative *start* for *vpath*."""
+        if vpath in self._file_data:
+            chunk = self._file_data[vpath][start:start + length]
+        else:
+            with open(self.path, "rb") as f:
+                f.seek(self._data_offset + entry.get("data_offset", 0) + start)
+                chunk = f.read(length)
+        if len(chunk) < length:
+            raise ValueError(
+                f"File data for {vpath} is truncated on disk "
+                f"(expected {length} bytes at blob offset {start}, "
+                f"got {len(chunk)})"
+            )
+        return chunk
+
+    def read_file_range(self, vpath: str, offset: int, size: int) -> bytes:
+        """Decrypt and return up to *size* plaintext bytes at *offset*.
+
+        Random access: decrypts only the chunks covering the range —
+        O(range), not O(file size).  Possible because every chunk is an
+        independent AEAD unit at a deterministic blob offset (all non-last
+        chunks carry exactly ``chunk_size`` plaintext, so chunk *i* starts
+        at ``i * (8 + chunk_size + 16)``).  The per-chunk AES-GCM tag and
+        AAD (index + last-flag) authenticate everything returned; the
+        whole-plaintext ``content_hash`` is NOT checked here — use
+        ``read_file(verify_hash=True)`` for an end-to-end scan.
+
+        Reads past EOF return the available bytes (empty at/past EOF),
+        matching read(2) semantics.
+        """
+        if offset < 0 or size < 0:
+            raise ValueError(f"Negative offset/size: {offset}/{size}")
+        if vpath not in self.dir_index:
+            raise FileNotFoundError(
+                errno.ENOENT, f"No such file in volume: {vpath}")
+        entry = self.dir_index[vpath]
+        if entry.get("type") == "dir":
+            raise IsADirectoryError(errno.EISDIR, f"Is a directory: {vpath}")
+
+        chunk_count = entry.get("chunk_count", 0)
+        fsize = entry.get("size", 0)
+        data_length = entry.get("data_length", 0)
+        chunk_size = self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
+
+        # Same tampered-entry bounds check as read_file().
+        if not isinstance(chunk_count, int) or chunk_count < 0:
+            raise ValueError(f"Invalid chunk_count for {vpath}: {chunk_count!r}")
+        max_expected_chunks = (
+            max(1, (fsize + chunk_size - 1) // chunk_size) if fsize else 1
+        )
+        if chunk_count > max_expected_chunks:
+            raise ValueError(
+                f"chunk_count for {vpath} ({chunk_count}) exceeds what "
+                f"{fsize} bytes at chunk_size {chunk_size} would produce "
+                f"(max {max_expected_chunks}) — directory entry may be corrupt"
+            )
+
+        if chunk_count == 0 or size == 0 or offset >= fsize:
+            return b""
+
+        end = min(offset + size, fsize)
+        first = offset // chunk_size
+        last = min(chunk_count - 1, (end - 1) // chunk_size)
+        stride = 8 + chunk_size + 16  # header + ciphertext + GCM tag
+
+        aes_key = derive_aes_key(self.final_key)
+        cipher = AESGCM(aes_key)
+        base_nonce = base64.b64decode(entry["nonce"])
+
+        parts: list[bytes] = []
+        for i in range(first, last + 1):
+            cstart = i * stride
+            clen = stride if i < chunk_count - 1 else data_length - cstart
+            if clen < 8 + 16 or cstart + clen > data_length:
+                raise ValueError(
+                    f"File data for {vpath} is truncated — chunk {i} "
+                    f"does not fit in data_length {data_length}"
+                )
+            chunk = self._get_blob_range(vpath, entry, cstart, clen)
+            seq = struct.unpack_from(">I", chunk, 0)[0]
+            ct_len = struct.unpack_from(">I", chunk, 4)[0]
+            if seq != i:
+                raise ValueError(
+                    f"Chunk sequence mismatch at {i} (got {seq})")
+            if ct_len != len(chunk) - 8:
+                raise ValueError(
+                    f"Chunk {i} length mismatch for {vpath} "
+                    f"({ct_len} vs {len(chunk) - 8})"
+                )
+            nonce = _chunk_nonce(base_nonce, i)
+            aad = _chunk_aad(i, i == chunk_count - 1)
+            try:
+                parts.append(cipher.decrypt(nonce, chunk[8:], aad))
+            except Exception:
+                raise ValueError(
+                    f"Authentication failed on chunk {i} — "
+                    "data may be corrupt or the wrong key was used"
+                )
+            del chunk
+
+        plain = b"".join(parts)
+        rel = offset - first * chunk_size
+        return plain[rel:rel + (end - offset)]
 
     def write_file(self, vpath: str, data: bytes) -> None:
         """Encrypt and store file data in the volume.
@@ -999,7 +1161,7 @@ class VolumeContainer:
         """Remove a file or empty directory from the volume."""
         _validate_vpath(vpath)
         if vpath not in self.dir_index:
-            raise FileNotFoundError(f"No such entry: {vpath}")
+            raise FileNotFoundError(errno.ENOENT, f"No such entry: {vpath}")
         entry = self.dir_index[vpath]
         is_dir = entry.get("type") == "dir"
 
@@ -1007,7 +1169,7 @@ class VolumeContainer:
         if is_dir:
             children = self.list_dir(vpath.rstrip("/"))
             if children:
-                raise OSError(f"Directory not empty: {vpath}")
+                raise OSError(errno.ENOTEMPTY, f"Directory not empty: {vpath}")
 
         del self.dir_index[vpath]
         self._file_data.pop(vpath, None)
@@ -1018,13 +1180,60 @@ class VolumeContainer:
         self._dirty = True
 
     def rename(self, old_path: str, new_path: str) -> None:
-        """Rename a file or directory."""
+        """Rename a file or directory.
+
+        POSIX rename(2) semantics for the destination: an existing regular
+        file is atomically replaced.  This is the editor atomic-save
+        pattern (write tmp, rename tmp → final) and macOS renames its
+        AppleDouble ``._`` sidecars over existing ones — refusing with
+        EEXIST breaks both.  The replaced destination gets a ``delete``
+        pending op so the journal carries a tombstone (see
+        _coalesce_pending_ops: without it, replay resurrects a persisted
+        destination's old content on the next open).
+        """
         _validate_vpath(old_path)
         _validate_vpath(new_path)
         if old_path not in self.dir_index:
-            raise FileNotFoundError(f"No such entry: {old_path}")
-        if new_path in self.dir_index:
-            raise FileExistsError(f"Destination already exists: {new_path}")
+            # Directory sources: dir keys carry a trailing slash, but FUSE
+            # (and most callers) pass slash-less paths.
+            old_dir = old_path if old_path.endswith("/") else old_path + "/"
+            src = self.dir_index.get(old_dir)
+            if src is not None and src.get("type") == "dir":
+                new_dir = new_path if new_path.endswith("/") else new_path + "/"
+                self._rename_dir(old_dir, new_dir)
+                return
+            raise FileNotFoundError(errno.ENOENT, f"No such entry: {old_path}")
+        if self.dir_index[old_path].get("type") == "dir":
+            # Slash-suffixed dir key passed directly.
+            new_dir = new_path if new_path.endswith("/") else new_path + "/"
+            self._rename_dir(old_path, new_dir)
+            return
+        if new_path == old_path:
+            # POSIX no-op success.  Without this guard the destination-
+            # exists branch below deletes the entry (it IS the source),
+            # queues a tombstone, then KeyErrors — permanent loss after
+            # the next save.
+            return
+        if not new_path.endswith("/") and new_path + "/" in self.dir_index:
+            # Directory destinations arrive slash-less from FUSE; without
+            # this check the slash-less lookup below misses the dir entry
+            # and installs a FILE key "/d" alongside the DIR key "/d/" —
+            # durable twin keys that make the dir's children unreachable.
+            raise IsADirectoryError(
+                errno.EISDIR, f"Destination is a directory: {new_path}")
+        dest = self.dir_index.get(new_path)
+        if dest is not None:
+            if dest.get("type") == "dir":
+                # Directory destinations keep the conservative refusal —
+                # subtree semantics are out of scope here (see F-013).
+                raise IsADirectoryError(
+                    errno.EISDIR, f"Destination is a directory: {new_path}")
+            del self.dir_index[new_path]
+            self._file_data.pop(new_path, None)
+            self._pending_ops.append({
+                "type": "delete",
+                "vpath": new_path,
+            })
 
         self.dir_index[new_path] = self.dir_index.pop(old_path)
         if old_path in self._file_data:
@@ -1034,6 +1243,47 @@ class VolumeContainer:
             "vpath": old_path,
             "new_vpath": new_path,
         })
+        self._dirty = True
+
+    def _rename_dir(self, old_dir: str, new_dir: str) -> None:
+        """Rename a directory subtree (both args slash-suffixed).
+
+        Re-keys the dir entry AND every index key under ``old_dir`` —
+        moving only the dir entry would orphan the whole subtree.  Emits
+        one rename pending-op per key: journal replay already handles
+        per-key renames, so no record type or format rev is needed.
+
+        Destination must not exist (EEXIST for a dir, ENOTDIR for a
+        file); dir-over-dir merge semantics are out of scope.  Renaming
+        into the source's own subtree is EINVAL, per rename(2).
+        """
+        if new_dir == old_dir:
+            return  # rename(a, a) is a POSIX no-op success
+        if new_dir.startswith(old_dir):
+            raise OSError(
+                errno.EINVAL,
+                f"Cannot rename {old_dir} into its own subtree {new_dir}")
+        if new_dir.rstrip("/") in self.dir_index:
+            raise NotADirectoryError(
+                errno.ENOTDIR, f"Destination is a file: {new_dir.rstrip('/')}")
+        if new_dir in self.dir_index:
+            raise FileExistsError(
+                errno.EEXIST, f"Destination directory exists: {new_dir}")
+
+        moves = sorted(
+            k for k in self.dir_index
+            if k == old_dir or k.startswith(old_dir)
+        )
+        for k in moves:
+            new_k = new_dir + k[len(old_dir):]
+            self.dir_index[new_k] = self.dir_index.pop(k)
+            if k in self._file_data:
+                self._file_data[new_k] = self._file_data.pop(k)
+            self._pending_ops.append({
+                "type": "rename",
+                "vpath": k,
+                "new_vpath": new_k,
+            })
         self._dirty = True
 
     def get_entry(self, vpath: str) -> dict | None:
@@ -1075,18 +1325,20 @@ class VolumeContainer:
 
         # Heuristic: if the existing journal + our pending ops would push
         # the journal past _JOURNAL_COMPACT_RATIO of the baseline, compact
-        # now so open() stays fast.  Estimate pending journal bytes
-        # optimistically — the exact size is overhead + body length.
-        existing_journal = max(0, self._file_size - self._journal_start)
+        # now so open() stays fast.  Estimate from the coalesced list —
+        # superseded writes and cancelled deletes never hit the journal,
+        # so counting them would bias toward needless compacts.
+        existing_journal = max(0, self._journal_end - self._journal_start)
+        coalesced = self._coalesce_pending_ops()
         pending_body_bytes = sum(
             len(self._file_data.get(op["vpath"], b""))
-            for op in self._pending_ops
+            for op in coalesced
             if op["type"] == "write"
         )
         # Rough: each record header is ~250 bytes encrypted (small JSON + 12B
         # nonce + 4B length + 16B tag).  Overestimating here only biases us
         # toward compacting more eagerly, which is fine.
-        pending_overhead = len(self._pending_ops) * 300
+        pending_overhead = len(coalesced) * 300
         total_journal = existing_journal + pending_overhead + pending_body_bytes
         # Only compact if the ratio AND the absolute floor are both exceeded
         # — otherwise small volumes would rewrite themselves on almost every
@@ -1104,7 +1356,7 @@ class VolumeContainer:
             self.compact()
             return
 
-        self._append_journal()
+        self._append_journal(coalesced)
 
     def _coalesce_pending_ops(self) -> list[dict]:
         """Collapse redundant ops before emitting to the journal.
@@ -1116,13 +1368,34 @@ class VolumeContainer:
             would look up an empty blob and get silently dropped, losing
             the data.
           * ``write X`` + ``write X`` → keep only the last.
-          * ``write X`` + ``delete X`` → drop both.
+          * ``write X`` + ``delete X`` → drop both **only if X won't exist
+            on replay anyway**.  If X persists on disk (baseline or an
+            earlier save) — or an emitted rename earlier in this batch
+            moves something to X — a ``delete`` tombstone is kept:
+            otherwise replay would resurrect the old X on the next open.
+          * ``write X`` + ``rename X → Y`` where X exists on replay →
+            re-key the write to Y and emit a ``delete X`` tombstone in the
+            rename's place (same resurrection hazard).
           * ``rename X → Y`` where ``X`` is a baseline path (not an
             in-session write) → preserved as a rename record.
+
+        Tombstone decisions consult ``on_disk`` — a simulation of which
+        paths exist *at that point of the replay*, not the stale
+        last-save snapshot.  Emitted renames move names in the simulation
+        and deletes remove them; a rename of a baseline path followed by
+        write+delete of its destination therefore still emits the
+        destination's tombstone, where the snapshot alone would wrongly
+        drop it and replay would resurrect the renamed-in old content.
+        In-session writes are intentionally NOT added to the simulation:
+        their interaction with later ops on the same path goes through
+        ``current_owner``, and a write dropped by a later delete never
+        materializes anything on replay.
 
         Returns the coalesced ops in the order they should be emitted.
         """
         ops = self._pending_ops
+        # Simulated on-replay existence, advanced op by op (see docstring).
+        on_disk = set(self._persisted_paths)
         # Map from "current effective path" → index of the in-session write
         # op that produced that path.  Renames re-key this map; deletes
         # remove from it.
@@ -1134,6 +1407,16 @@ class VolumeContainer:
         # from the op's originally-recorded vpath if subsequent renames
         # moved it).
         write_final_path: dict[int, str] = {}
+        # Ops replaced by a different record (rename of a persisted source
+        # whose write was re-keyed → emitted as a delete tombstone instead).
+        converted: dict[int, dict] = {}
+        # Position at which each surviving write is emitted: its own index,
+        # or the index of the LAST rename that re-keyed it.  Emitting a
+        # re-keyed write at its original position would reorder it against
+        # ops that sit between the write and the rename and touch the
+        # destination path (e.g. rename-replace's tombstone for the old
+        # destination) — replay would then delete the fresh content.
+        emit_pos: dict[int, int] = {}
 
         for i, op in enumerate(ops):
             t = op["type"]
@@ -1144,43 +1427,82 @@ class VolumeContainer:
                     dropped.add(current_owner[vp])
                 current_owner[vp] = i
                 write_final_path[i] = vp
+                emit_pos[i] = i
             elif t == "rename":
                 old = op["vpath"]
                 new = op.get("new_vpath")
                 if old in current_owner and isinstance(new, str):
-                    # Re-key an in-session write: rewrite the write's vpath
-                    # and drop the rename record (no baseline file to move).
+                    # Re-key an in-session write to the new path.  If the
+                    # old path exists on replay at this point, replaying
+                    # just the re-keyed write would leave that old entry
+                    # alive — emit a tombstone for it in this slot.
                     idx = current_owner.pop(old)
                     current_owner[new] = idx
                     write_final_path[idx] = new
-                    dropped.add(i)
-                # else: rename operates on a baseline path — emit it as-is
+                    emit_pos[idx] = i
+                    if old in on_disk:
+                        converted[i] = {"type": "delete", "vpath": old}
+                        on_disk.discard(old)
+                    else:
+                        dropped.add(i)
+                else:
+                    # Rename of a baseline path — emitted as-is, which
+                    # moves the name in the replay simulation.
+                    on_disk.discard(old)
+                    if isinstance(new, str):
+                        on_disk.add(new)
             elif t in ("delete", "rmdir"):
                 vp = op["vpath"]
                 if vp in current_owner:
-                    # Cancelling an in-session write — drop both ops.
+                    # The in-session write is cancelled either way; the
+                    # delete record itself is only droppable if nothing
+                    # emitted before it materializes the path on replay.
                     dropped.add(current_owner.pop(vp))
-                    dropped.add(i)
-                # else: delete of a baseline path — emit it as-is
+                    if vp in on_disk:
+                        on_disk.discard(vp)
+                    else:
+                        dropped.add(i)
+                else:
+                    # Delete of a baseline path — emit it as-is.
+                    on_disk.discard(vp)
             # mkdir is emitted as-is; mkdir-then-rmdir coalescing would be
             # a further refinement but is rarely worth complicating.
 
+        # position → surviving write index to emit there
+        writes_at: dict[int, int] = {
+            pos: idx for idx, pos in emit_pos.items() if idx not in dropped
+        }
+
         coalesced: list[dict] = []
         for i, op in enumerate(ops):
-            if i in dropped:
-                continue
-            if op["type"] == "write" and i in write_final_path:
-                final = write_final_path[i]
-                if final != op["vpath"]:
-                    op = {**op, "vpath": final}
-            coalesced.append(op)
+            if i in converted:
+                coalesced.append(converted[i])
+            elif i not in dropped and op["type"] != "write":
+                coalesced.append(op)
+            if i in writes_at:
+                w = ops[writes_at[i]]
+                final = write_final_path[writes_at[i]]
+                if final != w["vpath"]:
+                    w = {**w, "vpath": final}
+                coalesced.append(w)
         return coalesced
 
-    def _append_journal(self) -> None:
-        """Append pending ops as journal records at end-of-file (v2)."""
-        ops = self._coalesce_pending_ops()
+    def _append_journal(self, ops: list[dict] | None = None) -> None:
+        """Append pending ops as journal records at the valid journal end (v2).
+
+        ``ops`` is the already-coalesced list when the caller (save()) has
+        computed it for its size estimate; None coalesces here.
+
+        Seeks to ``_journal_end`` — NOT raw EOF — and truncates first.  Any
+        bytes past the last valid record are a crash-garbage tail; replay
+        stops there forever, so appending after them would make every new
+        record permanently unreachable on the next open.
+        """
+        if ops is None:
+            ops = self._coalesce_pending_ops()
         with open(self.path, "r+b") as f:
-            f.seek(0, 2)  # SEEK_END
+            f.seek(self._journal_end)
+            f.truncate()
             for op in ops:
                 body = b""
                 if op["type"] == "write":
@@ -1202,10 +1524,14 @@ class VolumeContainer:
             f.flush()
             os.fsync(f.fileno())
             self._file_size = f.tell()
+            self._journal_end = self._file_size
 
         self._pending_ops.clear()
         self._file_data.clear()
         self._dirty = False
+        # The journal now reflects dir_index exactly; refresh the snapshot
+        # coalescing uses to decide tombstone emission.
+        self._persisted_paths = set(self.dir_index)
 
     def compact(self) -> None:
         """Rewrite the entire container as a fresh baseline with no journal.
@@ -1215,36 +1541,43 @@ class VolumeContainer:
         "Compact volume" action in the Volume Manager UI) to reclaim space
         that deleted / overwritten files leave in the journal.
 
-        Preserves atomicity via ``.tmp`` + ``os.replace()``.  Memory profile
-        is O(largest file in _file_data) plus a 1 MB sliding window for
-        streaming unmodified blobs from the current container.
-        """
-        # Capture OLD offsets before overwriting them in the dir_index;
-        # we need them to copy unmodified blobs from the current file.
-        old_offsets = {
-            vp: e.get("data_offset", 0)
-            for vp, e in self.dir_index.items()
-            if e.get("type") != "dir"
-        }
-        old_data_offset = self._data_offset
+        Preserves atomicity via ``.tmp`` + ``os.replace()`` — and the
+        in-memory state mirrors that: ``dir_index`` / ``metadata`` / header
+        fields are only committed after the replace succeeds.  A failed
+        compact (disk full is the likely cause — pass 2 needs ~2× the
+        container size) leaves both disk and memory exactly as before, so
+        reads keep working and a retry is safe.  Mutating ``dir_index``
+        offsets up front would poison a retry: it would copy the wrong byte
+        ranges out of the intact original and *successfully* replace it
+        with garbage.
 
-        # Pass 1: update offsets + lengths in dir_index.  For modified files
-        # data_length is already set by write_file; for unmodified ones it
-        # was established at open() and is preserved from the current entry.
+        Memory profile is O(largest file in _file_data) plus a 1 MB sliding
+        window for streaming unmodified blobs from the current container.
+        """
+        # Pass 1: compute new offsets + lengths into FRESH entry dicts —
+        # self.dir_index is not touched until the os.replace() commit point.
+        # For modified files data_length comes from the pending blob; for
+        # unmodified ones it was established at open() and is preserved.
+        new_dir_index: dict[str, dict] = {}
         new_offset = 0
         for vpath in sorted(self.dir_index):
-            entry = self.dir_index[vpath]
+            entry = dict(self.dir_index[vpath])
             if entry.get("type") == "dir":
+                new_dir_index[vpath] = entry
                 continue
             if vpath in self._file_data:
                 entry["data_length"] = len(self._file_data[vpath])
-            length = entry.get("data_length", 0)
             entry["data_offset"] = new_offset
-            new_offset += length
+            new_offset += entry.get("data_length", 0)
+            new_dir_index[vpath] = entry
 
-        # Re-encrypt metadata and directory (cheap; ~KB of JSON)
-        meta_nonce, meta_ct = encrypt_metadata(self.final_key, self.metadata)
-        dir_nonce, dir_ct = encrypt_directory(self.final_key, self.dir_index)
+        # Re-encrypt metadata and directory (cheap; ~KB of JSON).  The
+        # format_version bump happens in the copy that gets encrypted, so
+        # the persisted metadata agrees with the v2 header immediately
+        # after a v1→v2 upgrade — not one compact later.
+        new_metadata = {**self.metadata, "format_version": VOLUME_FORMAT_VERSION}
+        meta_nonce, meta_ct = encrypt_metadata(self.final_key, new_metadata)
+        dir_nonce, dir_ct = encrypt_directory(self.final_key, new_dir_index)
 
         # Pass 2: stream to .tmp.  On disk-full / I/O error the temp file
         # is cleaned up so we never leave a partial .tmp beside the original.
@@ -1262,8 +1595,8 @@ class VolumeContainer:
                 # blobs.  os.replace() below atomically swaps it; any open
                 # descriptor still refers to the old inode until it closes.
                 with open(self.path, "rb") as src_f:
-                    for vpath in sorted(self.dir_index):
-                        entry = self.dir_index[vpath]
+                    for vpath in sorted(new_dir_index):
+                        entry = new_dir_index[vpath]
                         if entry.get("type") == "dir":
                             continue
                         length = entry.get("data_length", 0)
@@ -1272,7 +1605,11 @@ class VolumeContainer:
                         if vpath in self._file_data:
                             tmp_f.write(self._file_data[vpath])
                         else:
-                            src_f.seek(old_data_offset + old_offsets[vpath])
+                            # Old offset still lives untouched in dir_index.
+                            src_f.seek(
+                                self._data_offset
+                                + self.dir_index[vpath].get("data_offset", 0)
+                            )
                             remaining = length
                             while remaining > 0:
                                 chunk = src_f.read(min(remaining, _COPY_CHUNK))
@@ -1294,25 +1631,29 @@ class VolumeContainer:
 
         os.replace(tmp_path, self.path)
 
-        # Update state for continued use.  _file_data is cleared because all
-        # blobs now live canonically on disk at the new offsets; future reads
-        # go through _get_blob() which will seek-read them fresh.  The
-        # journal region is empty post-compact, so _journal_start coincides
-        # with the end of the baseline blobs.
+        # ── Commit point ──  The new container is on disk; only now do we
+        # swap the in-memory state over to describe it.  _file_data is
+        # cleared because all blobs now live canonically on disk at the new
+        # offsets; future reads go through _get_blob() which will seek-read
+        # them fresh.  The journal region is empty post-compact, so
+        # _journal_start coincides with the end of the baseline blobs.
+        self.dir_index = new_dir_index
+        self.metadata = new_metadata
         self._data_offset = new_data_offset
         self._baseline_size = new_offset  # sum of lengths written above
         self._journal_start = new_data_offset + new_offset
+        self._journal_end = self._journal_start
         # Re-stat to pick up the new file size for bounds checks.
         self._file_size = os.path.getsize(self.path)
         self.header["meta_nonce"] = meta_nonce
         self.header["dir_nonce"] = dir_nonce
-        # Keep the header version in sync with what _compact actually wrote
+        # Keep the header version in sync with what compact actually wrote
         # (v1 containers are upgraded to v2 on first save via this path).
         self.header["version"] = VOLUME_FORMAT_VERSION
-        self.metadata["format_version"] = VOLUME_FORMAT_VERSION
         self._pending_ops.clear()
         self._file_data.clear()
         self._dirty = False
+        self._persisted_paths = set(self.dir_index)
 
     def stat(self) -> dict:
         """Return volume statistics."""

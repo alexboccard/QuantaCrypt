@@ -348,6 +348,14 @@ def stream_decrypt_payload(
             if len(ct_len_raw) < 4:
                 raise ValueError("File appears truncated — chunk header incomplete")
             ct_len = int.from_bytes(ct_len_raw, "big")
+            # The length field is attacker-controlled and unauthenticated
+            # at this point: bound it before allocating, or a crafted
+            # header requests a 4 GB read ahead of any GCM tag check.
+            if ct_len > CHUNK_SIZE + 16:
+                raise ValueError(
+                    f"Chunk {i} declares an implausible size ({ct_len} "
+                    f"bytes) — file may be corrupt"
+                )
             ct     = src.read(ct_len)
             if len(ct) < ct_len:
                 raise ValueError("File appears truncated — chunk data incomplete")

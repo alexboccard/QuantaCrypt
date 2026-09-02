@@ -224,6 +224,53 @@ class VolumeManagerApp(tk.Toplevel):
                                    parent=self)
             return
 
+        # create_volume_* opens the path with "wb" — immediate truncation.
+        # The Browse dialog confirms overwrites, but a typed path gets no
+        # check, and neither path knows about live mounts.
+        try:
+            from quantacrypt.core.fuse_ops import get_mounted_volumes
+            real = os.path.realpath(path)
+            for mp, info in get_mounted_volumes().items():
+                if os.path.realpath(info.get("volume_path", "")) == real:
+                    messagebox.showerror(
+                        "Volume is mounted",
+                        f"That volume is currently mounted at {mp}.\n\n"
+                        "Creating over a mounted volume would destroy it. "
+                        "Unmount it first.",
+                        parent=self)
+                    return
+        except Exception:
+            pass  # fuse_ops unavailable → nothing can be mounted
+        if os.path.exists(path):
+            # The in-process check above can't see another app instance or
+            # a script: probe the cross-process mount flock too (acquired
+            # and immediately released — creation itself is guarded by the
+            # overwrite prompt below).
+            try:
+                from quantacrypt.core.fuse_ops import _acquire_volume_lock
+                probe_fd = _acquire_volume_lock(path)
+                os.close(probe_fd)
+            except RuntimeError:
+                messagebox.showerror(
+                    "Volume is mounted",
+                    "That volume appears to be mounted by another "
+                    "QuantaCrypt process.\n\n"
+                    "Creating over a mounted volume would destroy it. "
+                    "Unmount it there first.",
+                    parent=self)
+                return
+            except Exception:
+                pass  # probe unavailable → fall through to the prompt
+        if os.path.exists(path):
+            if not messagebox.askyesno(
+                    "Overwrite volume?",
+                    f"{os.path.basename(path)} already exists.\n\n"
+                    "Creating a new volume here will PERMANENTLY destroy "
+                    "the existing one — its contents cannot be recovered.\n\n"
+                    "Overwrite it?",
+                    icon="warning", default="no", parent=self):
+                return
+
         auth = self._auth_var.get()
 
         if auth == "password":
@@ -428,12 +475,19 @@ class VolumeManagerApp(tk.Toplevel):
                         btn_frame, install_label,
                         lambda: self._install_fuse_backend(),
                         small=True)
+                    btn.pack(side="left")
+                elif getattr(sys, "frozen", False):
+                    # In a PyInstaller bundle sys.executable IS the GUI app —
+                    # "-m pip" would just respawn QuantaCrypt.  fusepy ships
+                    # inside the bundle, so a missing import means the
+                    # install is broken, not incomplete.
+                    hint = "fusepy ships with the app — reinstall QuantaCrypt to restore it."
                 else:
                     btn = FlatButton(
                         btn_frame, install_label,
                         lambda c=install_cmd, k=key: self._run_install(c, k),
                         small=True)
-                btn.pack(side="left")
+                    btn.pack(side="left")
 
                 hint_lbl = tk.Label(btn_frame, text=hint, font=F["caption"],
                                      bg=C["surface"], fg=C["text3"])
@@ -730,6 +784,18 @@ class VolumeManagerApp(tk.Toplevel):
         self._mount_btn.enable(False)
         self._mount_status.config(text="Reading volume…", fg=C["text3"])
 
+        # Tk widget reads are not thread-safe — capture credential state on
+        # the main thread before handing off to the worker (same pattern as
+        # the encryptor/decryptor wizards).
+        pw = self._mount_pw_var.get()
+        shares_text = self._mount_shares_text.get("1.0", "end").strip()
+
+        # Emergency-save signal handlers can only be installed from the
+        # main thread; the mount itself runs on a worker (see fuse_ops
+        # _ensure_shutdown_handlers for why the worker's attempt can't).
+        from quantacrypt.core.fuse_ops import install_shutdown_handlers
+        install_shutdown_handlers()
+
         def _worker():
             try:
                 # Read unencrypted auth params (no key needed)
@@ -738,7 +804,6 @@ class VolumeManagerApp(tk.Toplevel):
 
                 # Derive key from credentials + auth params
                 if mode == "single":
-                    pw = self._mount_pw_var.get()
                     if not pw:
                         self.after(0, lambda: self._mount_error("Enter password."))
                         return
@@ -747,7 +812,6 @@ class VolumeManagerApp(tk.Toplevel):
                         fg=C["text3"]))
                     final_key = vol.derive_volume_key_single(pw, auth_params)
                 else:
-                    shares_text = self._mount_shares_text.get("1.0", "end").strip()
                     if not shares_text:
                         self.after(0, lambda: self._mount_error(
                             "Paste your recovery shares."))
@@ -764,22 +828,41 @@ class VolumeManagerApp(tk.Toplevel):
                 self.after(0, lambda: self._mount_status.config(
                     text="Mounting…", fg=C["text3"]))
                 from quantacrypt.core.fuse_ops import mount_volume
-                mount_volume(vol_path, final_key, mount_point)
+                fuse_obj = mount_volume(vol_path, final_key, mount_point)
 
-                self.after(0, lambda: self._on_mount_done(mount_point))
+                suspicious = fuse_obj.volume.journal_suspicious
+                self.after(0, lambda: self._on_mount_done(
+                    mount_point, suspicious=suspicious))
 
             except Exception as e:
                 self.after(0, lambda exc=e: self._mount_error(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_mount_done(self, mount_point: str):
+    def _on_mount_done(self, mount_point: str, suspicious: bool = False):
         self._mount_btn.enable(True)
         self._mount_status.config(
             text=f"Mounted at {mount_point}", fg=C["success"])
         notify("Volume Mounted",
                f"Encrypted volume mounted at {mount_point}")
         self._refresh_mounted_list()
+        if suspicious:
+            # open() found a fully-present journal record failing
+            # authentication — the shape of tampering or rollback, not of
+            # a crash.  Warn BEFORE the user writes: the first save
+            # truncates the suspicious tail, destroying the evidence.
+            messagebox.showwarning(
+                "Volume integrity warning",
+                "This volume's change journal ends in data that fails "
+                "authentication.  A crash normally leaves a truncated "
+                "tail, not a complete unreadable record — this pattern "
+                "can indicate tampering or a rollback to an older "
+                "version.\n\n"
+                "The volume was mounted using its last verifiable state. "
+                "If you did not expect this, unmount now and keep a copy "
+                "of the .qcv file before writing anything.",
+                parent=self,
+            )
 
     def _mount_error(self, msg):
         self._mount_btn.enable(True)

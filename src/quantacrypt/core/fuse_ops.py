@@ -28,17 +28,45 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from quantacrypt.core.volume import VolumeContainer
+from quantacrypt.core.volume import VOLUME_CHUNK_SIZE, VolumeContainer
 
 
 # ── FUSE availability check ─────────────────────────────────────────────────
+
+def _prepare_fuse_environment() -> None:
+    """Point fusepy at FUSE-T's libfuse when nothing else would be found.
+
+    fusepy's Darwin loader resolves the library via find_library('fuse')
+    or the FUSE_LIBRARY_PATH env var — it never looks for
+    ``libfuse-t.dylib``, so a FUSE-T-only machine (our recommended
+    install) would fail with "Unable to find libfuse" despite having a
+    working backend.  macFUSE registers itself with find_library, so we
+    only intervene when it is absent.
+    """
+    import sys
+    if sys.platform != "darwin" or os.environ.get("FUSE_LIBRARY_PATH"):
+        return
+    if os.path.isdir("/Library/Filesystems/macfuse.fs"):
+        return
+    for cand in ("/opt/homebrew/lib/libfuse-t.dylib",
+                 "/usr/local/lib/libfuse-t.dylib"):
+        if os.path.isfile(cand):
+            os.environ["FUSE_LIBRARY_PATH"] = cand
+            return
+
 
 def check_fuse_available() -> tuple[bool, str]:
     """Check whether fusepy and a FUSE backend are available.
 
     Returns (available, message).
+
+    fusepy raises ImportError when the package is missing but
+    EnvironmentError (an OSError) when the package imports and no libfuse
+    backend can be loaded — both must be caught or the "helpful error"
+    path itself crashes on machines without a backend.
     """
     try:
+        _prepare_fuse_environment()
         import fuse  # noqa: F401
         return True, "fusepy is available"
     except ImportError:
@@ -46,6 +74,13 @@ def check_fuse_available() -> tuple[bool, str]:
             "fusepy is not installed. Install it with:\n"
             "  pip install fusepy\n\n"
             "You also need a FUSE backend:\n"
+            "  macOS: brew install --cask macfuse  (or brew install fuse-t)\n"
+            "  Linux: sudo apt install libfuse-dev"
+        )
+    except OSError as exc:
+        return False, (
+            f"fusepy is installed but could not load a FUSE backend ({exc}).\n\n"
+            "Install a backend:\n"
             "  macOS: brew install --cask macfuse  (or brew install fuse-t)\n"
             "  Linux: sudo apt install libfuse-dev"
         )
@@ -63,12 +98,19 @@ def check_fuse_components() -> dict[str, dict[str, Any]]:
 
     result: dict[str, dict[str, Any]] = {}
 
-    # 1. fusepy Python package
+    # 1. fusepy Python package (OSError = installed but backend unloadable;
+    # see check_fuse_available)
     try:
+        _prepare_fuse_environment()
         import fuse  # noqa: F401
         result["fusepy"] = {"ok": True, "detail": "fusepy is installed"}
     except ImportError:
         result["fusepy"] = {"ok": False, "detail": "fusepy is not installed"}
+    except OSError as exc:
+        result["fusepy"] = {
+            "ok": False,
+            "detail": f"fusepy cannot load a FUSE backend: {exc}",
+        }
 
     # 2. System FUSE backend
     if sys.platform == "darwin":
@@ -144,6 +186,12 @@ class LRUCache:
             self._current_bytes -= self._sizes.pop(key, 0)
             del self._cache[key]
 
+    def invalidate_prefix(self, prefix: str) -> None:
+        """Drop every entry whose key starts with ``prefix`` (dir renames)."""
+        for key in [k for k in self._cache if k.startswith(prefix)]:
+            self._current_bytes -= self._sizes.pop(key, 0)
+            del self._cache[key]
+
     def clear(self) -> None:
         self._cache.clear()
         self._sizes.clear()
@@ -159,7 +207,26 @@ class LRUCache:
 
 # ── FUSE Operations ─────────────────────────────────────────────────────────
 
-class QuantaCryptFUSE:
+# fusepy dispatches every kernel op by CALLING the operations object —
+# self.operations('getattr', path, fh) — a protocol only fuse.Operations
+# provides via __call__ (plus sane defaults for the ~20 ops we don't
+# implement).  Subclassing it is therefore mandatory for a real mount to
+# work; a plain class "mounts" fine and then fails every op with EINVAL.
+# The import is guarded so this module (and the direct-call test suite)
+# stays importable when fusepy is absent — mount_volume() re-checks
+# availability before any real mount.
+# OSError too: fusepy raises EnvironmentError at import time when no
+# libfuse backend loads — the module must stay importable on such machines
+# so check_fuse_components can show the guided-setup screen.
+try:
+    _prepare_fuse_environment()
+    from fuse import Operations as _FuseOperations
+except (ImportError, OSError):  # pragma: no cover — dev/CI installs fusepy
+    class _FuseOperations:
+        """Stand-in base so the module imports without fusepy/libfuse."""
+
+
+class QuantaCryptFUSE(_FuseOperations):
     """FUSE filesystem backed by an encrypted .qcv volume.
 
     Implements the fusepy Operations interface. All methods translate
@@ -170,7 +237,12 @@ class QuantaCryptFUSE:
     def __init__(self, volume: VolumeContainer, cache_mb: int = 100):
         self.volume = volume
         self.cache = LRUCache(max_bytes=cache_mb * 1024 * 1024)
-        self._lock = threading.Lock()
+        # RLock, not Lock: SIGTERM/SIGINT handlers run _emergency_save_all
+        # on the main thread; if the signal lands while the main thread is
+        # already inside save_all_dirty (e.g. via unmount_volume), a plain
+        # Lock would self-deadlock and no volume would get its emergency
+        # save.
+        self._lock = threading.RLock()
         self._fd_counter = 0
         self._open_files: dict[int, str] = {}  # fd → vpath
         self._dirty_files: set[str] = set()
@@ -202,13 +274,27 @@ class QuantaCryptFUSE:
     # ── Filesystem info ─────────────────────────────────────────────────
 
     def statfs(self, path: str) -> dict:
-        """Return filesystem statistics."""
+        """Return filesystem statistics.
+
+        Free space is the HOST filesystem's: the container grows on the
+        host disk, so that is the true bound on what can still be
+        written (the approach gocryptfs/Cryptomator take).  The old
+        ``max(container, 1 GB) − plaintext`` formula collapsed to ~zero
+        free once a volume held ≈1 GB — Finder's free-space pre-flight
+        then refused every copy into the mount — and journal dead space
+        inflated the number after deletes.
+        """
         stats = self.volume.stat()
-        total = max(stats.get("container_size", 1 << 30), 1 << 30)
         used = stats.get("total_plaintext_size", 0)
         bsize = 4096
-        total_blocks = total // bsize
-        free_blocks = max(total_blocks - (used // bsize), 0)
+        try:
+            host = os.statvfs(
+                os.path.dirname(os.path.abspath(self.volume.path)) or "/")
+            host_free = host.f_bavail * host.f_frsize
+        except OSError:
+            host_free = 1 << 40  # host unstat-able: claim 1 TB free
+        total_blocks = (used + host_free) // bsize
+        free_blocks = host_free // bsize
         return {
             "f_bsize": bsize,
             "f_frsize": bsize,
@@ -302,6 +388,7 @@ class QuantaCryptFUSE:
         """Create a directory."""
         with self._lock:
             self.volume.mkdir(self._vpath(path))
+            self._persist_locked()
 
     def rmdir(self, path: str) -> None:
         """Remove an empty directory."""
@@ -311,6 +398,18 @@ class QuantaCryptFUSE:
             if children:
                 raise OSError(errno.ENOTEMPTY, "Directory not empty", path)
             self.volume.delete(dir_vp)
+            self._persist_locked()
+
+    def _persist_locked(self) -> None:
+        """Persist volume state if dirty.  Caller must hold ``_lock``.
+
+        save() is a journal append — O(size of the change) — so calling it
+        on every metadata op and flush is cheap.  Deferring persistence to
+        unmount (the pre-fix behavior) meant a crash, SIGKILL, or power
+        loss silently discarded every write since mount.
+        """
+        if self.volume.is_dirty:
+            self.volume.save()
 
     # ── File operations ─────────────────────────────────────────────────
 
@@ -338,8 +437,27 @@ class QuantaCryptFUSE:
             self._open_files[fd] = vpath
         return fd
 
+    def _chunk_key(self, vpath: str, chunk_index: int) -> str:
+        """LRU cache key for one decrypted chunk of *vpath*.
+
+        NUL never appears in a validated vpath, so the key space can't
+        collide with another path — and every chunk key of a path (or of
+        a whole directory subtree) is droppable via invalidate_prefix.
+        """
+        return f"{vpath}\x00{chunk_index}"
+
+    def _invalidate_cached(self, vpath: str) -> None:
+        """Drop all cached decrypted chunks for *vpath*."""
+        self.cache.invalidate_prefix(vpath + "\x00")
+
     def open(self, path: str, flags: int) -> int:
-        """Open a file and return a file descriptor."""
+        """Open a file and return a file descriptor.
+
+        Does NOT materialize the plaintext: reads decrypt only the chunks
+        they touch (read_file_range), so opening a 500 MB file is O(1)
+        instead of a multi-second stall.  The full buffer is created
+        lazily by the first write()/truncate() on the file.
+        """
         vpath = self._vpath(path)
         # POSIX: after unlink(), the pathname is unusable even for new
         # opens — the existing fds keep their view of the inode via fh,
@@ -356,34 +474,48 @@ class QuantaCryptFUSE:
         fd = self._next_fd()
         with self._lock:
             self._open_files[fd] = vpath
-
-            # Load file data into buffer if not already cached.
-            # Skip whole-plaintext SHA-256 on the FUSE hot path — per-chunk
-            # AES-GCM already authenticates the data.  Explicit integrity
-            # verification remains available via VolumeContainer.read_file(
-            # vpath, verify_hash=True) for callers that want it.
-            if vpath not in self._file_buffers:
-                cached = self.cache.get(vpath)
-                if cached is not None:
-                    self._file_buffers[vpath] = bytearray(cached)
-                else:
-                    data = self.volume.read_file(vpath, verify_hash=False)
-                    self._file_buffers[vpath] = bytearray(data)
-                    self.cache.put(vpath, data)
-
         return fd
 
     def read(self, path: str, size: int, offset: int, fh: int) -> bytes:
-        """Read data from a file."""
+        """Read data from a file.
+
+        A live write buffer (file being modified, or freshly created) is
+        authoritative.  Otherwise decrypt just the chunks covering the
+        range, through a chunk-granular LRU cache — sequential readers and
+        seek-happy tools (media players, archive listers) hit the cache
+        for re-read chunks without ever materializing the whole file.
+        Per-chunk AES-GCM tags + AAD authenticate everything returned
+        (whole-file SHA-256 stays available via read_file(verify_hash=True)).
+        """
         vpath = self._vpath(path)
         with self._lock:
             buf = self._file_buffers.get(vpath)
-            if buf is None:
-                # Lazy load; verify_hash=False on the hot path (see open()).
-                data = self.volume.read_file(vpath, verify_hash=False)
-                buf = bytearray(data)
-                self._file_buffers[vpath] = buf
-        return bytes(buf[offset:offset + size])
+            if buf is not None:
+                return bytes(buf[offset:offset + size])
+
+            entry = self.volume.get_entry(vpath)
+            if entry is None:
+                raise OSError(errno.ENOENT, "No such file", path)
+            fsize = entry.get("size", 0)
+            if size <= 0 or offset >= fsize:
+                return b""
+            end = min(offset + size, fsize)
+            chunk_size = self.volume.metadata.get(
+                "chunk_size", VOLUME_CHUNK_SIZE)
+            first = offset // chunk_size
+            last = (end - 1) // chunk_size
+            parts: list[bytes] = []
+            for ci in range(first, last + 1):
+                key = self._chunk_key(vpath, ci)
+                data = self.cache.get(key)
+                if data is None:
+                    data = self.volume.read_file_range(
+                        vpath, ci * chunk_size, chunk_size)
+                    self.cache.put(key, data)
+                parts.append(data)
+            plain = b"".join(parts)
+            rel = offset - first * chunk_size
+            return plain[rel:rel + (end - offset)]
 
     def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
         """Write data to a file."""
@@ -391,7 +523,16 @@ class QuantaCryptFUSE:
         with self._lock:
             buf = self._file_buffers.get(vpath)
             if buf is None:
-                buf = bytearray()
+                # First write on an untouched file: open() no longer
+                # eagerly decrypts, so materialize the existing plaintext
+                # here — starting from an empty buffer would zero
+                # everything outside this write's range.
+                entry = self.volume.get_entry(vpath)
+                if entry is not None and entry.get("type") != "dir":
+                    buf = bytearray(
+                        self.volume.read_file(vpath, verify_hash=False))
+                else:
+                    buf = bytearray()
                 self._file_buffers[vpath] = buf
 
             # Extend buffer if writing past end
@@ -420,7 +561,7 @@ class QuantaCryptFUSE:
             self._dirty_files.add(vpath)
 
     def flush(self, path: str, fh: int) -> None:
-        """Flush dirty data to the volume container."""
+        """Flush dirty data to the volume container and persist to disk."""
         vpath = self._vpath(path)
         with self._lock:
             if vpath in self._dirty_files:
@@ -429,12 +570,17 @@ class QuantaCryptFUSE:
                 # should NOT be persisted — the last close will drop it.
                 if vpath not in self._pending_unlink:
                     buf = self._file_buffers.get(vpath, bytearray())
-                    # One materialisation of the bytes — write_file takes the
-                    # same object the cache gets, instead of allocating twice.
                     snapshot = bytes(buf)
                     self.volume.write_file(vpath, snapshot)
-                    self.cache.put(vpath, snapshot)
+                    # Chunks cached from the previous content are stale now.
+                    self._invalidate_cached(vpath)
                 self._dirty_files.discard(vpath)
+            self._persist_locked()
+
+    def fsync(self, path: str, datasync: int, fh: int) -> int:
+        """Force file data to stable storage (flush + journal append)."""
+        self.flush(path, fh)
+        return 0
 
     def release(self, path: str, fh: int) -> None:
         """Close a file descriptor."""
@@ -447,7 +593,7 @@ class QuantaCryptFUSE:
                     buf = self._file_buffers.get(vpath, bytearray())
                     snapshot = bytes(buf)
                     self.volume.write_file(vpath, snapshot)
-                    self.cache.put(vpath, snapshot)
+                    self._invalidate_cached(vpath)
                 self._dirty_files.discard(vpath)
 
             self._open_files.pop(fh, None)
@@ -467,8 +613,9 @@ class QuantaCryptFUSE:
                         self.volume.delete(vpath)
                     except FileNotFoundError:
                         pass
-                    self.cache.invalidate(vpath)
+                    self._invalidate_cached(vpath)
                     self._dirty_files.discard(vpath)
+            self._persist_locked()
 
     def unlink(self, path: str) -> None:
         """Delete a file.
@@ -491,11 +638,12 @@ class QuantaCryptFUSE:
                 return
             self.volume.delete(vpath)
             self._file_buffers.pop(vpath, None)
-            self.cache.invalidate(vpath)
+            self._invalidate_cached(vpath)
             self._dirty_files.discard(vpath)
+            self._persist_locked()
 
     def rename(self, old: str, new: str) -> None:
-        """Rename a file or directory."""
+        """Rename a file or directory (subtree re-keyed for directories)."""
         old_vp = self._vpath(old)
         new_vp = self._vpath(new)
         with self._lock:
@@ -504,15 +652,99 @@ class QuantaCryptFUSE:
             # source doesn't exist.
             if old_vp in self._pending_unlink:
                 raise OSError(errno.ENOENT, "No such file or directory", old)
-            self.volume.rename(old_vp, new_vp)
-            if old_vp in self._file_buffers:
-                self._file_buffers[new_vp] = self._file_buffers.pop(old_vp)
-            self.cache.invalidate(old_vp)
-            if old_vp in self._dirty_files:
-                self._dirty_files.discard(old_vp)
-                self._dirty_files.add(new_vp)
+            # POSIX no-op, mirroring the container-level guard.  Without
+            # this, the file branch below pops the destination buffer —
+            # which IS the source's — and discards its dirty flag before
+            # re-keying, silently losing every unflushed write.
+            if new_vp == old_vp:
+                return
+            # Destination held by an unlinked-but-still-open file: our
+            # buffers are vpath-keyed (same reasoning as create()), so
+            # letting the rename land would corrupt the old fds' view and
+            # the deferred delete on their last close would destroy the
+            # freshly renamed file.  Refuse until those fds close.
+            if new_vp in self._pending_unlink:
+                raise OSError(
+                    errno.EBUSY,
+                    "Destination was unlinked but still has open fds", new)
+            is_dir = (
+                self.volume.get_entry(old_vp) is None
+                and self.volume.get_entry(self._dir_vpath(old)) is not None
+            )
+            if is_dir:
+                old_prefix = self._dir_vpath(old)
+                new_prefix = self._dir_vpath(new)
+                # A pending-unlink child still has open fds whose deferred
+                # delete is keyed to the old path — renaming the parent
+                # would strand the entry under its new name.
+                if any(vp.startswith(old_prefix)
+                       for vp in self._pending_unlink):
+                    raise OSError(
+                        errno.EBUSY,
+                        "Directory contains unlinked files with open fds",
+                        old)
+                self.volume.rename(old_vp, new_vp)
+                for vp in [v for v in self._file_buffers
+                           if v.startswith(old_prefix)]:
+                    self._file_buffers[new_prefix + vp[len(old_prefix):]] = \
+                        self._file_buffers.pop(vp)
+                for vp in [v for v in self._dirty_files
+                           if v.startswith(old_prefix)]:
+                    self._dirty_files.discard(vp)
+                    self._dirty_files.add(new_prefix + vp[len(old_prefix):])
+                # fd → vpath tracking must follow too: release()/unlink()
+                # compare these values against the path the kernel passes
+                # AFTER the rename, and a stale value silently disables
+                # the deferred-unlink machinery for open children.
+                for fd_key, vp in self._open_files.items():
+                    if vp.startswith(old_prefix):
+                        self._open_files[fd_key] = \
+                            new_prefix + vp[len(old_prefix):]
+                self.cache.invalidate_prefix(old_prefix)
+            else:
+                self.volume.rename(old_vp, new_vp)
+                # A replaced destination's buffered/cached content is gone;
+                # drop it before re-keying the source's buffer into place.
+                self._file_buffers.pop(new_vp, None)
+                self._dirty_files.discard(new_vp)
+                self._invalidate_cached(new_vp)
+                if old_vp in self._file_buffers:
+                    self._file_buffers[new_vp] = self._file_buffers.pop(old_vp)
+                self._invalidate_cached(old_vp)
+                if old_vp in self._dirty_files:
+                    self._dirty_files.discard(old_vp)
+                    self._dirty_files.add(new_vp)
+                # Re-key open-fd tracking (see the dir branch for why).
+                for fd_key, vp in self._open_files.items():
+                    if vp == old_vp:
+                        self._open_files[fd_key] = new_vp
+            self._persist_locked()
 
-    def save_all_dirty(self) -> None:
+    def chmod(self, path: str, mode: int) -> int:
+        """Update mode in memory.  Not journaled — permissions inside the
+        volume are cosmetic (the mount is single-user), but returning the
+        fusepy default EROFS would break tools that chmod after saving."""
+        vpath = self._vpath(path)
+        entry = self.volume.get_entry(vpath)
+        if entry is None:
+            entry = self.volume.get_entry(vpath + "/")
+        if entry is None:
+            raise OSError(errno.ENOENT, "No such file or directory", path)
+        entry["mode"] = mode
+        return 0
+
+    def utimens(self, path: str, times: tuple | None = None) -> int:
+        """Update mtime in memory (same non-journaled rationale as chmod)."""
+        vpath = self._vpath(path)
+        entry = self.volume.get_entry(vpath)
+        if entry is None:
+            entry = self.volume.get_entry(vpath + "/")
+        if entry is None:
+            raise OSError(errno.ENOENT, "No such file or directory", path)
+        entry["mtime"] = int(times[1]) if times else int(time.time())
+        return 0
+
+    def save_all_dirty(self, apply_pending_unlink: bool = True) -> None:
         """Flush all dirty FUSE buffers to the volume, then persist the volume.
 
         Acquires the FUSE ops lock so this cannot race with an in-flight
@@ -529,6 +761,13 @@ class QuantaCryptFUSE:
         this guard an editor's swap file (classic create + unlink + keep
         writing pattern) would be silently resurrected in the encrypted
         container on the next mount.
+
+        ``apply_pending_unlink`` must be True only when shutdown is
+        certain (exit/signal paths).  A caller that might CONTINUE serving
+        afterwards — unmount_volume before its OS unmount, whose failure
+        leaves the mount live — passes False: clearing the limbo set on a
+        still-serving mount lets a later flush on the still-open fd write
+        the deleted file straight back into the container.
         """
         with self._lock:
             for vpath in list(self._dirty_files):
@@ -537,19 +776,28 @@ class QuantaCryptFUSE:
                 buf = self._file_buffers.get(vpath, bytearray())
                 snapshot = bytes(buf)
                 self.volume.write_file(vpath, snapshot)
-                self.cache.put(vpath, snapshot)
+                self._invalidate_cached(vpath)
             self._dirty_files.clear()
-            # Also proactively apply any pending unlinks whose fds won't
-            # get their release() called (e.g. SIGKILL / forced shutdown
-            # paths).  The volume.delete() here is safe: if the path still
-            # has open fds, the kernel's subsequent release() will be a
-            # no-op for the delete (vpath already gone from dir_index).
+            if apply_pending_unlink:
+                self.apply_pending_unlinks()
+            elif self.volume.is_dirty:
+                self.volume.save()
+
+    def apply_pending_unlinks(self) -> None:
+        """Apply deferred unlinks whose fds will never see release().
+
+        Call only once shutdown is certain (successful unmount, exit and
+        signal paths).  The volume.delete() here is safe: if the path
+        still has open fds, the kernel's subsequent release() will be a
+        no-op for the delete (vpath already gone from dir_index).
+        """
+        with self._lock:
             for vpath in list(self._pending_unlink):
                 try:
                     self.volume.delete(vpath)
                 except FileNotFoundError:
                     pass
-                self.cache.invalidate(vpath)
+                self._invalidate_cached(vpath)
             self._pending_unlink.clear()
             if self.volume.is_dirty:
                 self.volume.save()
@@ -561,6 +809,84 @@ _mounted_volumes: dict[str, dict] = {}  # mount_point → {thread, volume, fuse_
 # Serialises mount_volume() / unmount_volume() mutations of _mounted_volumes
 # so concurrent UI clicks or scripted mounts can't observe torn state.
 _mount_lock = threading.Lock()
+# mount_point → fd holding the cross-process flock for that mount
+_volume_locks: dict[str, int] = {}
+
+
+def _acquire_volume_lock(volume_path: str) -> int:
+    """Advisory cross-process lock held for the life of a mount.
+
+    The in-process double-mount guard can't see a second app instance or
+    a script: two processes appending to one journal truncate each
+    other's records (both do seek(_journal_end); truncate() with
+    diverging bookkeeping).  A sidecar ``<volume>.lock`` file is flocked
+    LOCK_EX|LOCK_NB — the .qcv itself cannot carry the lock because
+    compact() replaces its inode via os.replace(), which would silently
+    release an flock held on the old inode.  The 0-byte sidecar is never
+    deleted (unlinking it would race a concurrent locker onto a fresh,
+    unlocked inode).
+
+    Returns the open fd (closing it releases the lock; process exit
+    releases it automatically).  Raises RuntimeError when another
+    process holds it.
+    """
+    import fcntl
+    # Canonicalize: a symlinked or differently-spelled path to the same
+    # volume must contend for the SAME lock file, or the guard is
+    # bypassable by aliasing.
+    lock_path = os.path.realpath(volume_path) + ".lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise RuntimeError(
+            "Volume appears to be mounted by another process "
+            f"(lock held on {os.path.basename(lock_path)}). "
+            "Unmount it there first."
+        )
+    return fd
+
+
+def _release_volume_lock(mount_point: str) -> None:
+    fd = _volume_locks.pop(mount_point, None)
+    if fd is not None:
+        try:
+            os.close(fd)  # closing the fd releases the flock
+        except OSError:
+            pass
+
+
+def _reap_dead_mounts_locked() -> None:
+    """Drop tracking for mounts whose FUSE worker has exited.
+
+    Caller must hold ``_mount_lock``.  An external eject (Finder,
+    ``umount``, backend crash) ends the worker thread without ever going
+    through unmount_volume(): the tracking entry and its cross-process
+    flock would otherwise persist for the process lifetime — every
+    remount of that volume fails with "mounted by another process" and
+    the UI keeps listing a mount that no longer exists.  Best-effort
+    save first: the kernel flushed on eject via release(), but buffered
+    volume state may remain.  Entries with ``thread`` None (direct API /
+    test injection) are left alone — liveness is unknowable for them.
+    """
+    for mp, info in list(_mounted_volumes.items()):
+        t = info.get("thread")
+        if t is None or t.is_alive():
+            continue
+        logger.warning(
+            "Mount at %s ended outside unmount_volume (external eject?); "
+            "reclaiming its tracking entry and lock", mp)
+        try:
+            fuse_obj = info.get("fuse")
+            if fuse_obj is not None:
+                fuse_obj.save_all_dirty(apply_pending_unlink=True)
+            elif info["volume"].is_dirty:
+                info["volume"].save()
+        except Exception:
+            logger.exception("Post-eject save failed for %s", mp)
+        _mounted_volumes.pop(mp, None)
+        _release_volume_lock(mp)
 
 # How long mount_volume() waits for the FUSE worker to either successfully
 # start serving or fail synchronously.  If FUSE() raises (missing backend,
@@ -570,7 +896,8 @@ _FUSE_STARTUP_TIMEOUT = 2.0
 
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 
-_shutdown_registered = False
+_atexit_registered = False
+_signals_registered = False
 _shutdown_lock = threading.Lock()
 
 
@@ -609,20 +936,39 @@ def _signal_handler(signum: int, frame: Any) -> None:
 
 
 def _ensure_shutdown_handlers() -> None:
-    """Register atexit + signal handlers (once)."""
-    global _shutdown_registered  # noqa: PLW0603
+    """Register atexit + signal handlers (each once, independently).
+
+    The two halves latch separately: signal.signal() only works on the
+    main thread, and mounts from the GUI always run on a worker.  With a
+    single latch the worker's failed signal install was recorded as done
+    and SIGTERM never saved anything (atexit does not run on SIGTERM).
+    Now the signal half stays unlatched until a main-thread call — such
+    as install_shutdown_handlers() at app startup — succeeds; every
+    mount retries it, so script/CLI main-thread mounts self-heal too.
+    """
+    global _atexit_registered, _signals_registered  # noqa: PLW0603
     with _shutdown_lock:
-        if _shutdown_registered:
-            return
-        atexit.register(_emergency_save_all)
-        # Only install signal handlers on the main thread
-        try:
-            signal.signal(signal.SIGTERM, _signal_handler)
-            signal.signal(signal.SIGINT, _signal_handler)
-        except ValueError:
-            # Can only set signal handlers from the main thread
-            pass
-        _shutdown_registered = True
+        if not _atexit_registered:
+            atexit.register(_emergency_save_all)
+            _atexit_registered = True
+        if not _signals_registered:
+            try:
+                signal.signal(signal.SIGTERM, _signal_handler)
+                signal.signal(signal.SIGINT, _signal_handler)
+                _signals_registered = True
+            except ValueError:
+                # Not the main thread — leave unlatched so a later
+                # main-thread call can install the handlers.
+                pass
+
+
+def install_shutdown_handlers() -> None:
+    """Install the emergency-save handlers from the main thread.
+
+    Call once at app startup (the GUI's main() does).  Safe to call from
+    any thread — off-main-thread the signal half simply stays pending.
+    """
+    _ensure_shutdown_handlers()
 
 
 def mount_volume(
@@ -649,7 +995,10 @@ def mount_volume(
     # resize ("RuntimeError: dictionary changed size during iteration").
     # The lock-held re-check below is the race-safe guarantee against
     # double-registration; this snapshot is just for the fast error.
+    # Reap externally-ended mounts first so an ejected volume doesn't
+    # block its own remount forever.
     with _mount_lock:
+        _reap_dead_mounts_locked()
         _mounted_snapshot = list(_mounted_volumes.items())
     for mp, info in _mounted_snapshot:
         if os.path.realpath(info["volume_path"]) == real_vol:
@@ -664,72 +1013,94 @@ def mount_volume(
 
     from fuse import FUSE  # type: ignore[import-untyped]
 
-    # Open the volume
-    vc = VolumeContainer(volume_path, final_key)
-    vc.open()
+    # Cross-process guard: acquire the flock BEFORE the container reads
+    # its journal bookkeeping.  Opening first would let a mount racing
+    # another process's unmount snapshot a stale _journal_end and, once
+    # it wins the lock, truncate records the other process committed in
+    # between.  Held from here until handed to _volume_locks (background
+    # success) or closed (foreground return / any failure).
+    lock_fd = _acquire_volume_lock(volume_path)
+    lock_owned = True
+    try:
+        # Open the volume (under the cross-process lock)
+        vc = VolumeContainer(volume_path, final_key)
+        vc.open()
 
-    # Create mount point if needed
-    os.makedirs(mount_point, exist_ok=True)
+        # Create mount point if needed
+        os.makedirs(mount_point, exist_ok=True)
 
-    fuse_obj = QuantaCryptFUSE(vc, cache_mb=cache_mb)
+        fuse_obj = QuantaCryptFUSE(vc, cache_mb=cache_mb)
 
-    if foreground:
-        FUSE(fuse_obj, mount_point, foreground=True, nothreads=True,
-             allow_other=False, volname="QuantaCrypt")
-        return fuse_obj
-
-    # Background mount: wait for FUSE to either start serving or fail
-    # synchronously, and only register _mounted_volumes on success.
-    # Previously we registered unconditionally; a failed FUSE startup
-    # (missing FUSE-T, busy mount point, permission denied) left a zombie
-    # entry, and a later unmount_volume() would run diskutil / fusermount
-    # against a path we never actually mounted.
-    startup_error: list[BaseException] = []
-    ready = threading.Event()
-
-    def _run():
-        try:
+        if foreground:
             FUSE(fuse_obj, mount_point, foreground=True, nothreads=True,
                  allow_other=False, volname="QuantaCrypt")
-        except BaseException as exc:  # noqa: BLE001
-            startup_error.append(exc)
-        finally:
-            ready.set()
+            return fuse_obj  # finally releases the lock post-unmount
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+        # Background mount: wait for FUSE to either start serving or fail
+        # synchronously, and only register _mounted_volumes on success.
+        # Registering unconditionally would leave a zombie entry after a
+        # failed FUSE startup (missing FUSE-T, busy mount point), and a
+        # later unmount_volume() would run diskutil / fusermount against
+        # a path we never actually mounted.
+        startup_error: list[BaseException] = []
+        ready = threading.Event()
 
-    # A live FUSE() blocks serving requests; the thread staying alive past
-    # this window means the mount is up.  If the thread has already exited,
-    # FUSE() raised synchronously and we propagate.
-    ready.wait(timeout=_FUSE_STARTUP_TIMEOUT)
-    if not t.is_alive():
-        if startup_error:
-            raise RuntimeError(
-                f"FUSE mount failed: {startup_error[0]}"
-            ) from startup_error[0]
-        raise RuntimeError(
-            "FUSE worker thread exited before the mount was established"
-        )
+        def _run():
+            try:
+                FUSE(fuse_obj, mount_point, foreground=True, nothreads=True,
+                     allow_other=False, volname="QuantaCrypt")
+            except BaseException as exc:  # noqa: BLE001
+                startup_error.append(exc)
+            finally:
+                ready.set()
 
-    # Atomic registration: re-check double-mount under the lock so two
-    # concurrent callers can't both pass the early guard and each install
-    # a tracker entry for the same volume file.
-    with _mount_lock:
-        for mp, info in _mounted_volumes.items():
-            if os.path.realpath(info["volume_path"]) == real_vol:
+        # The duplicate check, worker start, and registration must be one
+        # atomic step under _mount_lock.  With the check outside the lock,
+        # two racers could both pass it and both spawn live mounts on the
+        # same .qcv — the loser's raise then left a serving, UNTRACKED
+        # mount (unreachable by unmount / emergency save) whose journal
+        # appends interleave with the winner's truncate+write sequences
+        # and corrupt the container.  mount/unmount are already fully
+        # serialised elsewhere; holding the lock for the ≤2 s startup
+        # window is fine for a single-user app.
+        with _mount_lock:
+            for mp, info in _mounted_volumes.items():
+                if os.path.realpath(info["volume_path"]) == real_vol:
+                    raise RuntimeError(
+                        f"Volume is already mounted at {mp}. "
+                        "Unmount it first before mounting again."
+                    )
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+
+            # A live FUSE() blocks serving requests; the thread staying
+            # alive past this window means the mount is up.  If the thread
+            # has already exited, FUSE() raised synchronously — propagate.
+            ready.wait(timeout=_FUSE_STARTUP_TIMEOUT)
+            if not t.is_alive():
+                if startup_error:
+                    raise RuntimeError(
+                        f"FUSE mount failed: {startup_error[0]}"
+                    ) from startup_error[0]
                 raise RuntimeError(
-                    f"Volume is already mounted at {mp}. "
-                    "Unmount it first before mounting again."
+                    "FUSE worker thread exited before the mount was "
+                    "established"
                 )
-        _mounted_volumes[mount_point] = {
-            "thread": t,
-            "volume": vc,
-            "fuse": fuse_obj,
-            "volume_path": volume_path,
-        }
 
-    return fuse_obj
+            _mounted_volumes[mount_point] = {
+                "thread": t,
+                "volume": vc,
+                "fuse": fuse_obj,
+                "volume_path": volume_path,
+            }
+            _volume_locks[mount_point] = lock_fd
+            lock_owned = False
+
+        return fuse_obj
+    finally:
+        if lock_owned:
+            os.close(lock_fd)
 
 
 def unmount_volume(mount_point: str) -> None:
@@ -753,6 +1124,7 @@ def unmount_volume(mount_point: str) -> None:
     import sys
 
     with _mount_lock:
+        _reap_dead_mounts_locked()
         info = _mounted_volumes.get(mount_point)
         if info is None:
             raise ValueError(
@@ -760,27 +1132,60 @@ def unmount_volume(mount_point: str) -> None:
                 "refusing to run unmount against a path we do not own"
             )
 
-        # Save state *before* removing from the dict so that if
-        # save_all_dirty() fails, _emergency_save_all can still find the
-        # volume for a retry.
+        # Save state *before* anything else so that if save_all_dirty()
+        # fails, _emergency_save_all can still find the volume for a retry.
+        # Deferred unlinks are NOT applied yet: if the OS unmount below
+        # fails, the mount keeps serving, and a cleared limbo set would
+        # let a later flush resurrect the deleted files.
         fuse_obj = info.get("fuse")
         if fuse_obj is not None:
-            fuse_obj.save_all_dirty()
+            fuse_obj.save_all_dirty(apply_pending_unlink=False)
         elif info["volume"].is_dirty:
             info["volume"].save()
-        _mounted_volumes.pop(mount_point, None)
 
         # Use platform-appropriate unmount.  Still under the lock so a
         # concurrent remount at the same mount_point can't race our
         # subprocess into tearing down the new mount.
         if sys.platform == "darwin":
-            subprocess.run(["diskutil", "unmount", mount_point],
-                           capture_output=True)
+            cmd = ["diskutil", "unmount", mount_point]
         else:
-            subprocess.run(["fusermount", "-u", mount_point],
-                           capture_output=True)
+            # Some distros ship only fusermount3 (libfuse3).
+            import shutil
+            tool = "fusermount3" if shutil.which("fusermount3") else "fusermount"
+            cmd = [tool, "-u", mount_point]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # The volume is still mounted and serving — keep it tracked so
+            # emergency save and a retry can reach it, and so the double-
+            # mount guard keeps a second writer off this journal.
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"Unmount of {mount_point} failed"
+                f"{': ' + detail if detail else ''} — "
+                "the volume may be in use by another application"
+            )
+
+        # Shutdown of this mount is now certain: apply the deferred
+        # unlinks the pre-unmount save intentionally skipped (a clean
+        # unmount usually already ran them via release(); this covers
+        # fds that never saw one).  Tracking and the flock are dropped in
+        # a finally — a failure in the unlink application must not strand
+        # a permanently-tracked, permanently-locked entry for a mount the
+        # OS has already torn down.
+        try:
+            if fuse_obj is not None:
+                fuse_obj.apply_pending_unlinks()
+        finally:
+            _mounted_volumes.pop(mount_point, None)
+            _release_volume_lock(mount_point)
 
 
 def get_mounted_volumes() -> dict[str, dict]:
-    """Return dict of currently mounted volumes: mount_point → info."""
-    return dict(_mounted_volumes)
+    """Return dict of currently mounted volumes: mount_point → info.
+
+    Reaps externally-ended mounts first so callers (the Volume Manager
+    list, the create-guard) see reality, not stale tracking.
+    """
+    with _mount_lock:
+        _reap_dead_mounts_locked()
+        return dict(_mounted_volumes)

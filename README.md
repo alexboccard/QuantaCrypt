@@ -52,6 +52,8 @@ python -m quantacrypt
 
 **Split-key mode** works like a vault with multiple keys: you give each person a unique share, and only when enough people combine their shares can the file be unlocked. Quick presets (2-of-3, 3-of-5, 3-of-7) make configuration easy.
 
+> **Note on folder encryption:** folders are first zipped to a hidden staging file (`.<output>.qc-staging-*.zip`, permissions 0600) in the same directory you chose for the encrypted output, then encrypted and deleted. If the app is killed mid-encryption, delete that leftover staging file — it contains your unencrypted data. It is intentionally placed next to your chosen output (not in the system temp directory) so it's visible and on the volume you picked.
+
 ---
 
 ## Launch Modes

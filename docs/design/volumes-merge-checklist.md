@@ -1,6 +1,13 @@
 # Volumes Feature — Merge Checklist
 
-**Status as of 2026-04-20:** All implementation work was completed 2026-03-17.
+> **OBSOLETE — 2026-04-27.** The merge this checklist describes shipped
+> in PR #1 `qcv-and-hardening` (commit `9cf521c`) and v1.3.0 is tagged.
+> Safe to delete. Kept in tree only because the sandbox can't run `rm`;
+> remove on next local cleanup along with `weekly-audit-2026-03-{23,30}.md`.
+
+---
+
+**Status as of 2026-04-20 (historical):** All implementation work was completed 2026-03-17.
 The branch has been uncommitted for 6 weeks and flagged by 6 consecutive
 weekly audits. This checklist exists so the merge can be finished in one
 sitting without re-deriving context.

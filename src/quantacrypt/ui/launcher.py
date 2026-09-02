@@ -60,13 +60,13 @@ class LauncherApp(tk.Toplevel):
             if sys.platform == "darwin":
                 self.bind(f"<Command-{key}>", lambda e, h=handler: h())
         # Escape quits the app; Cmd+W closes the window (macOS convention)
-        self.bind("<Escape>", lambda e: self.master.destroy())
+        self.bind("<Escape>", lambda e: self._quit_app())
         if sys.platform == "darwin":
-            self.bind("<Command-w>", lambda e: self.master.destroy())
-            self.bind("<Command-W>", lambda e: self.master.destroy())
-            self.bind("<Command-q>", lambda e: self.master.destroy())
-            self.bind("<Command-Q>", lambda e: self.master.destroy())
-        self.protocol("WM_DELETE_WINDOW", self.master.destroy)
+            self.bind("<Command-w>", lambda e: self._quit_app())
+            self.bind("<Command-W>", lambda e: self._quit_app())
+            self.bind("<Command-q>", lambda e: self._quit_app())
+            self.bind("<Command-Q>", lambda e: self._quit_app())
+        self.protocol("WM_DELETE_WINDOW", self._quit_app)
         # Drag-and-drop: drop a .qcx → open decryptor
         if _DND_FILES:
             try:
@@ -74,6 +74,47 @@ class LauncherApp(tk.Toplevel):
                 self.dnd_bind("<<Drop>>", self._on_drop)
             except Exception:
                 pass
+
+    def _quit_app(self):
+        """Quit, unmounting any live volumes first.
+
+        Bare destroy() with volumes mounted loses in-flight kernel writes
+        and leaves the mountpoint dangling in Finder — atexit only saves
+        buffered volume state, it does not unmount.
+        """
+        try:
+            from quantacrypt.core.fuse_ops import (
+                get_mounted_volumes, unmount_volume)
+            mounted = list(get_mounted_volumes())
+        except Exception:
+            mounted = []
+        if mounted:
+            from tkinter import messagebox
+            n = len(mounted)
+            noun = "volume" if n == 1 else f"{n} volumes"
+            if not messagebox.askyesno(
+                    "Volumes mounted",
+                    f"You still have {noun} mounted:\n"
+                    + "\n".join(f"  • {mp}" for mp in mounted[:5])
+                    + ("\n  …" if n > 5 else "")
+                    + "\n\nUnmount and quit?",
+                    icon="warning", default="yes", parent=self):
+                return
+            failed = []
+            for mp in mounted:
+                try:
+                    unmount_volume(mp)
+                except Exception as exc:
+                    failed.append(f"{mp}: {exc}")
+            if failed:
+                messagebox.showerror(
+                    "Unmount failed",
+                    "Some volumes could not be unmounted (files may be "
+                    "in use):\n\n" + "\n".join(failed)
+                    + "\n\nClose the files using them, then quit again.",
+                    parent=self)
+                return
+        self.master.destroy()
 
     def _on_drop(self, event):
         try:
