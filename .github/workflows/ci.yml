@@ -21,6 +21,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # fusepy imports only when a libfuse backend is loadable (it raises
+      # OSError, not ImportError, without one) — install libfuse2 so the
+      # FUSE contract tests run on CI instead of skipping.
+      - name: Install libfuse
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
 

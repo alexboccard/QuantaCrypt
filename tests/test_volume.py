@@ -2698,7 +2698,13 @@ class TestFuseOperationsContract:
     and then fails every op with EINVAL)."""
 
     def test_subclasses_fuse_operations(self):
-        fuse = pytest.importorskip("fuse")
+        # Not importorskip: fusepy raises OSError (not ImportError) when
+        # the package is installed but no libfuse backend loads — the
+        # skip must cover both, or a backend-less machine errors here.
+        try:
+            import fuse
+        except (ImportError, OSError) as exc:
+            pytest.skip(f"fusepy/libfuse unavailable: {exc}")
         assert issubclass(QuantaCryptFUSE, fuse.Operations)
 
     def test_chmod_and_utimens(self, tmp_dir):
