@@ -154,6 +154,16 @@ open htmlcov/index.html
 
 ---
 
+## Native macOS app (preview)
+
+`macos/` contains a SwiftUI shell that drives the same Python core through a
+bundled helper (`qc-core`). It is the planned replacement for the Tkinter
+windows; see `docs/design/native-macos-ui.md` for the plan and
+`RELEASING.md` for how to build it. The Tkinter app remains the shipped UI
+until the native one reaches parity.
+
+---
+
 ## Keyboard Shortcuts
 
 `⌘` on macOS (`Ctrl` also works there), `Ctrl` on Linux / Windows.

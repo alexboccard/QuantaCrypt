@@ -58,3 +58,9 @@ pytest-cache-files-*/
 # Code-review working files (finding lists must never reach the public repo)
 .review/
 .review-archive-*/
+
+# Xcode (macos/ shell)
+macos/build/
+macos/*.xcodeproj/xcuserdata/
+macos/*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/

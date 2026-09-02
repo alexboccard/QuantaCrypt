@@ -436,12 +436,15 @@ def _parse_args():
                    help="Skip the test suite (useful for CI split builds)")
     p.add_argument("--test-only", action="store_true",
                    help="Run tests and coverage only — skip the build entirely")
+    p.add_argument("--helper", action="store_true",
+                   help="Build only the qc-core helper (dist/qc-core.app) "
+                        "for the native macOS shell; skips icons and DMG")
     p.add_argument("--no-dmg", action="store_true",
                    help="Build the .app bundle but skip DMG creation")
     return p.parse_args()
 
 
-def _codesign_app_bundle(app_path):
+def _codesign_app_bundle(app_path, name=None):
     """Ad-hoc sign every binary inside the .app bundle, inside-out.
 
     macOS requires consistent code signatures across all Mach-O binaries
@@ -488,7 +491,7 @@ def _codesign_app_bundle(app_path):
             signed.add(path)
 
     # 2. Sign the main executable
-    main_exe = os.path.join(app_path, "Contents", "MacOS", NAME)
+    main_exe = os.path.join(app_path, "Contents", "MacOS", name or NAME)
     if os.path.isfile(main_exe):
         subprocess.run(
             sign_cmd + [main_exe],
@@ -576,6 +579,68 @@ def _post_build(app_path, doc_icon_tmp, arch_label, *,
     print(f"{'=' * 60}\n")
 
 
+HELPER_NAME = "qc-core"
+
+
+def _build_helper(args):
+    """Build dist/qc-core.app: the JSON-lines core service as a background
+    app bundle (no Tk).  A bundle — not a loose onedir folder — because the
+    SwiftUI app nests it under Contents/Helpers/, and codesign only accepts
+    nested code that is itself a signed bundle (loose data files next to a
+    Mach-O fail with "code object is not signed at all").  It runs headless:
+    LSUIElement keeps it out of the Dock; stdin/stdout are ordinary pipes."""
+    import plistlib
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--name",      HELPER_NAME,
+        "--distpath",  DIST,
+        "--workpath",  os.path.join(WORK, "helper"),
+        "--specpath",  os.path.join(WORK, "helper"),
+        "--onedir",
+        "--windowed",              # produces the .app bundle layout
+        "--clean",
+        "--noconfirm",
+        "--osx-bundle-identifier", BUNDLE_ID + ".core",
+        "--paths",     SRC,
+    ]
+    if args.arch:
+        cmd += ["--target-arch", args.arch]
+    for h in HIDDEN:
+        if "tkinter" in h or "zxcvbn" in h or ".ui" in h:
+            continue
+        cmd += ["--hidden-import", h]
+    for mod in ("tkinter", "_tkinter", "tkinterdnd2", "quantacrypt.ui"):
+        cmd += ["--exclude-module", mod]
+    cmd += ["--add-data", f"{PKG}:quantacrypt"]
+    cmd.append(os.path.join(PKG, "cli.py"))
+    print(f"\n{'='*60}\n  Building helper: {HELPER_NAME}.app\n{'='*60}")
+    if args.arch == "x86_64":
+        cmd = ["arch", "-x86_64"] + cmd
+    result = subprocess.run(cmd, cwd=ROOT)
+    if result.returncode != 0:
+        print("[!] Helper build failed"); sys.exit(1)
+    app = os.path.join(DIST, HELPER_NAME + ".app")
+    # PyInstaller also leaves a bare onedir tree next to the .app; drop it so
+    # only one artefact exists to copy.
+    shutil.rmtree(os.path.join(DIST, HELPER_NAME), ignore_errors=True)
+    plist_path = os.path.join(app, "Contents", "Info.plist")
+    with open(plist_path, "rb") as f:
+        plist = plistlib.load(f)
+    plist["LSUIElement"] = True        # no Dock icon, no menu bar
+    plist["LSBackgroundOnly"] = True
+    plist["CFBundleDisplayName"] = "QuantaCrypt Core"
+    with open(plist_path, "wb") as f:
+        plistlib.dump(plist, f)
+    _codesign_app_bundle(app, name=HELPER_NAME)
+    exe = os.path.join(app, "Contents", "MacOS", HELPER_NAME)
+    # Smoke: the binary must answer a version request and exit on EOF.
+    probe = '{"id":"1","op":"version"}\n'
+    r = subprocess.run([exe], input=probe, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or '"version"' not in r.stdout:
+        print(f"[!] Helper smoke test failed:\n{r.stdout}\n{r.stderr}"); sys.exit(1)
+    total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(app) for f in fs)
+    print(f"[+] Built {app} ({total / 1_000_000:.1f} MB), smoke test OK")
+
 def main():
     args = _parse_args()
     os.makedirs(DIST, exist_ok=True)
@@ -585,6 +650,10 @@ def main():
         _run_tests()
 
     if args.test_only:
+        return
+
+    if args.helper:
+        _build_helper(args)
         return
 
     # ── Gate: the optional `strength` extra must be installed so the shipped

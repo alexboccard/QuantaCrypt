@@ -35,3 +35,37 @@ jobs:
       # config-discovery behavior.
       - name: Run tests with coverage gate
         run: python -m pytest --tb=short -q --cov-fail-under=95
+
+  # The native shell: the qc-core helper (PyInstaller, no Tk) plus the
+  # SwiftUI app generated from macos/project.yml.  Runs on every push so a
+  # protocol change that breaks the Swift client is caught before a tag.
+  macos-shell:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,build,volumes]"
+
+      - name: Build qc-core helper (smoke-tested by the build script)
+        run: python scripts/build.py --helper --skip-tests
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: cd macos && xcodegen generate
+
+      - name: Build and test the app
+        run: |
+          cd macos
+          xcodebuild -project QuantaCrypt.xcodeproj -scheme QuantaCrypt \
+            -configuration Debug -derivedDataPath build \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -project QuantaCrypt.xcodeproj -scheme QuantaCrypt \
+            -destination 'platform=macOS' -derivedDataPath build \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO test

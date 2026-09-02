@@ -54,6 +54,26 @@ python scripts/build.py --arch arm64 --skip-tests
 
 Output lands in `dist/quantacrypt.app` and `dist/quantacrypt-{arch}.dmg`.
 
+### Core helper for the native shell
+
+The SwiftUI app in `macos/` does not embed Python; it launches `qc-core`, a
+PyInstaller build of the JSON-lines core service packaged as a headless
+`.app` (codesign only accepts nested code that is itself a signed bundle)
+(`docs/design/core-service-protocol.md`):
+
+```bash
+python scripts/build.py --helper --skip-tests            # → dist/qc-core.app (headless bundle; --arch arm64|x86_64 to cross-build)
+```
+
+The build runs a smoke request against the binary and fails if it does not
+answer. The Xcode project copies `dist/qc-core.app` into
+`QuantaCrypt.app/Contents/Helpers/` (see `macos/project.yml`); build the
+helper first, then the app:
+
+```bash
+cd macos && xcodegen generate && xcodebuild -scheme QuantaCrypt -configuration Release build
+```
+
 ## Version scheme
 
 Follow [Semantic Versioning](https://semver.org):

@@ -24,75 +24,11 @@ from quantacrypt.ui.shared import (
 )
 
 
-def _folder_stats(folder):
-    """Return (file_count, total_bytes) for a folder tree."""
-    count, total = 0, 0
-    for dirpath, _, filenames in os.walk(folder):
-        for fn in filenames:
-            try:
-                total += os.path.getsize(os.path.join(dirpath, fn))
-            except OSError:
-                pass
-            count += 1
-    return count, total
-
-
-def _batch_output_paths(paths, out_dir):
-    """Map each batch input to a UNIQUE <stem>.qcx in out_dir.
-
-    Inputs with colliding stems (report.txt + report.md) must not map to
-    the same output — the second os.replace would silently destroy the
-    first file's ciphertext while both show as succeeded.  Collisions get
-    the decryptor-style _2 suffix.
-    """
-    outs, used = [], set()
-    for p in paths:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        cand, i = stem, 2
-        while (cand + ".qcx").lower() in used:
-            cand = f"{stem}_{i}"
-            i += 1
-        used.add((cand + ".qcx").lower())
-        outs.append(os.path.join(out_dir, cand + ".qcx"))
-    return outs
-
-
-def _zip_folder(folder, dst_path, progress_cb=None, cancel_check=None):
-    """Zip folder into dst_path with paths relative to folder's parent.
-
-    The top-level directory name is preserved inside the archive.
-    Fires progress_cb(msg) every file.  Returns bytes written.
-    Raises crypto.CancelledOperation when cancel_check() goes true.
-    """
-    from quantacrypt.core.crypto import CancelledOperation
-    parent = os.path.dirname(os.path.abspath(folder))
-    # The staging zip may live inside the tree being walked (it is created
-    # in the output directory, which the user can point into the source
-    # folder).  Zipping the archive into itself never terminates: deflate
-    # output is incompressible, so the writer stays ahead of the reader
-    # until the disk fills.
-    dst_abs = os.path.abspath(dst_path)
-    total_files, _ = _folder_stats(folder)
-    done = 0
-    with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-        for dirpath, dirnames, filenames in os.walk(folder):
-            dirnames.sort()
-            filenames.sort()
-            for fn in filenames:
-                if cancel_check and cancel_check():
-                    raise CancelledOperation("Compression cancelled")
-                full = os.path.join(dirpath, fn)
-                if os.path.abspath(full) == dst_abs:
-                    continue
-                arcname = os.path.relpath(full, parent)
-                zf.write(full, arcname)
-                done += 1
-                if progress_cb and total_files:
-                    pct = done / total_files
-                    progress_cb(
-                        f"Compressing folder… {int(pct * 100)}%"
-                        f" ({done}/{total_files} files)"
-                    )
+from quantacrypt.core.package import (  # noqa: E402
+    folder_stats as _folder_stats,
+    batch_output_paths as _batch_output_paths,
+    zip_folder as _zip_folder,
+)
 
 # Friendly stage names + relative weights.  The list shown to the user is
 # built PER RUN (see _stages_for): "Compressing folder" only for folders,

@@ -63,6 +63,7 @@ Issues = "https://github.com/alexboccard/QuantaCrypt/issues"
 
 [project.scripts]
 quantacrypt = "quantacrypt:main"
+qc-core = "quantacrypt.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

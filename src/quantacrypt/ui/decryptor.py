@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 from quantacrypt.core import crypto as cc
+from quantacrypt.core.package import load_pkg  # noqa: F401  (re-exported for callers/tests)
 from quantacrypt.core.crypto import (
     MAGIC, FORMAT_VERSION, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION,
 )
@@ -60,55 +61,6 @@ def get_wl():
 
 _MAX_TAIL = 1 << 20  # 1 MB tail search window
 _MAX_SHARE_FILE = 1 << 20  # share .txt files are a few KB; refuse anything huge
-
-def load_pkg(path):
-    """Parse a .qcx file without loading the whole thing into RAM."""
-    file_size = os.path.getsize(path)
-    tail_size = min(file_size, _MAX_TAIL)
-    with open(path, "rb") as f:
-        f.seek(file_size - tail_size)
-        tail = f.read(tail_size)
-    i = tail.rfind(MAGIC)
-    if i < 0:
-        raise ValueError("Not a QuantaCrypt file")
-    o = i + len(MAGIC)
-    if o + 4 > len(tail):
-        raise ValueError("File appears truncated or corrupt")
-    n = struct.unpack(">I", tail[o:o+4])[0]
-    if o + 4 + n > len(tail):
-        raise ValueError("File appears truncated or corrupt")
-    pkg = json.loads(tail[o+4:o+4+n])
-    if not isinstance(pkg, dict):
-        raise ValueError("File metadata envelope is not a valid dictionary — file may be corrupt")
-    meta = pkg.get("meta", {})
-    if not isinstance(meta, dict):
-        raise ValueError("File metadata is not a valid dictionary — file may be corrupt")
-    ver = meta.get("version", 1)
-    # Reject files from future versions (need a newer app)
-    if ver > MAX_FORMAT_VERSION:
-        raise ValueError(
-            f"This file was created with a newer version of QuantaCrypt (format v{ver}). "
-            f"Please upgrade the app."
-        )
-    # Reject files from older versions (v1 is the minimum supported format)
-    if ver < MIN_FORMAT_VERSION:
-        raise ValueError(
-            f"This file uses an older format (v{ver}) that is no longer supported. "
-            f"Use an older version of QuantaCrypt to decrypt it, "
-            f"then re-encrypt with this version."
-        )
-    # Validate required fields so downstream code never hits bare KeyError
-    if "mode" not in meta:
-        raise ValueError("File metadata is missing required field 'mode' — file may be corrupt")
-    if meta["mode"] not in ("single", "shamir"):
-        raise ValueError(f"Unknown encryption mode {meta['mode']!r} — file may be corrupt or from an unsupported version")
-    if meta["mode"] == "shamir":
-        for field in ("threshold", "total"):
-            if field not in meta:
-                raise ValueError(f"Shamir file metadata is missing required field '{field}' — file may be corrupt")
-        if not (2 <= meta["threshold"] <= meta["total"] <= 255):
-            raise ValueError(f"Invalid Shamir parameters: threshold={meta.get('threshold')}, total={meta.get('total')}")
-    return pkg
 
 def _find_stage(msg):
     """Map a raw core progress string to (stage index, friendly label).

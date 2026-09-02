@@ -1,0 +1,133 @@
+name: QuantaCrypt
+options:
+  bundleIdPrefix: com.alexboccard
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "26.1"
+  createIntermediateGroups: true
+  generateEmptySchemes: false
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+
+targets:
+  QuantaCrypt:
+    type: application
+    platform: macOS
+    sources:
+      - path: QuantaCrypt
+        excludes:
+          - "Info.plist"
+    info:
+      path: QuantaCrypt/Info.plist
+      properties:
+        CFBundleName: QuantaCrypt
+        CFBundleDisplayName: QuantaCrypt
+        CFBundleShortVersionString: "1.3.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHumanReadableCopyright: "Copyright © 2026 Alex Boccard. All rights reserved."
+        NSPrincipalClass: NSApplication
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: QuantaCrypt Encrypted File
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.alexboccard.quantacrypt.qcx
+          - CFBundleTypeName: QuantaCrypt Encrypted Volume
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.alexboccard.quantacrypt.qcv
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.alexboccard.quantacrypt.qcx
+            UTTypeDescription: QuantaCrypt Encrypted File
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - qcx
+          - UTTypeIdentifier: com.alexboccard.quantacrypt.qcv
+            UTTypeDescription: QuantaCrypt Encrypted Volume
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - qcv
+    postCompileScripts:
+      - name: Bundle qc-core helper
+        shell: /bin/sh
+        runOnlyWhenInstalling: false
+        basedOnDependencyAnalysis: false
+        # Step 3 of the staged plan: when scripts/build.py --helper has
+        # produced dist/qc-core.app (a headless bundle, so codesign accepts
+        # it as nested code), ship it as Contents/Helpers/qc-core.app.
+        # Absent in day-to-day development, where HelperLocator falls back
+        # to the venv.
+        script: |
+          set -eu
+          HELPER="$SRCROOT/../dist/qc-core.app"
+          DEST="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
+          if [ -x "$HELPER/Contents/MacOS/qc-core" ]; then
+            rm -rf "$DEST/qc-core.app" "$DEST/qc-core"
+            mkdir -p "$DEST"
+            cp -R "$HELPER" "$DEST/qc-core.app"
+            echo "Bundled $HELPER"
+          else
+            echo "note: $HELPER not built; the app will use the development helper"
+          fi
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alexboccard.quantacrypt
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        PRODUCT_NAME: QuantaCrypt
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_PREVIEWS: YES
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_EMIT_LOC_STRINGS: YES
+        COMBINE_HIDPI_IMAGES: YES
+        OTHER_SWIFT_FLAGS: "-warnings-as-errors"
+
+  QuantaCryptTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: QuantaCryptTests
+    dependencies:
+      - target: QuantaCrypt
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alexboccard.quantacrypt.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  QuantaCrypt:
+    build:
+      targets:
+        QuantaCrypt: all
+        QuantaCryptTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - QuantaCryptTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
