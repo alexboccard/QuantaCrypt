@@ -76,6 +76,13 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
+      # project.yml lists the .icns files as resources and they are gitignored
+      # build artifacts, so a clean checkout must render them or xcodebuild
+      # fails at CpResource. xcodegen's `optional: true` only silences the
+      # generation-time check, not the build.
+      - name: Render app icons
+        run: python scripts/build.py --icons --skip-tests
+
       - name: Generate Xcode project
         run: cd macos && xcodegen generate
 

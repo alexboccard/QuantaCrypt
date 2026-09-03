@@ -442,6 +442,10 @@ def _parse_args():
     p.add_argument("--helper", action="store_true",
                    help="Build only the qc-core helper (dist/qc-core.app) "
                         "for the native macOS shell; skips icons and DMG")
+    p.add_argument("--icons", action="store_true",
+                   help="Render only the .icns files into "
+                        "macos/QuantaCrypt/Resources; required before a plain "
+                        "`xcodegen generate && xcodebuild` on a fresh clone")
     p.add_argument("--no-dmg", action="store_true",
                    help="Build the .app bundle but skip DMG creation")
     return p.parse_args()
@@ -652,24 +656,44 @@ NATIVE_DIR = os.path.join(ROOT, "macos")
 NATIVE_NAME = "QuantaCrypt"
 
 
+def _stage_native_icons():
+    """Render the app/document/volume icons into macos/QuantaCrypt/Resources.
+
+    The .icns files are generated artifacts (gitignored), but project.yml
+    lists them as resources — xcodegen's `optional: true` only silences the
+    *generation*-time missing-path check, so the reference still lands in the
+    project and `xcodebuild` fails at CpResource if they are absent. Any path
+    that generates the project and builds it must run this first: `--native`,
+    CI's macos-shell job, and a fresh clone following the README/CLAUDE.md
+    dev command.
+    """
+    res_dir = os.path.join(NATIVE_DIR, NATIVE_NAME, "Resources")
+    os.makedirs(res_dir, exist_ok=True)
+    _, icon_tmp = _build_icon()
+    staged = []
+    for tmp, name in ((icon_tmp, "icon.icns"),
+                      (_build_doc_icon(), DOC_ICON_NAME),
+                      (_build_vol_icon(), VOL_ICON_NAME)):
+        dest = os.path.join(res_dir, name)
+        if tmp and os.path.isfile(tmp):
+            shutil.move(tmp, dest)
+            print(f"[+] Icon → {dest}")
+            staged.append(name)
+        elif not os.path.isfile(dest):
+            # Better a placeholder than a build that fails at CpResource: the
+            # icon is cosmetic, the build is not.
+            open(dest, "wb").close()
+            print(f"[!] Could not render {name} — wrote an empty placeholder")
+    return staged
+
+
 def _build_native(args):
     """One command → one .app.  Builds the qc-core helper bundle, renders
     the app/document icons from src/quantacrypt/assets into the Xcode
     resources, generates the project, builds Release, copies the result to
     dist/ and wraps it in the same drag-to-Applications DMG as the Tk app."""
     _build_helper(args)
-
-    # Icons: the same PNG sources the Tk build uses, rendered to .icns and
-    # dropped where project.yml's resource glob picks them up.
-    res_dir = os.path.join(NATIVE_DIR, NATIVE_NAME, "Resources")
-    os.makedirs(res_dir, exist_ok=True)
-    icon_args, icon_tmp = _build_icon()
-    for tmp, name in ((icon_tmp, "icon.icns"),
-                      (_build_doc_icon(), DOC_ICON_NAME),
-                      (_build_vol_icon(), VOL_ICON_NAME)):
-        if tmp and os.path.isfile(tmp):
-            shutil.move(tmp, os.path.join(res_dir, name))
-            print(f"[+] Icon → {os.path.join(res_dir, name)}")
+    _stage_native_icons()
 
     if shutil.which("xcodegen") is None:
         print("[!] xcodegen not found — brew install xcodegen"); sys.exit(1)
@@ -723,6 +747,10 @@ def main():
 
     if args.native:
         _build_native(args)
+        return
+
+    if args.icons:
+        _stage_native_icons()
         return
 
     if args.helper:

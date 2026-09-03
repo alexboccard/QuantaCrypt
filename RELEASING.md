@@ -87,6 +87,7 @@ answer. `--native` runs this for you. The Xcode project copies `dist/qc-core.app
 helper first, then the app:
 
 ```bash
+python scripts/build.py --icons --skip-tests   # .icns are gitignored artifacts; xcodebuild needs them
 cd macos && xcodegen generate && xcodebuild -scheme QuantaCrypt -configuration Release build
 ```
 
