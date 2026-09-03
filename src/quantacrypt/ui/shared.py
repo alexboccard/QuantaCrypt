@@ -1,14 +1,16 @@
 """QuantaCrypt Shared UI Design System."""
 
 import os
+import queue
 import sys
+import threading
 import time
 
 import tkinter as tk
 
 __all__ = [
     "C", "F", "UI", "MONO", "SP", "ICON", "MOD", "MOD_LABEL", "REVEAL_LABEL",
-    "accel", "bind_shortcut",
+    "accel", "bind_shortcut", "safe_after", "write_new_private_file",
     "styled_entry", "bind_context_menu", "fmt_size", "rule", "section_label",
     "card", "kv_row", "confirm", "alert", "reveal_path",
     "FlatButton", "SegmentedControl", "StagedProgressBar",
@@ -105,6 +107,63 @@ def bind_shortcut(widget, key: str, handler, *, also_control: bool = True):
     for m in mods:
         for k in keys:
             widget.bind(f"<{m}-{k}>", _cb)
+
+
+def safe_after(widget, fn, delay: int = 0) -> None:
+    """Schedule ``fn`` on the Tk main thread from a worker thread.
+
+    Every wizard hands worker results to the UI through ``after()``.  That is
+    safe only with a threaded Tcl build (python.org, Homebrew and PyInstaller
+    Tcl on macOS all are; some Linux distro builds are not) — with a
+    non-threaded Tcl the call raises RuntimeError instead of corrupting the
+    interpreter.  This helper swallows that, plus the TclError raised once the
+    window is gone, so a worker can never crash on a hop the user has already
+    walked away from.  ``fn`` itself is skipped when the widget was destroyed
+    in the meantime."""
+    def _safe():
+        try:
+            if widget.winfo_exists():
+                fn()
+        except tk.TclError:
+            pass
+    try:
+        widget.after(delay, _safe)
+    except (tk.TclError, RuntimeError):
+        pass  # window destroyed / non-threaded Tcl / interpreter shutting down
+
+
+_MAX_NAME_ATTEMPTS = 99   # <stem>_2 … <stem>_99, then give up (same cap as the native app)
+
+
+def write_new_private_file(path: str, text: str) -> tuple[str, bool]:
+    """Create ``path`` 0600 with O_EXCL — never over an existing file.  When
+    the name is taken the file goes to the next free ``<stem>_N<ext>`` and
+    ``renamed`` is True so the caller can say so.  Key material is written
+    this way in every screen so a second run can't silently destroy the
+    only copy of the first run's shares.
+
+    The free-name probe uses ``lexists``: ``open(O_EXCL)`` fails on a
+    dangling symlink too, and ``exists`` would keep proposing that same
+    name forever.  After ``_MAX_NAME_ATTEMPTS`` names ``FileExistsError``
+    is raised instead of looping."""
+    import errno
+    d = os.path.dirname(path) or "."
+    root, ext = os.path.splitext(os.path.basename(path))
+    for n in range(1, _MAX_NAME_ATTEMPTS + 1):
+        out = path if n == 1 else os.path.join(d, f"{root}_{n}{ext}")
+        if os.path.lexists(out):
+            continue
+        try:
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue   # appeared between the probe and the open — next name
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        return out, n > 1
+    raise FileExistsError(
+        errno.EEXIST,
+        f"{_MAX_NAME_ATTEMPTS} files named like {os.path.basename(path)} already "
+        "exist here — choose another name or folder", path)
 
 
 def bind_context_menu(widget):
@@ -236,10 +295,22 @@ def _dialog(parent, title, message, buttons, *, danger=False, default=0):
         win.geometry(f"+{px + (pw - ww) // 2}+{py + (ph - wh) // 2}")
     except Exception:
         pass
+    # Tk keeps no grab stack: destroying this dialog drops the grab a modal
+    # parent (the shares dialog) held, so remember it and hand it back.
+    try:
+        prev_grab = parent.grab_current()
+    except tk.TclError:
+        prev_grab = None
     win.grab_set()
     win.focus_force()
     btns[min(default, len(btns) - 1)].focus_set()
     win.wait_window()
+    if prev_grab is not None:
+        try:
+            if prev_grab.winfo_exists():
+                prev_grab.grab_set()
+        except tk.TclError:
+            pass
     return result["v"]
 
 
@@ -380,12 +451,15 @@ def rule(parent, color=None, pady=12, padx=0):
 
 
 def section_label(parent, text, padx=24):
+    """Heading row.  Returns the text Label so callers that relabel a
+    section later (PASSWORD ↔ SHARES) don't have to dig through children."""
     row = tk.Frame(parent, bg=C["bg"])
     row.pack(fill="x", padx=padx, pady=(18, 6))
-    tk.Label(row, text=text, font=F["small"], bg=C["bg"],
-             fg=C["text3"]).pack(side="left")
+    lbl = tk.Label(row, text=text, font=F["small"], bg=C["bg"], fg=C["text3"])
+    lbl.pack(side="left")
     tk.Frame(row, bg=C["border"], height=2).pack(
         side="left", fill="x", expand=True, padx=(10,0), pady=1)
+    return lbl
 
 
 try:
@@ -447,6 +521,16 @@ class FlatButton(tk.Label):
 
     def set_text(self, text):
         self.config(text=text)
+
+    def set_tint(self, on: bool):
+        """Secondary button shown as "selected" (accent fill) or at rest.
+        The rest colours move too, so hover/leave can't undo the tint."""
+        if on:
+            self._bg, self._fg, self._hov = C["accent"], C["text"], C["accent_hover"]
+        else:
+            self._bg, self._fg, self._hov = C["surface2"], C["text2"], C["surface3"]
+        if self._enabled:
+            self.config(bg=self._bg, fg=self._fg)
 
     def enable(self, on=True):
         self._enabled = on
@@ -558,6 +642,8 @@ class StagedProgressBar(tk.Frame):
         self._running   = False
         self._pulse_base = None  # base label text for animated dot pulse
         self._pulse_job  = None  # pending after() id for pulse
+        self._time_job   = None  # pending after() id for the ETA loop
+        self._bar_w      = 0     # canvas width from the last <Configure>
         self._stage_pcts = self._build_stage_pcts()
 
         # Stage name label
@@ -569,7 +655,7 @@ class StagedProgressBar(tk.Frame):
         self._bar_cv = tk.Canvas(self, height=6, bg=C["surface2"],
                                   highlightthickness=0)
         self._bar_cv.pack(fill="x", padx=16, pady=(0, 6))
-        self._bar_cv.bind("<Configure>", lambda e: self._draw_bar())
+        self._bar_cv.bind("<Configure>", self._on_bar_configure)
 
         # Bottom row: stage progress + time
         bottom = tk.Frame(self, bg=C["surface"])
@@ -612,7 +698,18 @@ class StagedProgressBar(tk.Frame):
             acc += w
         return pcts
 
+    def _cancel_jobs(self):
+        for attr in ("_time_job", "_pulse_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
     def start(self):
+        self._cancel_jobs()
         self._start_t = time.time()
         self._stage_t = time.time()
         self._running = True
@@ -620,11 +717,14 @@ class StagedProgressBar(tk.Frame):
         # "Complete" label/colours from a previous run
         self._current  = -1
         self._pct      = 0.0
+        self._pulse_base = None
         self._stage_lbl.config(text="Starting…", fg=C["text"])
         self._pct_lbl.config(text="0%", fg=C["text2"])
         self._time_lbl.config(text="", fg=C["text3"])
         self._draw_bar()
         self._draw_dots()
+        # The one and only ETA loop for this run — advance() must never
+        # start another (one per 4 MB chunk used to pile up on big files).
         self._update_time()
 
     def advance(self, stage_idx, stage_name=None):
@@ -657,18 +757,25 @@ class StagedProgressBar(tk.Frame):
 
         self._draw_bar()
         self._draw_dots()
-        self._update_time()
-        self._pulse_tick(0)      # start/restart dot-pulse for this stage
+        self._refresh_time_labels()
+        # Restart the dot pulse for this stage (cancelling the previous one)
+        if self._pulse_job is not None:
+            try: self.after_cancel(self._pulse_job)
+            except Exception: pass
+            self._pulse_job = None
+        self._pulse_tick(0)
 
     def stop(self):
         """Halt the timer loop without marking as complete (used on failure/reset)."""
         self._running = False
         self._pulse_base = None  # stop pulse loop
+        self._cancel_jobs()
 
     def complete(self):
         self._pct = 1.0
         self._running = False
         self._pulse_base = None  # stop pulse loop
+        self._cancel_jobs()
         elapsed = time.time() - self._start_t if self._start_t else 0
         self._stage_lbl.config(text="Complete", fg=C["success"])
         self._pct_lbl.config(text="100%", fg=C["success"])
@@ -676,9 +783,18 @@ class StagedProgressBar(tk.Frame):
         self._draw_bar(complete=True)
         self._draw_dots(complete=True)
 
+    def destroy(self):
+        self._cancel_jobs()
+        super().destroy()
+
+    def _on_bar_configure(self, event):
+        self._bar_w = event.width
+        self._draw_bar(complete=(not self._running and self._pct >= 1.0))
+
     def _draw_bar(self, complete=False):
-        self._bar_cv.update_idletasks()
-        w = self._bar_cv.winfo_width()
+        # Width comes from the last <Configure>; no update_idletasks() here —
+        # this runs once per progress message and must not pump the event loop.
+        w = self._bar_w
         if w < 2: return
         self._bar_cv.delete("all")
         # Background
@@ -705,6 +821,15 @@ class StagedProgressBar(tk.Frame):
             con.config(bg=C["success"] if done else C["border"])
 
     def _update_time(self):
+        """250 ms ETA loop.  Scheduled from start() only; every tick
+        re-arms itself so there is exactly one pending job at a time."""
+        self._time_job = None
+        if not self._running or not self._start_t: return
+        self._refresh_time_labels()
+        if self._running and self._pct < 1.0:
+            self._time_job = self.after(250, self._update_time)
+
+    def _refresh_time_labels(self):
         if not self._running or not self._start_t: return
         now = time.time()
         pct = self._pct
@@ -735,14 +860,12 @@ class StagedProgressBar(tk.Frame):
         else:
             self._pct_lbl.config(text="0%")
             self._time_lbl.config(text="calculating...")
-        if self._running and pct < 1.0:
-            self.after(250, self._update_time)
-
 
     def _pulse_tick(self, dot_count):
         """Animate a cycling '…' suffix on the stage label when there is no
         sub-progress to display (pct == 0, e.g. during the Argon2id KDF stage).
         Stops automatically when _pulse_base is cleared by advance/stop/complete."""
+        self._pulse_job = None
         if self._pulse_base is None: return          # stopped
         if self._pct > 0.01:                         # real progress arrived — stop pulse
             self._stage_lbl.config(text=self._pulse_base)
@@ -756,7 +879,13 @@ class StagedProgressBar(tk.Frame):
 
 
 class PasswordStrengthBar(tk.Frame):
-    """Live password strength estimator using zxcvbn for realistic scoring."""
+    """Live password strength estimator using zxcvbn for realistic scoring.
+
+    zxcvbn is super-linear in the password length (a long passphrase costs
+    hundreds of ms in pure Python), so scoring runs on a worker thread and
+    the result is applied on the main thread; a stale result for text the
+    user has since changed is dropped.  ``score_for()`` lets the submit
+    path reuse the last score instead of blocking the window again."""
     _LABELS = ["Very Weak", "Weak", "Fair", "Good", "Strong"]
 
     def __init__(self, parent, entry_var, **kw):
@@ -769,7 +898,8 @@ class PasswordStrengthBar(tk.Frame):
         self._bar_cv = tk.Canvas(bar_row, height=3, bg=C["surface2"],
                                   highlightthickness=0)
         self._bar_cv.pack(side="left", fill="x", expand=True)
-        self._bar_cv.bind("<Configure>", lambda e: self._schedule_refresh())
+        self._bar_w = 0
+        self._bar_cv.bind("<Configure>", self._on_configure)
 
         self._lbl = tk.Label(bar_row, text="", font=F["small"],
                               bg=C["bg"], fg=C["text3"], width=8, anchor="e")
@@ -781,10 +911,23 @@ class PasswordStrengthBar(tk.Frame):
         self._tip.pack(fill="x", pady=(2,0))
 
         self._refresh_job = None  # debounce handle
+        self._seq = 0             # request counter — stale worker results are dropped
+        self._last = ("", 0, "", "")   # (pw, score, label, tip) of the last applied result
+        # One scoring thread per bar, fed through a queue that is drained to
+        # the newest request (a burst of pauses used to spawn one zxcvbn run
+        # each).  ``_inflight`` lets score_for() wait briefly for the result
+        # of the text on screen instead of scoring on the main thread.
+        self._queue: "queue.Queue" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._inflight: tuple[str, threading.Event, dict] | None = None
         entry_var.trace_add("write", lambda *_: self._schedule_refresh())
 
+    def _on_configure(self, event):
+        self._bar_w = event.width
+        self._draw(self._last[1], self._last[0])
+
     def _schedule_refresh(self):
-        """Debounce — run zxcvbn 150 ms after last keystroke."""
+        """Debounce — score 150 ms after the last keystroke."""
         if self._refresh_job is not None:
             try: self.after_cancel(self._refresh_job)
             except Exception: pass
@@ -793,7 +936,10 @@ class PasswordStrengthBar(tk.Frame):
     def _score(self, pw):
         if not pw: return 0, "", ""
         if _zxcvbn_fn is not None:
-            r = _zxcvbn_fn(pw)
+            # zxcvbn caps input at 72 characters (raises above it, and is
+            # super-linear below it) — score the prefix, like the estimator
+            # itself does; anything that long is not weak for its length.
+            r = _zxcvbn_fn(pw[:72])
             score = r["score"]  # 0-4
             fb = r.get("feedback", {})
             tips = []
@@ -812,24 +958,95 @@ class PasswordStrengthBar(tk.Frame):
             s = 1 if e < 28 else 2 if e < 36 else 3 if e < 60 else 4
             return s, self._LABELS[s], ""
 
+    _SUBMIT_WAIT_S = 0.3   # how long score_for() waits for an in-flight result
+
+    def score_for(self, pw) -> int:
+        """0-4 for ``pw``.  The cached result when it is the text on screen
+        (the usual case at submit).  A fast typist who presses Return inside
+        the debounce window (or before the worker returned) gets the worker
+        kicked now and a short wait for ITS result; if that is still not in,
+        the last applied score is used — never a synchronous zxcvbn run on
+        the main thread."""
+        if pw == self._last[0]:
+            return self._last[1]
+        if self._refresh_job is not None:
+            try:
+                self.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+            self._refresh_job = None
+            self._refresh()
+        inflight = self._inflight
+        if inflight is not None and inflight[0] == pw:
+            _pw, ev, holder = inflight
+            if ev.wait(self._SUBMIT_WAIT_S) and "res" in holder:
+                score, label, tip = holder["res"]
+                self._apply(holder["seq"], pw, score, label, tip)
+                return score
+        return self._last[1]
+
     def _refresh(self):
+        self._refresh_job = None
         pw = self._var.get()
-        score, label, tip = self._score(pw)
+        self._seq += 1
+        seq = self._seq
+        if not pw:
+            self._inflight = None
+            self._apply(seq, pw, 0, "", "")
+            return
+        holder = {"seq": seq}
+        ev = threading.Event()
+        self._inflight = (pw, ev, holder)
+        self._queue.put((seq, pw, ev, holder))
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self._thread.start()
+
+    def _worker_loop(self):
+        """Scores the newest queued request; exits after a few idle seconds
+        so a closed window doesn't keep a thread parked forever."""
+        while True:
+            try:
+                item = self._queue.get(timeout=5)
+            except queue.Empty:
+                return
+            while True:   # drain: only the newest text matters
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            seq, pw, ev, holder = item
+            try:
+                res = self._score(pw)
+            except Exception:
+                res = (0, "", "")
+            holder["res"] = res
+            ev.set()
+            score, label, tip = res
+            safe_after(self, lambda s=seq, p=pw, r=res: self._apply(s, p, *r))
+
+    def _apply(self, seq, pw, score, label, tip):
+        if seq != self._seq:
+            return  # a newer keystroke superseded this result
+        self._last = (pw, score, label, tip)
+        self._lbl.config(text=label, fg=self._colour(score, pw))
+        self._tip.config(text=tip)
+        self._draw(score, pw)
+
+    @staticmethod
+    def _colour(score, pw):
         # Quality ramp only — the action blue is not a grade.
         colors = [C["error"], C["error"], C["warning"], C["success"], C["success"]]
-        pct    = score / 4
-        color  = colors[score] if pw else C["surface3"]
+        return colors[score] if pw else C["surface3"]
 
-        self._lbl.config(text=label, fg=color)
-        self._tip.config(text=tip)
-        self._bar_cv.update_idletasks()
-        w = self._bar_cv.winfo_width()
+    def _draw(self, score, pw):
+        w = self._bar_w
         if w < 2: return
         self._bar_cv.delete("all")
         self._bar_cv.create_rectangle(0, 0, w, 3, fill=C["surface2"], outline="")
-        fill = int(w * pct)
+        fill = int(w * score / 4)
         if fill > 0:
-            self._bar_cv.create_rectangle(0, 0, fill, 3, fill=color, outline="")
+            self._bar_cv.create_rectangle(0, 0, fill, 3, fill=self._colour(score, pw), outline="")
 
 
 class FileCard(tk.Frame):
@@ -839,12 +1056,15 @@ class FileCard(tk.Frame):
     ----------
     parent      : tk widget
     on_select   : callable(path) — fired when a file is chosen
+    on_folder   : callable(path) — fired when a folder is chosen in folder
+                  mode (falls back to on_select when not given)
     prompt      : str  — headline text before selection
     sub         : str  — subtext / accepted types hint
     filetypes   : list of (label, pattern) for the file dialog
     """
 
     def __init__(self, parent, on_select, *,
+                 on_folder=None,
                  prompt="Select a file",
                  sub="Click anywhere in this box",
                  filetypes=None,
@@ -853,6 +1073,8 @@ class FileCard(tk.Frame):
                          highlightbackground=C["border"], highlightthickness=1,
                          cursor="hand2", **kw)
         self._cb        = on_select
+        self._on_folder = on_folder
+        self._folder_mode = False
         self._selected  = False
         self._filetypes = filetypes or [("All files", "*")]
 
@@ -891,19 +1113,16 @@ class FileCard(tk.Frame):
             self._line2.config(text=sub_with_drop if supported else sub_without)
         self._sub_default = sub_with_drop if supported else sub_without
 
+    def set_folder_mode(self, on: bool):
+        """Clicking the card asks for a folder (→ ``on_folder``) instead of a file."""
+        self._folder_mode = bool(on)
+
     def _pick(self):
         from tkinter import filedialog
-        if getattr(self, "_is_folder_mode", False):
+        if self._folder_mode:
             p = filedialog.askdirectory()
-            if p and hasattr(self._cb, "__self__"):
-                # The encryptor wires _on_folder separately — call it if available
-                owner = self._cb.__self__
-                if hasattr(owner, "_on_folder"):
-                    owner._on_folder(p)
-                    return
-            # Fallback: treat folder path like a file path
             if p:
-                self._cb(p)
+                (self._on_folder or self._cb)(p)
         else:
             import os as _os
             p = filedialog.askopenfilename(

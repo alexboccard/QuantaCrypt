@@ -198,17 +198,23 @@ class TestVerifyKeyMethod:
         assert ".tmp" not in src, "_verify_run must not write any output file"
 
     def test_verify_run_checks_hmac(self):
+        """The HMAC check now lives in core.package.derive_final_key (which
+        the Tk wizard shares with qc-core); _verify_run must go through it."""
         import inspect
         from quantacrypt.ui.decryptor import DecryptorApp
         src = inspect.getsource(DecryptorApp._verify_run)
-        assert "_verify_meta_hmac" in src
+        assert "derive_final_key" in src
+        assert "argon2id_derive" not in src and "_verify_meta_hmac" not in src, \
+            "key derivation must not be re-implemented in the UI"
 
     def test_verify_run_decrypts_only_first_chunk(self):
+        """Chunk-0 proof is core.package.verify_first_chunk; the wizard
+        must call it rather than carry its own copy."""
         import inspect
         from quantacrypt.ui.decryptor import DecryptorApp
         src = inspect.getsource(DecryptorApp._verify_run)
-        # Verifier checks first chunk AAD uses chunk_count==1 for is_last
-        assert "chunk_count == 1" in src
+        assert "verify_first_chunk" in src
+        assert "decrypt_streaming" not in src and "AESGCM" not in src
 
     def test_start_verify_calls_validate(self):
         import inspect

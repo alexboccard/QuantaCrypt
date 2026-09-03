@@ -6,6 +6,9 @@ struct SharesSheet: View {
     let shares: [Share]
     let context: ShareFiles.Context
     var onDismiss: () -> Void = {}
+    /// Reported up so the quit guard knows the shares are safe — the sheet's
+    /// own `saved` flag dies with the sheet.
+    var onSaved: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var saved = false
@@ -131,11 +134,12 @@ struct SharesSheet: View {
         guard let folder = Panels.chooseFolder(message: "Choose a folder for the \(context.n) share files.",
                                                prompt: "Save Shares") else { return }
         do {
-            let written = try ShareFiles.writeIndividual(shares, context: context, into: folder)
+            let outcome = try ShareFiles.writeIndividual(shares, context: context, into: folder)
             saved = true
+            onSaved()
             saveError = nil
-            savedNote = "Saved \(written.count) share files to \(Format.tildePath(folder.path))"
-            savedLocation = written.first?.path ?? folder.path
+            savedNote = Self.savedNote(for: outcome, count: outcome.files.count, location: folder.path)
+            savedLocation = outcome.files.first?.path ?? folder.path
         } catch {
             saveError = "Could not write the share files: \(error.localizedDescription) Try a different folder."
         }
@@ -145,13 +149,27 @@ struct SharesSheet: View {
         guard let url = Panels.save(suggestedName: "\(context.stem).shares.txt", type: .plainText,
                                     message: "Save all \(context.n) shares in one file.") else { return }
         do {
-            try ShareFiles.writeCombined(shares, context: context, to: url)
+            let outcome = try ShareFiles.writeCombined(shares, context: context, to: url)
             saved = true
+            onSaved()
             saveError = nil
-            savedNote = "Saved all shares to \(Format.tildePath(url.path))"
-            savedLocation = url.path
+            savedNote = Self.savedNote(for: outcome, count: nil, location: outcome.files.first?.path ?? url.path)
+            savedLocation = outcome.files.first?.path ?? url.path
         } catch {
             saveError = "Could not write the shares file: \(error.localizedDescription) Try a different location."
         }
+    }
+
+    /// "Saved …", plus where the run went when a same-named file from an
+    /// earlier run forced a rename (its shares are left untouched).
+    nonisolated static func savedNote(for outcome: ShareFiles.Outcome, count: Int?, location: String) -> String {
+        let what = count.map { "\($0) share files" } ?? "all shares"
+        let base = "Saved \(what) to \(Format.tildePath(location))"
+        guard let renamed = outcome.renamedStem else { return base + "." }
+        if let count, count > 0 {
+            let names = outcome.files.map(\.lastPathComponent).joined(separator: ", ")
+            return base + ". A share file with that name already existed, so this run was saved as \(names) (stem \(renamed))."
+        }
+        return base + ". A file with that name already existed, so this run was saved as \(renamed)."
     }
 }

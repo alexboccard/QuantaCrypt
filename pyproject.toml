@@ -48,6 +48,7 @@ dev = [
     # error-formatting, but pin it explicitly so Dependabot can see the
     # floor directly.
     "pytest>=8.3.4",
+    "pip-audit>=2.7",
     "pytest-cov>=4.0",
     "pygments>=2.15",
     # volumes (fusepy) must be in dev so CI's `pip install .[dev]` has it:

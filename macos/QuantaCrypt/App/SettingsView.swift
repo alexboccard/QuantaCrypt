@@ -68,7 +68,9 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 560)
+        // minWidth, not width: at accessibility text sizes a fixed 560 clips
+        // the path row instead of letting the window grow.
+        .frame(minWidth: 560)
         .fixedSize(horizontal: false, vertical: true)
     }
 

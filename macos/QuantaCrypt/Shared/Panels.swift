@@ -71,4 +71,11 @@ enum Finder {
     static func open(_ path: String) {
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
+
+    /// The FUSE remedy is a Terminal command; handing over a command with no
+    /// way to reach the thing that runs it is half an instruction.
+    static func openTerminal() {
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        NSWorkspace.shared.openApplication(at: terminal, configuration: NSWorkspace.OpenConfiguration())
+    }
 }

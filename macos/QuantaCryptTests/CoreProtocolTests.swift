@@ -32,6 +32,52 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(error.detail, "InvalidTag")
     }
 
+    /// Every code `classify_error` in src/quantacrypt/core/errors.py can
+    /// return (its docstring lists them), plus the service's own
+    /// `invalid_request`. A code missing here would decode as `.internal`
+    /// and lose its code-specific handling.
+    func testEveryHelperErrorCodeDecodesToItsOwnCase() throws {
+        let helperCodes = ["wrong_credentials", "cancelled", "invalid_request", "invalid_input", "not_found",
+                           "already_exists", "permission_denied", "io", "format", "unsupported", "busy", "internal"]
+        for code in helperCodes {
+            let line = #"{"id":"r1","event":"error","code":"\#(code)","message":"m","detail":"d"}"#
+            guard case .error(let error)? = try WireEvent.parse(line: line).coreEvent else {
+                return XCTFail("not error for \(code)")
+            }
+            XCTAssertEqual(error.code.rawValue, code, "\(code) must map to its own case")
+            if code != "internal" {
+                XCTAssertNotEqual(error.code, .internal, "\(code) decoded as .internal")
+            }
+        }
+        XCTAssertEqual(CoreError.Code(wire: "permission_denied"), .permissionDenied)
+        XCTAssertEqual(CoreError.Code(wire: "already_exists"), .alreadyExists)
+    }
+
+    func testInvalidRequestGetsAppBugMessage() throws {
+        let line = #"{"id":"r1","event":"error","code":"invalid_request","message":"missing 'path'","detail":"InvalidRequest"}"#
+        guard case .error(let error)? = try WireEvent.parse(line: line).coreEvent else { return XCTFail("not error") }
+        XCTAssertEqual(error.code, .invalidRequest)
+        XCTAssertTrue(error.message.contains("QuantaCrypt sent a request the helper rejected"))
+        XCTAssertTrue(error.detail.contains("missing 'path'"))
+        XCTAssertTrue(error.detail.contains("InvalidRequest"))
+    }
+
+    /// `invalid_input` is the user's mistake (a share with a typo, too few
+    /// shares); `format` is a damaged payload. Both messages are written for
+    /// the user and must reach them untouched — never the "bug in the app"
+    /// text, never "wrong password".
+    func testUserFacingCodesKeepTheHelperMessage() throws {
+        let cases: [(code: String, expected: CoreError.Code)] = [("invalid_input", .invalidInput), ("format", .format)]
+        for (code, expected) in cases {
+            let line = #"{"id":"r1","event":"error","code":"\#(code)","message":"Share 2 can't be read — checksum mismatch","detail":"InvalidInput"}"#
+            guard case .error(let error)? = try WireEvent.parse(line: line).coreEvent else { return XCTFail("not error") }
+            XCTAssertEqual(error.code, expected)
+            XCTAssertEqual(error.message, "Share 2 can't be read — checksum mismatch")
+            XCTAssertEqual(error.detail, "InvalidInput")
+            XCTAssertFalse(error.message.contains("bug in the app"))
+        }
+    }
+
     func testUnknownErrorCodeFallsBackToInternal() throws {
         let line = #"{"id":"r1","event":"error","code":"brand_new","message":"?","detail":""}"#
         guard case .error(let error)? = try WireEvent.parse(line: line).coreEvent else { return XCTFail("not error") }
@@ -65,6 +111,75 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertEqual(params["n"] as? Int, 5)
         XCTAssertEqual(params["source"] as? String, "/tmp/in.txt")
         XCTAssertNil(params["password"])
+        // The helper's `_int_pair` checks `isinstance(k, int)`: the raw text
+        // must carry JSON integers, not `3.0` that an encoder happens to trim.
+        XCTAssertTrue(line.contains(#""k":3,"#), line)
+        XCTAssertTrue(line.contains(#""n":5"#), line)
+        XCTAssertFalse(line.contains("3.0"), line)
+    }
+
+    func testVolumeCreateEncodesIntegerThreshold() throws {
+        let line = try WireRequest(id: "v", request: .volumeCreate(path: "/v.qcv", credential: .splitKey(k: 2, n: 3))).encodedLine()
+        XCTAssertEqual(line, #"{"id":"v","op":"volume_create","params":{"k":2,"mode":"shamir","n":3,"path":"/v.qcv"}}"# + "\n")
+    }
+
+    func testJSONIntegerRoundTrips() throws {
+        XCTAssertEqual(JSONValue.integer(7).intValue, 7)
+        XCTAssertEqual(JSONValue.integer(7).doubleValue, 7)
+        XCTAssertEqual(JSONValue.number(7).intValue, 7)
+        XCTAssertNil(JSONValue.number(.infinity).intValue)
+        let data = try JSONEncoder().encode(JSONValue.integer(42))
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "42")
+    }
+
+    // MARK: Model message mapping
+
+    private let passwordFile = InspectInfo(path: "/f.qcx", size: 1, version: 1, mode: "password",
+                                           threshold: nil, total: nil, embedded: false)
+    private let splitFile = InspectInfo(path: "/f.qcx", size: 1, version: 1, mode: "shamir",
+                                        threshold: 2, total: 3, embedded: false)
+
+    @MainActor
+    func testDecryptRewritesOnlyWrongCredentials() {
+        let wrong = CoreError(code: .wrongCredentials, message: "helper text", detail: "InvalidTag")
+        let shown = DecryptModel.userFacingError(wrong, info: passwordFile, wrongPasswordCount: 3)
+        XCTAssertTrue(shown.error.message.contains("Caps Lock"))
+        XCTAssertEqual(shown.note, DecryptModel.noRecoveryNote)
+        XCTAssertNil(DecryptModel.userFacingError(wrong, info: passwordFile, wrongPasswordCount: 2).note)
+        XCTAssertTrue(DecryptModel.userFacingError(wrong, info: splitFile, wrongPasswordCount: 0)
+            .error.message.contains("Any 2 of the 3 shares"))
+
+        let damaged = CoreError(code: .format, message: "The file's contents are damaged — restore it from a backup.",
+                                detail: "CorruptPayload")
+        let unreadable = CoreError(code: .invalidInput, message: "Share 1 can't be read — checksum mismatch",
+                                   detail: "InvalidInput")
+        for info in [passwordFile, splitFile] {
+            for error in [damaged, unreadable] {
+                let shown = DecryptModel.userFacingError(error, info: info, wrongPasswordCount: 5)
+                XCTAssertEqual(shown.error, error, "\(error.code) must pass through for \(info.mode)")
+                XCTAssertNil(shown.note)
+                XCTAssertFalse(shown.error.message.lowercased().contains("password is incorrect"))
+            }
+        }
+    }
+
+    @MainActor
+    func testMountRewritesOnlyWrongCredentials() {
+        let wrong = CoreError(code: .wrongCredentials, message: "helper text", detail: "InvalidTag")
+        XCTAssertTrue(VolumesModel.friendlyMountError(wrong, credential: .password, path: "/v.qcv")
+            .message.contains("Caps Lock"))
+        XCTAssertTrue(VolumesModel.friendlyMountError(wrong, credential: .shares, path: "/v.qcv")
+            .message.contains("swapping in a different share"))
+        let damaged = CoreError(code: .format, message: "The volume's contents are damaged.", detail: "CorruptPayload")
+        let unreadable = CoreError(code: .invalidInput, message: "Need 3 different shares to unlock this volume, got 2",
+                                   detail: "InvalidInput")
+        for credential in VolumesModel.MountCredential.allCases {
+            XCTAssertEqual(VolumesModel.friendlyMountError(damaged, credential: credential, path: "/v.qcv"), damaged)
+            XCTAssertEqual(VolumesModel.friendlyMountError(unreadable, credential: credential, path: "/v.qcv"), unreadable)
+        }
+        let inspect = VolumesModel.inspectFailure(CoreError(code: .format, message: "File too small to be a valid .qcv volume", detail: "ValueError"))
+        XCTAssertEqual(inspect.code, .format)
+        XCTAssertEqual(inspect.message, "Couldn't read this volume: File too small to be a valid .qcv volume")
     }
 
     func testDecryptVerifyOnlyOmitsOutputDir() throws {

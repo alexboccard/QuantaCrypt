@@ -36,6 +36,7 @@ import uuid
 from typing import IO, Any, Callable
 
 from quantacrypt.core.crypto import (
+    CancelledOperation,
     KEY_BYTES,
     ARGON2_TIME_COST,
     ARGON2_MEMORY_COST,
@@ -479,12 +480,15 @@ def create_volume_single(
     path: str,
     password: str,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Create an empty .qcv volume protected by a password.
 
     Returns the volume metadata dict.
     """
     def _p(m):
+        if cancel_check and cancel_check():
+            raise CancelledOperation("Volume creation cancelled")
         if progress_cb:
             progress_cb(m)
 
@@ -537,12 +541,16 @@ def create_volume_single(
     dir_nonce, dir_ct = encrypt_directory(final_key, dir_index)
 
     _p("Writing volume container...")
-    with open(path, "wb") as f:
+    # Atomic and never clobbering: write beside the target, then replace.
+    # "xb" refuses an existing temp; the final os.replace is atomic.
+    tmp = path + ".part"
+    with open(tmp, "xb") as f:
         write_header(f, volume_id, meta_nonce, dir_nonce)
         _write_auth_params(f, auth_params)
         _write_encrypted_block(f, meta_ct)
         _write_encrypted_block(f, dir_ct)
 
+    os.replace(tmp, path)
     _p("Volume created.")
     return metadata
 
@@ -552,12 +560,15 @@ def create_volume_shamir(
     n: int,
     k: int,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[dict, list[str]]:
     """Create an empty .qcv volume protected by Shamir secret sharing.
 
     Returns (metadata_dict, share_strings).
     """
     def _p(m):
+        if cancel_check and cancel_check():
+            raise CancelledOperation("Volume creation cancelled")
         if progress_cb:
             progress_cb(m)
 
@@ -615,12 +626,16 @@ def create_volume_shamir(
     dir_nonce, dir_ct = encrypt_directory(final_key, dir_index)
 
     _p("Writing volume container...")
-    with open(path, "wb") as f:
+    # Atomic and never clobbering: write beside the target, then replace.
+    # "xb" refuses an existing temp; the final os.replace is atomic.
+    tmp = path + ".part"
+    with open(tmp, "xb") as f:
         write_header(f, volume_id, meta_nonce, dir_nonce)
         _write_auth_params(f, auth_params)
         _write_encrypted_block(f, meta_ct)
         _write_encrypted_block(f, dir_ct)
 
+    os.replace(tmp, path)
     _p("Volume created.")
     return metadata, share_strings
 

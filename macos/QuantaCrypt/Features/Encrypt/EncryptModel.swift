@@ -32,11 +32,20 @@ final class EncryptModel {
 
     var progress: CoreProgress?
     var isRunning = false
+    var isCancelling = false
     var error: CoreError?
     var status: String?
     var result: EncryptResult?
-    var sharesToShow: SharesPresentation?
+    var sharesToShow: SharesPresentation? {
+        didSet { if sharesToShow != nil { sharesSaved = false } }
+    }
+    /// Whether the shares on screen have been written somewhere durable.
+    /// Read by the quit guard — the sheet's own state dies with the sheet.
+    var sharesSaved = false
     var confirmReplace = false
+    /// Set when a source is refused for being already encrypted; the view
+    /// offers to hand it to the section that can actually open it.
+    var wrongSection: (path: String, section: AppSection)?
 
     private var task: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
@@ -52,8 +61,27 @@ final class EncryptModel {
         setSource(url.path)
     }
 
-    func setSource(_ path: String) {
-        guard !isRunning else { return }
+    /// Take `path` as the source. Returns false — and says why in `status`
+    /// — while an encrypt is running, so callers never switch the UI to a
+    /// file that was not actually loaded.
+    @discardableResult
+    func setSource(_ path: String) -> Bool {
+        guard !isRunning else {
+            status = Self.busyMessage(for: path)
+            return false
+        }
+        // Encrypt is the default section, so someone who wants their file
+        // back lands here first. Accepting a .qcx produced notes.txt.qcx.qcx
+        // and a success card.
+        if let section = Self.alreadyEncrypted(path) {
+            wrongSection = (path, section)
+            return false
+        }
+        wrongSection = nil
+        // An output the user picked belongs to the source it was picked for;
+        // a new source gets the default name again so the replace prompt can
+        // protect the previous run's ciphertext.
+        if path != sourcePath { outputChosenByUser = false }
         sourcePath = path
         sourceIsFolder = Paths.isDirectory(path)
         result = nil
@@ -61,6 +89,21 @@ final class EncryptModel {
         status = nil
         if !outputChosenByUser { outputPath = Self.defaultOutput(for: path) }
         describeSource(path)
+        return true
+    }
+
+    static func busyMessage(for path: String) -> String {
+        "Finish or cancel the current job to open \(Format.fileName(path))."
+    }
+
+    /// The section that can open `path`, when it is already a QuantaCrypt
+    /// container and so cannot sensibly be an encryption source.
+    static func alreadyEncrypted(_ path: String) -> AppSection? {
+        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        case "qcx": return .decrypt
+        case "qcv": return .volumes
+        default: return nil
+        }
     }
 
     static func defaultOutput(for source: String) -> String {
@@ -138,8 +181,10 @@ final class EncryptModel {
 
     func encrypt() {
         guard canRun, let output = outputPath else { return }
-        // NSSavePanel already confirmed a replacement when the user chose the path.
-        if Paths.exists(output) && !outputChosenByUser {
+        // Always ask, even after the save panel's own replace prompt: the
+        // source or output may have changed since, and the file being
+        // replaced may be the only ciphertext of an earlier run.
+        if Paths.exists(output) {
             confirmReplace = true
             return
         }
@@ -156,6 +201,7 @@ final class EncryptModel {
             ? .password(password)
             : .splitKey(k: threshold, n: total)
         isRunning = true
+        isCancelling = false
         progress = nil
         error = nil
         status = nil
@@ -178,6 +224,7 @@ final class EncryptModel {
 
     private func finish(_ result: EncryptResult) {
         isRunning = false
+        isCancelling = false
         progress = nil
         self.result = result
         password = ""
@@ -186,12 +233,13 @@ final class EncryptModel {
             sharesToShow = SharesPresentation(
                 shares: shares,
                 context: ShareFiles.Context(stem: Format.stem(result.output),
-                                            protectedName: result.filename, k: k, n: n))
+                                            protectedName: result.filename, k: k, n: n, kind: .qcxFile))
         }
     }
 
     private func fail(_ error: CoreError) {
         isRunning = false
+        isCancelling = false
         progress = nil
         if error.isCancellation {
             status = error.message
@@ -200,7 +248,11 @@ final class EncryptModel {
         }
     }
 
+    /// The helper has up to `cancelGrace` to acknowledge, so say so rather
+    /// than leaving a percentage climbing under a user who asked it to stop.
     func cancel() {
+        guard isRunning else { return }
+        isCancelling = true
         task?.cancel()
     }
 
@@ -216,5 +268,6 @@ final class EncryptModel {
         result = nil
         error = nil
         status = nil
+        wrongSection = nil
     }
 }

@@ -7,6 +7,18 @@ import UniformTypeIdentifiers
 final class DecryptModel {
     static let noRecoveryNote = "There is no way to recover this file without the password."
 
+    static let inspectTimeout: Duration = .seconds(20)
+    static let inspectTimedOut = CoreError(
+        code: .helperUnavailable,
+        message: "The encryption helper didn't answer. Try again — if it keeps happening, restart the helper in Settings.",
+        detail: "inspect timed out after 20s")
+
+    /// Re-run the inspection for the file already on screen.
+    func retryInspect() {
+        guard let path = filePath else { return }
+        load(path: path)
+    }
+
     private let core: CoreClient
     private let recents: RecentStore
 
@@ -22,12 +34,16 @@ final class DecryptModel {
 
     var progress: CoreProgress?
     var isRunning = false
+    var isCancelling = false
     var isVerifying = false
     var error: CoreError?
     var errorNote: String?
     var status: String?
     var result: DecryptResult?
     var verifiedNote: String?
+    /// Set when the user arrives from "Check it opens" on the encrypt result,
+    /// so Decrypt can say why it is showing them this file.
+    var verifyPrompt = false
     private var wrongPasswordCount = 0
     private var task: Task<Void, Never>?
 
@@ -47,8 +63,14 @@ final class DecryptModel {
         url.pathExtension.lowercased() == "qcx"
     }
 
-    func load(path: String) {
-        guard !isRunning else { return }
+    /// Load `path` for inspection. Returns false — with the reason in
+    /// `status` — while a decrypt is running.
+    @discardableResult
+    func load(path: String) -> Bool {
+        guard !isRunning else {
+            status = EncryptModel.busyMessage(for: path)
+            return false
+        }
         filePath = path
         info = nil
         inspectError = nil
@@ -57,13 +79,23 @@ final class DecryptModel {
         errorNote = nil
         status = nil
         verifiedNote = nil
+        verifyPrompt = false
         wrongPasswordCount = 0
         password = ""
+        // Shares too, not just the password: leftovers from the previous
+        // file used to sit in the fields looking valid, and the failure then
+        // advised swapping a share that was never wrong.
+        shares = []
         if !outputChosenByUser { outputDir = Paths.defaultOutputFolder ?? Format.directory(path) }
         inspecting = true
         Task { [core] in
             do {
-                let info: InspectInfo = try await core.perform(.inspect(path: path))
+                // A helper that launches but never answers is the worst
+                // failure this client has; without a bound the user gets a
+                // spinner on an otherwise empty screen and no way out.
+                let info: InspectInfo = try await withTimeout(Self.inspectTimeout) {
+                    try await core.perform(.inspect(path: path))
+                }
                 guard filePath == path else { return }
                 self.info = info
                 let needed = info.threshold ?? 2
@@ -74,6 +106,8 @@ final class DecryptModel {
                 }
             } catch let error as CoreError {
                 if filePath == path { inspectError = error }
+            } catch is TimeoutError {
+                if filePath == path { inspectError = Self.inspectTimedOut }
             } catch {
                 if filePath == path {
                     inspectError = CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)")
@@ -81,6 +115,7 @@ final class DecryptModel {
             }
             if filePath == path { inspecting = false }
         }
+        return true
     }
 
     func chooseOutputDir() {
@@ -91,50 +126,26 @@ final class DecryptModel {
     }
 
     func loadSharesFromFiles() {
-        let urls = Panels.chooseFiles(types: [.plainText, .text, .item], message: "Choose one or more share files.")
+        let urls = Panels.chooseFiles(types: ShareFiles.fileTypes, message: "Choose one or more share files.")
         guard !urls.isEmpty else { return }
-        var loaded: [String] = []
-        for url in urls {
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            loaded.append(contentsOf: ShareFiles.parse(text))
-        }
+        let (loaded, problems) = ShareFiles.load(urls)
         guard !loaded.isEmpty else {
-            status = "No shares were found in \(urls.count == 1 ? "that file" : "those files")."
+            status = problems.first ?? "No shares were found in \(urls.count == 1 ? "that file" : "those files")."
             return
         }
-        status = nil
-        var merged = shares.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        for share in loaded where !merged.contains(share) { merged.append(share) }
-        let needed = info?.threshold ?? merged.count
-        while merged.count < needed { merged.append("") }
-        if let total = info?.total, merged.count > total { merged = Array(merged.prefix(total)) }
-        shares = merged
+        status = problems.first
+        shares = ShareValidation.merge(loaded, into: shares, threshold: info?.threshold, total: info?.total)
     }
 
     // MARK: Validation
-
-    private var trimmedShares: [String] {
-        shares.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-    }
 
     var validationMessage: String? {
         guard filePath != nil else { return "Choose an encrypted file." }
         guard let info else { return inspectError == nil ? "Reading the file…" : "This file can't be read." }
         if info.isSplitKey {
-            let filled = trimmedShares.filter { !$0.isEmpty }
-            let needed = info.threshold ?? 2
-            if filled.count < needed {
-                let empty = trimmedShares.enumerated().filter { $0.element.isEmpty }.map { "\($0.offset + 1)" }
-                return "Enter \(needed) shares — share\(empty.count == 1 ? "" : "s") \(empty.joined(separator: ", ")) \(empty.count == 1 ? "is" : "are") empty."
-            }
-            var seen: [String: Int] = [:]
-            for (i, share) in filled.enumerated() {
-                if let first = seen[share] { return "Shares \(first + 1) and \(i + 1) are the same share." }
-                seen[share] = i
-            }
-        } else if password.isEmpty {
-            return "Enter the password."
+            return ShareValidation.message(shares: shares, threshold: info.threshold)
         }
+        if password.isEmpty { return "Enter the password." }
         return nil
     }
 
@@ -148,9 +159,10 @@ final class DecryptModel {
     private func start(verifyOnly: Bool) {
         guard canRun, let path = filePath, let info else { return }
         let credential: CoreRequest.Credential = info.isSplitKey
-            ? .shares(trimmedShares.filter { !$0.isEmpty })
+            ? .shares(ShareValidation.prepared(shares))
             : .password(password)
         isRunning = true
+        isCancelling = false
         isVerifying = verifyOnly
         progress = nil
         error = nil
@@ -183,6 +195,7 @@ final class DecryptModel {
 
     private func finishVerify() {
         isRunning = false
+        isCancelling = false
         progress = nil
         verifiedNote = info?.isSplitKey == true
             ? "These shares unlock the file. Nothing was written."
@@ -191,6 +204,7 @@ final class DecryptModel {
 
     private func finish(_ result: DecryptResult, path: String) {
         isRunning = false
+        isCancelling = false
         progress = nil
         self.result = result
         password = ""
@@ -199,32 +213,43 @@ final class DecryptModel {
 
     private func fail(_ error: CoreError, info: InspectInfo) {
         isRunning = false
+        isCancelling = false
         progress = nil
         if error.isCancellation {
             status = error.message
             return
         }
-        guard error.code == .wrongCredentials else {
-            self.error = error
-            return
-        }
+        if error.code == .wrongCredentials, !info.isSplitKey { wrongPasswordCount += 1 }
+        let shown = Self.userFacingError(error, info: info, wrongPasswordCount: wrongPasswordCount)
+        self.error = shown.error
+        errorNote = shown.note
+    }
+
+    /// The error to show for a failed decrypt. Only `wrong_credentials` is
+    /// rewritten (Caps Lock hint, "which share?" advice, the no-recovery note
+    /// after `wrongPasswordCount` misses); every other code — `format` for a
+    /// damaged payload, `invalid_input` for an unreadable share — keeps the
+    /// helper's own message, which is written for the user.
+    static func userFacingError(_ error: CoreError, info: InspectInfo,
+                                wrongPasswordCount: Int) -> (error: CoreError, note: String?) {
+        guard error.code == .wrongCredentials else { return (error, nil) }
         if info.isSplitKey {
             let k = info.threshold.map(String.init) ?? "the required"
             let n = info.total.map(String.init) ?? "its"
-            self.error = CoreError(
+            return (CoreError(
                 code: error.code,
                 message: "These shares don't unlock this file. Any \(k) of the \(n) shares will work, so try swapping in a different share — QuantaCrypt can't tell which one is wrong.",
-                detail: error.detail)
-        } else {
-            wrongPasswordCount += 1
-            self.error = CoreError(code: error.code,
-                                   message: "The password is incorrect. Check Caps Lock and try again.",
-                                   detail: error.detail)
-            if wrongPasswordCount >= 3 { errorNote = Self.noRecoveryNote }
+                detail: error.detail), nil)
         }
+        return (CoreError(code: error.code,
+                          message: "The password is incorrect. Check Caps Lock and try again.",
+                          detail: error.detail),
+                wrongPasswordCount >= 3 ? noRecoveryNote : nil)
     }
 
     func cancel() {
+        guard isRunning else { return }
+        isCancelling = true
         task?.cancel()
     }
 

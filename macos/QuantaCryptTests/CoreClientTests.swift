@@ -174,7 +174,7 @@ final class CoreClientTests: XCTestCase {
         let req = await transport.request(0)
         XCTAssertEqual(req.op, "shutdown")
         await transport.emit(["id": req.id!, "event": "done", "result": [:]])
-        await shutdownTask.value
+        _ = await shutdownTask.value
         let terminated = await transport.terminated
         XCTAssertTrue(terminated)
         let running = await client.isRunning
@@ -186,6 +186,53 @@ final class CoreClientTests: XCTestCase {
         } catch let error as CoreError {
             XCTAssertEqual(error.code, .helperUnavailable)
         }
+    }
+
+    func testShutdownReportsUnmountFailures() async throws {
+        let (client, holder) = makeClient()
+        try await client.start()
+        let transport = await waitForTransport(holder)
+        let shutdownTask = Task { await client.shutdown() }
+        await transport.waitForRequests(1)
+        let req = await transport.request(0)
+        await transport.emit(["id": req.id!, "event": "done",
+                              "result": ["unmount_failed": ["/Users/x/QuantaCrypt Volumes/Vault"]]])
+        let outcome = await shutdownTask.value
+        XCTAssertEqual(outcome.unmountFailed, ["/Users/x/QuantaCrypt Volumes/Vault"])
+    }
+
+    func testRestartHoldsRequestsForTheNewHelperAndIsNotACrash() async throws {
+        let (client, holder) = makeClient()
+        try await client.start()
+        let old = await waitForTransport(holder)
+
+        let restartTask = Task { await client.restart() }
+        await old.waitForRequests(1)
+        let shutdownReq = await old.request(0)
+        XCTAssertEqual(shutdownReq.op, "shutdown")
+
+        // Arrives while the old helper is being stopped: it must wait for
+        // the new one, not be written to the dying pipe.
+        let pingTask = Task { try await client.perform(.ping) }
+        try await Task.sleep(for: .milliseconds(50))
+        let oldSent = await old.sent.count
+        XCTAssertEqual(oldSent, 1, "only the shutdown went to the old helper")
+
+        await old.emit(["id": shutdownReq.id!, "event": "done", "result": [:]])
+        await restartTask.value
+        XCTAssertEqual(holder.count, 2)
+        let fresh = holder.last
+        await fresh.waitForRequests(1)
+        let pingReq = await fresh.request(0)
+        XCTAssertEqual(pingReq.op, "ping")
+        await fresh.emit(["id": pingReq.id!, "event": "done", "result": ["pong": true]])
+        let result = try await pingTask.value
+        XCTAssertEqual(result["pong"], .bool(true))
+
+        let restarts = await client.restartCount
+        XCTAssertEqual(restarts, 0, "a requested restart is not a crash")
+        let oldTerminated = await old.terminated
+        XCTAssertTrue(oldTerminated)
     }
 
     func testTransportFactoryFailureSurfacesAsCoreError() async {

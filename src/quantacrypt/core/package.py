@@ -20,6 +20,7 @@ from quantacrypt.core import crypto as cc
 from quantacrypt.core.crypto import (
     MAGIC, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION, CancelledOperation,
 )
+from quantacrypt.core.errors import CorruptPayload, InvalidInput, InvalidRequest
 
 Progress = Callable[[str], None] | None
 CancelCheck = Callable[[], bool] | None
@@ -113,11 +114,56 @@ def normalize_shares(shares: Iterable[str]) -> list[str]:
             else:
                 code = cc.encode_share(cc.mnemonic_to_share(" ".join(s.split())))
         except Exception as exc:
-            raise ValueError(f"Share {i} can't be read — {exc}") from exc
+            raise InvalidInput(f"Share {i} can't be read — {exc}") from exc
         if code in seen:
             continue
         seen.add(code)
         codes.append(code)
+    return codes
+
+
+def extract_share_codes(text: str) -> list[str]:
+    """Find every share in free text (share files, pasted notes) as QCSHARE-
+    codes, in order of appearance.  Tolerates headers and prose: QCSHARE-
+    lines are taken as-is; runs of BIP-39 words are gathered and converted
+    when a run reaches the 50-word share length.  Duplicates collapse.
+    Used by both UIs so "Load from file…" and "Paste all" agree."""
+    codes: list[str] = []
+    seen: set[str] = set()
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    for ln in lines:
+        if ln.upper().startswith("QCSHARE-"):
+            try:
+                code = cc.encode_share(cc.decode_share(ln))
+            except Exception:
+                continue
+            if code not in seen:
+                seen.add(code); codes.append(code)
+    try:
+        wl_set = set(cc._load_wordlist())
+    except Exception:  # wordlist unavailable — codes only
+        return codes
+    block: list[str] = []
+
+    def _flush():
+        if len(block) == cc.MNEMONIC_WORDS_PER_SHARE:
+            try:
+                code = cc.encode_share(cc.mnemonic_to_share(" ".join(block)))
+            except Exception:
+                code = None
+            if code and code not in seen:
+                seen.add(code); codes.append(code)
+        block.clear()
+
+    for ln in lines:
+        toks = ln.lower().split()
+        if toks and all(t in wl_set for t in toks):
+            block.extend(toks)
+            if len(block) > cc.MNEMONIC_WORDS_PER_SHARE:
+                del block[:-cc.MNEMONIC_WORDS_PER_SHARE]
+        else:
+            _flush()
+    _flush()
     return codes
 
 
@@ -158,7 +204,7 @@ def derive_final_key(meta: dict, *, password: str | None = None,
 
     if meta["mode"] == "single":
         if not password:
-            raise ValueError("A password is required to open this file")
+            raise InvalidInput("A password is required to open this file")
         _p("Deriving 512-bit password key (Argon2id)...")
         pw_bytes = password.encode()
         argon_key = cc.argon2id_derive(pw_bytes, d64("argon_salt"))
@@ -175,7 +221,7 @@ def derive_final_key(meta: dict, *, password: str | None = None,
         k = meta["threshold"]
         codes = normalize_shares(shares or [])
         if len(codes) < k:
-            raise ValueError(
+            raise InvalidInput(
                 f"Need {k} different shares to open this file, got {len(codes)}")
         _p(f"Combining {k} shares to recover the key...")
         share_dicts = [cc.decode_share(s) for s in codes[:k]]
@@ -198,6 +244,13 @@ def verify_first_chunk(qcx_path: str, meta: dict, final_key: bytes) -> None:
     Raises on a wrong key or a corrupt/truncated payload."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    # The filename envelope is always present and encrypted under the same
+    # key, so it proves the key even for a 0-byte payload (which has no
+    # chunk to decrypt).
+    cc.aes_gcm_decrypt(final_key, _b64.b64decode(meta["filename_nonce"]),
+                       _b64.b64decode(meta["filename_enc"]))
+    if meta.get("payload_chunk_count", 0) == 0:
+        return
     payload_offset = meta.get("payload_offset", 0)
     base_nonce = _b64.b64decode(meta["payload_nonce"])
     cipher = AESGCM(cc.derive_aes_key(final_key))
@@ -209,14 +262,23 @@ def verify_first_chunk(qcx_path: str, meta: dict, final_key: bytes) -> None:
         seq = struct.unpack(">I", seq_raw)[0]
         if seq != 0:
             raise ValueError(f"First chunk has unexpected sequence number {seq} — file may be corrupt")
-        ct_len = struct.unpack(">I", f.read(4))[0]
+        len_raw = f.read(4)
+        if len(len_raw) < 4:
+            raise ValueError("File appears truncated")
+        ct_len = struct.unpack(">I", len_raw)[0]
         if ct_len > cc.CHUNK_SIZE + 16:
             raise ValueError(
                 f"Chunk declares an implausible size ({ct_len} bytes) — file may be corrupt")
         ct = f.read(ct_len)
     nonce = cc._chunk_nonce(base_nonce, 0)
     aad = cc._chunk_aad(0, meta["payload_chunk_count"] == 1)
-    cipher.decrypt(nonce, ct, aad)  # raises InvalidTag on a wrong key
+    try:
+        cipher.decrypt(nonce, ct, aad)
+    except Exception as exc:  # InvalidTag: the key is proven, so the data is bad
+        raise CorruptPayload(
+            "The file's contents are damaged or were altered after encryption — "
+            "the password is right, but this copy can't be restored. Try another "
+            "copy or a backup.") from exc
 
 
 # ── Output naming ─────────────────────────────────────────────────────────────
@@ -227,7 +289,12 @@ def safe_output_name(fname: str | None) -> str:
     an empty result becomes 'decrypted'."""
     name = os.path.basename(fname or "")
     name = "".join(ch for ch in name if ch.isprintable() and ch not in ("/", "\0"))
-    name = name.strip().strip(".")
+    name = name.strip()
+    # Keep a leading dot (hidden files like .env are legitimate names); only
+    # the bare "." / ".." entries and trailing dots are dropped.
+    name = name.rstrip(".")
+    if name.strip(".") == "":
+        name = ""
     return name or "decrypted"
 
 
@@ -240,6 +307,29 @@ def unique_path(out_dir: str, name: str) -> tuple[str, bool]:
         out = os.path.join(out_dir, f"{root}_{n}{ext}")
         n += 1
     return out, n > 2
+
+
+def _place_without_clobber(tmp: str, out_dir: str, name: str) -> tuple[str, bool]:
+    """Move ``tmp`` to a fresh name in ``out_dir`` atomically: ``os.link``
+    fails with EEXIST instead of replacing, so a file that appears between
+    the existence check and the rename is never overwritten.  Falls back to
+    ``os.replace`` on filesystems without hard links (exFAT, some SMB)."""
+    renamed = False
+    root, ext = os.path.splitext(name)
+    n = 1
+    while True:
+        cand = os.path.join(out_dir, name if n == 1 else f"{root}_{n}{ext}")
+        try:
+            os.link(tmp, cand)
+        except FileExistsError:
+            n += 1; renamed = True
+            continue
+        except OSError:
+            cand, renamed = unique_path(out_dir, name)
+            os.replace(tmp, cand)
+            return cand, renamed
+        os.unlink(tmp)
+        return cand, renamed
 
 
 def batch_output_paths(paths: list[str], out_dir: str) -> list[str]:
@@ -313,22 +403,26 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
     ``output + '.tmp'`` and renames.  Folders are zipped first to a 0600
     staging file beside the output.  Returns a JSON-able summary."""
     if mode not in ("password", "single", "shamir"):
-        raise ValueError(f"Unknown mode {mode!r}")
+        raise InvalidRequest(f"Unknown mode {mode!r}")
     single = mode in ("password", "single")
     if single and not password:
-        raise ValueError("A password is required")
+        raise InvalidInput("A password is required")
     if not single and not (k and n and 2 <= k <= n <= 255):
-        raise ValueError("Split-key mode needs 2 <= k <= n <= 255")
+        raise InvalidRequest("Split-key mode needs 2 <= k <= n <= 255")
     if not os.path.exists(source):
         raise FileNotFoundError(source)
     out_abs = os.path.abspath(output)
     src_abs = os.path.abspath(source)
     is_folder = os.path.isdir(source)
-    if is_folder and (out_abs == src_abs or out_abs.startswith(src_abs + os.sep)):
-        raise ValueError("The output file can't be inside the folder being encrypted")
+    if out_abs == src_abs:
+        raise InvalidInput("The output file can't be the source file itself")
+    if is_folder and out_abs.startswith(src_abs + os.sep):
+        raise InvalidInput("The output file can't be inside the folder being encrypted")
 
     staging = None
-    tmp = out_abs + ".tmp"
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(out_abs)}.qc-enc-",
+                               dir=os.path.dirname(out_abs) or None)
+    os.close(fd)
     try:
         if is_folder:
             fd, staging = tempfile.mkstemp(
@@ -410,16 +504,28 @@ def decrypt_qcx(path: str, output_dir: str, *, password: str | None = None,
         return {"verified": True, "mode": meta["mode"]}
 
     if not os.path.isdir(output_dir):
-        raise NotADirectoryError(output_dir)
+        raise InvalidInput(f"The output folder doesn't exist: {output_dir}")
     fd, tmp = tempfile.mkstemp(prefix=".qc-decrypt-", dir=output_dir)
     try:
         with os.fdopen(fd, "wb") as f:
-            fname, orig_size, ts = cc.decrypt_streaming(
-                path, f, meta, final_key,
-                progress_cb=progress, cancel_check=cancel_check)
+            try:
+                fname, orig_size, ts = cc.decrypt_streaming(
+                    path, f, meta, final_key,
+                    progress_cb=progress, cancel_check=cancel_check)
+            except CancelledOperation:
+                raise
+            except Exception as exc:
+                low = (str(exc) or type(exc).__name__).lower()
+                if "invalidtag" in low or "authentication" in low:
+                    # derive_final_key already proved the key (envelope +
+                    # HMAC), so a chunk that fails to authenticate is damage.
+                    raise CorruptPayload(
+                        "The file's contents are damaged or were altered after "
+                        "encryption — the password is right, but this copy can't "
+                        "be restored. Try another copy or a backup.") from exc
+                raise
         name = safe_output_name(fname)
-        out, renamed = unique_path(output_dir, name)
-        os.replace(tmp, out)
+        out, renamed = _place_without_clobber(tmp, output_dir, name)
     except BaseException:
         try:
             os.remove(tmp)

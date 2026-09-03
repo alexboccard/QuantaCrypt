@@ -8,30 +8,47 @@ event per stdout line; long operations run on worker threads and report
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
 import threading
+import uuid
+from errno import EEXIST as errno_EEXIST
 from typing import Any, Callable, IO
 
 from quantacrypt import __version__
 from quantacrypt.core import crypto as cc
 from quantacrypt.core import package as pkg
-from quantacrypt.core.errors import classify_error
+from quantacrypt.core.errors import InvalidInput, InvalidRequest, classify_error
+
+log = logging.getLogger("quantacrypt.service")
 
 CONTROL_OPS = ("cancel", "shutdown", "ping", "version")
+
+# How long the EOF path lets in-flight work finish before cancelling it —
+# a wedged worker must not keep an orphaned helper (and its mounts) alive.
+EOF_GRACE_SECONDS = 300.0
+JOIN_SECONDS = 5.0
+
+
+class ServiceStop(BaseException):
+    """Raised from the SIGTERM handler on the main thread so the blocked
+    stdin read unwinds (PEP 475: a handler that raises is not retried)."""
 
 # (keyword, stage id, label) — first match wins, so put specific before broad.
 _STAGE_MAP = [
     ("compress",       "compress", "Compressing folder"),
     ("argon2",         "kdf",      "Securing password"),
+    ("decrypting kyber", "unlock", "Unlocking key"),
+    ("decapsulat",     "unlock",   "Unlocking key"),
+    ("combining",      "split",    "Combining shares"),
     ("private key",    "lock",     "Locking key"),
     ("keypair",        "kem",      "Generating protection"),
     ("kyber",          "kem",      "Generating protection"),
     ("encapsulat",     "kem",      "Generating protection"),
     ("master key",     "kem",      "Generating protection"),
     ("splitting",      "split",    "Splitting key"),
-    ("combining",      "split",    "Combining shares"),
     ("decrypting payload", "payload", "Decrypting file"),
     ("payload",        "payload",  "Encrypting file"),
     ("integrity",      "verify",   "Checking integrity"),
@@ -78,6 +95,8 @@ class Service:
         self._reqs: dict[str, _Request] = {}
         self._rlock = threading.Lock()
         self._stopping = False
+        self._shutdown_started = False
+        self._shutdown_lock = threading.Lock()
         self._exit_fn = exit_fn
         self.ops: dict[str, Callable[[dict, "_Ctx"], dict]] = {
             "fuse_check": op_fuse_check,
@@ -106,22 +125,45 @@ class Service:
     # ── Loop ─────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Serve until EOF or ``shutdown``.
+        """Serve until EOF, ``shutdown`` or ``request_stop``.
 
         EOF means "no more requests": in-flight work is allowed to finish
-        (a one-shot client may write its request and close the pipe), then
-        volumes are unmounted and the process exits.  The ``shutdown`` op
-        is the abrupt form: it cancels in-flight work first.
+        (a one-shot client may write its request and close the pipe) for up
+        to ``EOF_GRACE_SECONDS``, then volumes are unmounted and the process
+        exits.  The ``shutdown`` op and SIGTERM are the abrupt form: they
+        cancel in-flight work first.
         """
         try:
-            for line in self._in:
-                if self._stopping:
-                    break
-                self.handle_line(line)
+            try:
+                for line in self._in:
+                    self.handle_line(line)
+                    if self._stopping:
+                        break
+            except ServiceStop:
+                pass
         finally:
             if not self._stopping:
-                self.wait_idle(timeout=None)
-            self.shutdown()
+                self.wait_idle(timeout=EOF_GRACE_SECONDS)
+            # Teardown once (a shutdown op may already have done it), then
+            # always leave: the exit must not depend on who tore down.
+            self.shutdown(exit_after=False)
+            if self._exit_fn:
+                self._exit_fn()
+
+    def request_stop(self) -> None:
+        """Flag the loop to stop and cancel workers.  Does NOT touch stdin:
+        closing a file another thread is blocked reading deadlocks on the
+        buffer lock (and inside a signal handler it is a reentrant call).
+        The SIGTERM handler raises ``ServiceStop`` after calling this so the
+        main thread's blocked read unwinds; a caller on another thread must
+        write a line (even an empty one) to wake the loop.  All teardown
+        happens in ``run()``'s ``finally`` on the main thread, never inside
+        the signal handler (which could otherwise re-enter ``_mount_lock``)."""
+        self._stopping = True
+        with self._rlock:
+            reqs = list(self._reqs.values())
+        for r in reqs:
+            r.cancelled.set()
 
     def handle_line(self, line: str) -> None:
         line = line.strip()
@@ -138,7 +180,7 @@ class Service:
             return
         rid = req.get("id")
         if rid is None:
-            rid = f"auto-{len(self._reqs) + 1}"
+            rid = f"auto-{uuid.uuid4().hex[:12]}"   # never collides with a live id
         rid = str(rid)
         op = req["op"]
         params = req.get("params") or {}
@@ -153,6 +195,7 @@ class Service:
         if handler is None:
             self._error(rid, "invalid_request", f"Unknown op {op!r}.")
             return
+        log.info("request %s op=%s", rid, op)   # ids and ops only — never params
         with self._rlock:
             if rid in self._reqs:
                 self._error(rid, "invalid_request", f"Request id {rid!r} is already running.")
@@ -182,21 +225,36 @@ class Service:
                 r.cancelled.set()
             self.emit({"id": rid, "event": "done", "result": {"cancelled": r is not None}})
         elif op == "shutdown":
-            self.emit({"id": rid, "event": "done", "result": {}})
+            # Do the work first, acknowledge second: the client starts its
+            # SIGTERM escalation timer only when it sees this ``done``.
             self._stopping = True
-            self.shutdown()
+            failures = self.shutdown(exit_after=False)
+            self.emit({"id": rid, "event": "done",
+                       "result": {"unmount_failed": failures}})
 
     def _run_request(self, r: _Request, handler) -> None:
         ctx = _Ctx(self, r)
         try:
+            # A handler that observed the cancel token raises
+            # CancelledOperation itself; one that finished has written its
+            # output, so it is reported as done even if a cancel arrived in
+            # the last millisecond — "cancelled" must mean "nothing written".
             result = handler(r.params, ctx)
-            if r.cancelled.is_set():
-                raise cc.CancelledOperation("Cancelled")
             self.emit({"id": r.id, "event": "done", "result": result})
         except BaseException as exc:  # noqa: BLE001 — every failure becomes an event
-            code, message, detail = classify_error(exc)
-            self._error(r.id, code, message, detail)
+            try:
+                code, message, detail = classify_error(exc)
+                self._error(r.id, code, message, detail)
+            except BaseException as exc2:  # noqa: BLE001 — a request must always end
+                try:
+                    self.emit({"id": r.id, "event": "error", "code": "internal",
+                               "message": "The helper hit an unexpected error.",
+                               "detail": repr(exc2)[:500]})
+                except BaseException:
+                    print(f"qc-core: could not report failure of {r.id}: {exc2!r}",
+                          file=sys.stderr)
         finally:
+            log.info("request %s finished", r.id)
             with self._rlock:
                 self._reqs.pop(r.id, None)
 
@@ -207,27 +265,36 @@ class Service:
         for t in threads:
             t.join(timeout)
 
-    def shutdown(self) -> None:
-        """Cancel running work, save and unmount every volume, exit."""
+    def shutdown(self, *, exit_after: bool = True) -> list[str]:
+        """Cancel running work, save and unmount every volume, then exit.
+        Idempotent: a second call (run()'s finally after the shutdown op,
+        or a signal during shutdown) returns immediately."""
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return []
+            self._shutdown_started = True
         self._stopping = True
         with self._rlock:
             reqs = list(self._reqs.values())
         for r in reqs:
             r.cancelled.set()
         for r in reqs:
-            if r.thread:
-                r.thread.join(5)
+            if r.thread and r.thread is not threading.current_thread():
+                r.thread.join(JOIN_SECONDS)
+        failures: list[str] = []
         try:
             from quantacrypt.core.fuse_ops import get_mounted_volumes, unmount_volume
             for mp in list(get_mounted_volumes()):
                 try:
                     unmount_volume(mp)
-                except Exception as exc:  # noqa: BLE001 — best effort at exit
+                except Exception as exc:  # noqa: BLE001 — reported, not hidden
+                    failures.append(mp)
                     print(f"qc-core: unmount {mp} failed: {exc}", file=sys.stderr)
         except Exception:  # fusepy absent — nothing to unmount
             pass
-        if self._exit_fn:
+        if exit_after and self._exit_fn:
             self._exit_fn()
+        return failures
 
 
 class _Ctx:
@@ -255,7 +322,35 @@ class _Ctx:
 def _need(params: dict, *keys: str) -> None:
     missing = [k for k in keys if not params.get(k)]
     if missing:
-        raise ValueError(f"Missing parameter(s): {', '.join(missing)}")
+        raise InvalidRequest(f"Missing parameter(s): {', '.join(missing)}")
+    for k in keys:
+        if not isinstance(params[k], str):
+            raise InvalidRequest(f"Parameter {k!r} must be a string")
+
+
+def _int_pair(params: dict) -> tuple[int, int]:
+    """Validated (k, n) for split-key modes."""
+    k, n = params.get("k"), params.get("n")
+    if (not isinstance(k, int) or not isinstance(n, int)
+            or isinstance(k, bool) or isinstance(n, bool)):
+        raise InvalidRequest("Split-key mode needs integer 'k' and 'n'")
+    if not (2 <= k <= n <= 255):
+        raise InvalidRequest("Split-key mode needs 2 <= k <= n <= 255")
+    return k, n
+
+
+def _opt_str(params: dict, key: str) -> str | None:
+    v = params.get(key)
+    if v is not None and not isinstance(v, str):
+        raise InvalidRequest(f"Parameter {key!r} must be a string")
+    return v
+
+
+def _opt_list(params: dict, key: str) -> list | None:
+    v = params.get(key)
+    if v is not None and not isinstance(v, list):
+        raise InvalidRequest(f"Parameter {key!r} must be a list")
+    return v
 
 
 def op_fuse_check(params: dict, ctx: _Ctx) -> dict:
@@ -275,11 +370,19 @@ def op_inspect(params: dict, ctx: _Ctx) -> dict:
 
 def op_encrypt(params: dict, ctx: _Ctx) -> dict:
     _need(params, "source", "output", "mode")
+    mode = params["mode"]
+    if mode not in ("password", "single", "shamir"):
+        raise InvalidRequest(f"Unknown mode {mode!r}")
+    k = n = None
+    if mode == "shamir":
+        k, n = _int_pair(params)
+    else:
+        _need(params, "password")
     return pkg.encrypt_to_qcx(
-        params["source"], params["output"], mode=params["mode"],
-        password=params.get("password"), k=params.get("k"), n=params.get("n"),
+        params["source"], params["output"], mode=mode,
+        password=_opt_str(params, "password"), k=k, n=n,
         progress=ctx.progress, cancel_check=ctx.cancelled,
-        embed_binary=params.get("embed_binary"))
+        embed_binary=_opt_str(params, "embed_binary"))
 
 
 def op_decrypt(params: dict, ctx: _Ctx) -> dict:
@@ -288,8 +391,8 @@ def op_decrypt(params: dict, ctx: _Ctx) -> dict:
     if not verify_only:
         _need(params, "output_dir")
     return pkg.decrypt_qcx(
-        params["path"], params.get("output_dir", ""),
-        password=params.get("password"), shares=params.get("shares"),
+        params["path"], _opt_str(params, "output_dir") or "",
+        password=_opt_str(params, "password"), shares=_opt_list(params, "shares"),
         verify_only=verify_only, progress=ctx.progress, cancel_check=ctx.cancelled)
 
 
@@ -318,18 +421,30 @@ def op_volume_create(params: dict, ctx: _Ctx) -> dict:
     if not path.lower().endswith(".qcv"):
         path += ".qcv"
     if os.path.exists(path):
-        raise FileExistsError(f"{path} already exists")
+        raise FileExistsError(errno_EEXIST, "already exists", path)
     mode = params["mode"]
-    if mode in ("password", "single"):
-        _need(params, "password")
-        vol.create_volume_single(path, params["password"], progress_cb=ctx.progress)
-        return {"path": path, "mode": "single", "shares": []}
-    k, n = params.get("k"), params.get("n")
-    if not (k and n and 2 <= k <= n <= 255):
-        raise ValueError("Split-key mode needs 2 <= k <= n <= 255")
-    _meta, shares = vol.create_volume_shamir(path, n, k, progress_cb=ctx.progress)
-    return {"path": path, "mode": "shamir", "threshold": k, "total": n,
-            "shares": pkg.shares_with_mnemonics(shares, k)}
+    if mode not in ("password", "single", "shamir"):
+        raise InvalidRequest(f"Unknown mode {mode!r}")
+    try:
+        if mode != "shamir":
+            _need(params, "password")
+            vol.create_volume_single(path, params["password"], progress_cb=ctx.progress,
+                                     cancel_check=ctx.cancelled)
+            return {"path": path, "mode": "single", "shares": []}
+        k, n = _int_pair(params)
+        _meta, shares = vol.create_volume_shamir(path, n, k, progress_cb=ctx.progress,
+                                                 cancel_check=ctx.cancelled)
+        return {"path": path, "mode": "shamir", "threshold": k, "total": n,
+                "shares": pkg.shares_with_mnemonics(shares, k)}
+    except cc.CancelledOperation:
+        # "cancelled" must mean "nothing written": a container written
+        # before the cancel was observed is removed (the Tk manager does
+        # the same), because its shares/password would never be shown.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
 
 
 def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
@@ -340,15 +455,17 @@ def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
     ctx.progress("Reading volume...")
     _header, auth = vol.read_volume_auth_params(path)
     ctx.check()
-    if auth.get("mode") == "single":
+    # A missing "mode" is a password volume, as op_volume_inspect and the
+    # Tk manager already assume.
+    if auth.get("mode", "single") == "single":
         _need(params, "password")
         ctx.progress("Deriving 512-bit password key (Argon2id)...")
         key = vol.derive_volume_key_single(params["password"], auth)
     else:
-        codes = pkg.normalize_shares(params.get("shares") or [])
+        codes = pkg.normalize_shares(_opt_list(params, "shares") or [])
         k = auth.get("threshold") or len(codes)
         if len(codes) < k:
-            raise ValueError(f"Need {k} different shares to unlock this volume, got {len(codes)}")
+            raise InvalidInput(f"Need {k} different shares to unlock this volume, got {len(codes)}")
         ctx.progress(f"Combining {k} shares to recover the key...")
         key = vol.derive_volume_key_shamir(codes[:k], auth)
     ctx.check()

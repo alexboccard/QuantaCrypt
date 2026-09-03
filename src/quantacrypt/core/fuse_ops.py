@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import atexit
 import errno
+import hashlib
 import logging
 import os
 import signal
@@ -559,6 +560,10 @@ class QuantaCryptFUSE(_FuseOperations):
             elif length > len(buf):
                 buf.extend(b"\x00" * (length - len(buf)))
             self._dirty_files.add(vpath)
+        if fh is None:
+            # Path-based truncate (no open fd): nothing will flush this
+            # buffer later, so persist it now like a flush would.
+            self.flush(path, 0)
 
     def flush(self, path: str, fh: int) -> None:
         """Flush dirty data to the volume container and persist to disk."""
@@ -571,9 +576,23 @@ class QuantaCryptFUSE(_FuseOperations):
                 if vpath not in self._pending_unlink:
                     buf = self._file_buffers.get(vpath, bytearray())
                     snapshot = bytes(buf)
-                    self.volume.write_file(vpath, snapshot)
-                    # Chunks cached from the previous content are stale now.
-                    self._invalidate_cached(vpath)
+                    # A write that leaves the bytes identical to what the
+                    # container already holds (editors re-saving unchanged
+                    # files, periodic fsync from rsync/databases) must not
+                    # re-encrypt and append the whole file to the journal
+                    # again: compare the plaintext hash with the stored one.
+                    entry = self.volume.get_entry(vpath)
+                    unchanged = (
+                        entry is not None
+                        and entry.get("type") != "dir"
+                        and entry.get("size") == len(snapshot)
+                        and entry.get("content_hash")
+                        and entry["content_hash"] == hashlib.sha256(snapshot).hexdigest()
+                    )
+                    if not unchanged:
+                        self.volume.write_file(vpath, snapshot)
+                        # Chunks cached from the previous content are stale now.
+                        self._invalidate_cached(vpath)
                 self._dirty_files.discard(vpath)
             self._persist_locked()
 

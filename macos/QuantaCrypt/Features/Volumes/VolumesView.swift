@@ -7,13 +7,6 @@ struct VolumesView: View {
     enum Field: Hashable {
         case createName, createPassword, createConfirmation
         case mountPoint, mountPassword, mountShare(Int)
-
-        var job: VolumesModel.Job {
-            switch self {
-            case .createName, .createPassword, .createConfirmation: return .create
-            case .mountPoint, .mountPassword, .mountShare: return .mount
-            }
-        }
     }
 
     var body: some View {
@@ -23,36 +16,38 @@ struct VolumesView: View {
             } else if let error = model.fuseError {
                 Section("Disk mounting") { ErrorPanel(error: error) }
             }
-            createSection
-            mountSection
+            // Daily task first. Creating a volume happens once per
+            // volume; mounting one happens every day, and "what is open
+            // right now" is the question this screen should answer first.
             mountedSection
+            mountSection
+            createSection
         }
         .formStyle(.grouped)
         .task { await model.pollMounted() }
-        .onChange(of: focus) { _, field in
-            if let field { model.activeJob = field.job }
-        }
         .toolbar {
+            // One stable action. It used to swap between Create and Mount
+            // depending on which field last held focus, silently re-arming
+            // ⌘↩ to a different operation with nothing on screen saying so.
             ToolbarItem(placement: .primaryAction) {
-                switch model.activeJob {
-                case .create:
-                    Button("Create volume", systemImage: "externaldrive.badge.plus", action: model.createVolume)
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.return, modifiers: .command)
-                        .disabled(!model.canCreate)
-                        .help(model.createValidationMessage ?? "Create the encrypted volume (⌘↩)")
-                case .mount:
-                    Button("Mount volume", systemImage: "externaldrive.badge.checkmark", action: model.mount)
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.return, modifiers: .command)
-                        .disabled(!model.canMount)
-                        .help(model.mountValidationMessage ?? "Unlock and mount the volume (⌘↩)")
-                }
+                Button("Mount volume", systemImage: "externaldrive.badge.checkmark", action: model.mount)
+                    // Not `.borderedProminent`: macOS 26 renders a disabled
+                    // prominent toolbar button at full saturation, so it reads
+                    // as live. The prominent copy is the inline one, which
+                    // dims correctly.
+                    .labelStyle(.titleAndIcon)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!model.canMountNow)
+                    .help(model.mountBlockedMessage ?? "Unlock and mount the volume (⌘↩)")
             }
+        }
+        .onChange(of: outcome) { _, new in
+            if let new { AccessibilityNotification.Announcement(new).post() }
         }
         .sheet(item: $model.sharesToShow) { presentation in
             SharesSheet(shares: presentation.shares, context: presentation.context,
-                        onDismiss: model.sharesSheetDismissed)
+                        onDismiss: model.sharesSheetDismissed,
+                        onSaved: { model.sharesSaved = true })
         }
         .confirmationDialog("Mount the new volume now?", isPresented: $model.offerMountAfterCreate, titleVisibility: .visible) {
             Button("Mount volume now", action: model.mountCreatedVolume)
@@ -80,6 +75,17 @@ struct VolumesView: View {
         }
     }
 
+    private var outcome: String? {
+        if let error = model.mountError { return error.message }
+        if let error = model.createError { return error.message }
+        if let error = model.unmountError { return error.message }
+        if let note = model.mountedNote { return note }
+        if let result = model.createResult, !model.createRunning {
+            return "Created \(Format.fileName(result.path))."
+        }
+        return nil
+    }
+
     // MARK: Setup
 
     private func setupSection(_ fuse: FuseCheck) -> some View {
@@ -89,13 +95,25 @@ struct VolumesView: View {
                 .fixedSize(horizontal: false, vertical: true)
             componentRow("Disk mounting support (macFUSE or FUSE-T)", fuse.fuseBackend)
             componentRow("Mounting helper", fuse.fusepy)
-            LabeledContent("Install with Homebrew") {
-                TextField("", text: .constant(VolumesModel.brewCommand))
-                    .font(.body.monospaced())
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 260)
+            Text("Install it with Homebrew — a package manager you run in Terminal. If you don't have Homebrew, get it from brew.sh first.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            LabeledContent("Paste this in Terminal") {
+                HStack {
+                    Text(VolumesModel.brewCommand)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Homebrew install command")
+                        .accessibilityValue(VolumesModel.brewCommand)
+                    Button("Copy") { Clipboard.copy(VolumesModel.brewCommand, expiring: false) }
+                        .controlSize(.small)
+                        .accessibilityLabel("Copy Homebrew install command")
+                    Button("Open Terminal") { Finder.openTerminal() }
+                        .controlSize(.small)
+                }
             }
-            Text("Needs an administrator password. FUSE-T is recommended (no kernel extension); macFUSE also works: \(VolumesModel.brewAlternative)")
+            Text("It will ask for your Mac's administrator password. FUSE-T is the recommended choice. If you already have macFUSE, that works too — QuantaCrypt uses whichever it finds.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -130,6 +148,10 @@ struct VolumesView: View {
 
     private var createSection: some View {
         Section("Create a volume") {
+            Text("A volume is one file that opens as a drive. Files you drag in are encrypted as they are saved; unmount it and everything is sealed back inside the .qcv file.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             TextField("Name", text: $model.createName)
                 .focused($focus, equals: .createName)
             LabeledContent("Location") {
@@ -139,6 +161,7 @@ struct VolumesView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Button("Change…", action: model.chooseCreateLocation)
+                        .accessibilityLabel("Change where the new volume is saved")
                 }
             }
             Picker("Protect with", selection: $model.createMode) {
@@ -155,6 +178,7 @@ struct VolumesView: View {
                     .focused($focus, equals: .createConfirmation)
                     .onSubmit(model.createVolume)
                 strengthRow
+                WarningStrip(text: "If you forget this password the volume is gone — QuantaCrypt cannot recover it, and neither can anyone else.")
             case .splitKey:
                 SplitKeyFields(threshold: $model.createThreshold, total: $model.createTotal)
             }
@@ -165,17 +189,15 @@ struct VolumesView: View {
                 WarningStrip(text: "You can create this volume now, but it can't be mounted on this Mac until disk mounting support is installed.")
             }
             if model.createRunning {
-                ProgressPanel(progress: model.createProgress, onCancel: model.cancelCreate)
+                ProgressPanel(progress: model.createProgress, isCancelling: model.createCancelling,
+                              onCancel: model.cancelCreate)
             } else {
-                HStack {
-                    Button("Create volume", action: model.createVolume)
-                        .disabled(!model.canCreate)
-                    if let message = model.createValidationMessage, !model.createName.isEmpty {
-                        Text(message)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                // Unconditional: the message was hidden while the Name field
+                // was empty, which is exactly when "Give the volume a name."
+                // is the thing the user needs to read.
+                PrimaryActionRow(title: "Create volume", systemImage: "externaldrive.badge.plus",
+                                 isEnabled: model.canCreate, blockedReason: model.createValidationMessage,
+                                 action: model.createVolume)
             }
             if let error = model.createError { ErrorPanel(error: error) }
             if let status = model.createStatus { StatusNote(text: status) }
@@ -184,6 +206,11 @@ struct VolumesView: View {
                     Label("Created \(Format.fileName(result.path))", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                     Button("Show in Finder") { Finder.reveal(result.path) }
+                    // Without this, one click on "Discard shares" sealed the
+                    // volume forever; .qcx has had the same escape all along.
+                    if model.canShowSharesAgain {
+                        Button("Show shares again", action: model.showSharesAgain)
+                    }
                     Button("Mount volume now", action: model.mountCreatedVolume)
                         .disabled(!model.mountingAvailable)
                 }
@@ -218,8 +245,10 @@ struct VolumesView: View {
     private var mountSection: some View {
         Section("Mount a volume") {
             if let path = model.mountPath {
-                PathRow(path: path, detail: nil, systemImage: "externaldrive",
-                        changeTitle: "Change…", onChange: model.chooseVolumeToMount)
+                PathRow(path: path, detail: model.mountInfo?.protectionSummary,
+                        systemImage: "externaldrive",
+                        changeTitle: "Change…", changeLabel: "Change the volume to open",
+                        onChange: model.chooseVolumeToMount)
             } else {
                 DropZone(title: "Drop a volume here",
                          subtitle: "Volumes end in .qcv.",
@@ -235,14 +264,34 @@ struct VolumesView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Mount point") {
+                // Read-only text plus a picker, matching the Location row on
+                // the create form. A free-text filesystem path existed mainly
+                // to produce the "choose a folder inside your home folder"
+                // error that the picker cannot produce.
+                LabeledContent("Opens as a drive at") {
                     HStack {
-                        TextField("", text: $model.mountPoint)
-                            .textFieldStyle(.roundedBorder)
-                            .labelsHidden()
-                            .focused($focus, equals: .mountPoint)
+                        Text(Format.tildePath(model.mountPoint))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .accessibilityLabel("Opens as a drive at")
+                            .accessibilityValue(Format.tildePath(model.mountPoint))
                         Button("Change…", action: model.chooseMountPoint)
+                            .accessibilityLabel("Change where the volume appears")
                     }
+                }
+                if model.mountInspecting {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Reading the volume…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+                if let error = model.mountInspectError {
+                    ErrorPanel(error: error)
                 }
                 // The auth block says how the volume is protected; the picker
                 // is only a fallback when it could not be read.
@@ -259,17 +308,19 @@ struct VolumesView: View {
                         .focused($focus, equals: .mountPassword)
                         .onSubmit(model.mount)
                 case .shares:
-                    ShareEntryFields(shares: $model.mountShares, required: nil, total: nil,
-                                     onLoadFiles: model.loadMountSharesFromFiles)
+                    ShareEntryFields(shares: $model.mountShares, required: model.mountInfo?.threshold,
+                                     total: model.mountInfo?.total, onLoadFiles: model.loadMountSharesFromFiles)
                 }
                 if model.fuse != nil && !model.mountingAvailable {
                     WarningStrip(text: "Install disk mounting support above before mounting.")
                 }
                 if model.mountRunning {
-                    ProgressPanel(progress: model.mountProgress, onCancel: model.cancelMount)
+                    ProgressPanel(progress: model.mountProgress, isCancelling: model.mountCancelling,
+                                  onCancel: model.cancelMount)
                 } else {
-                    Button("Mount volume", action: model.mount)
-                        .disabled(!model.canMount || !model.mountingAvailable)
+                    PrimaryActionRow(title: "Mount volume", systemImage: "externaldrive.badge.checkmark",
+                                     isEnabled: model.canMountNow, blockedReason: model.mountBlockedMessage,
+                                     action: model.mount)
                 }
             }
             if let error = model.mountError { ErrorPanel(error: error) }
@@ -277,6 +328,10 @@ struct VolumesView: View {
             if let note = model.mountedNote {
                 Label(note, systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
+                Text("Drag files onto the drive in Finder to add them. They are encrypted as they are written, and sealed back into the volume file when you unmount.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -286,9 +341,17 @@ struct VolumesView: View {
     private var mountedSection: some View {
         Section("Mounted volumes") {
             if let error = model.unmountError { ErrorPanel(error: error) }
+            if model.listIsStale {
+                WarningStrip(text: "Can't reach the helper, so this list may be out of date.")
+            }
             if model.mounted.isEmpty {
-                Text(model.listLoaded ? "No volumes mounted." : "Checking…")
-                    .foregroundStyle(.secondary)
+                if model.listLoaded {
+                    Text("No volumes are open. Choose a volume below and unlock it — it appears in Finder as a drive until you unmount it.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Checking…").foregroundStyle(.secondary)
+                }
             }
             ForEach(model.mounted) { volume in
                 HStack {
@@ -312,7 +375,11 @@ struct VolumesView: View {
                         Text("Unmounting…").foregroundStyle(.secondary)
                     } else {
                         Button("Show in Finder") { Finder.open(volume.mountPoint) }
+                            .disabled(model.listIsStale)
+                            .accessibilityLabel("Show \(volume.name) in Finder")
                         Button("Unmount") { model.requestUnmount(volume) }
+                            .disabled(model.listIsStale)
+                            .accessibilityLabel("Unmount \(volume.name)")
                     }
                 }
             }

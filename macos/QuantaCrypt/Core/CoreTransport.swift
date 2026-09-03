@@ -70,8 +70,15 @@ actor ProcessTransport: CoreTransport {
         // proved unreliable on a pipe here (it delivered the first line or
         // nothing, depending on timing), and a helper that answers "never"
         // is the worst failure mode this client can have.
+        // Tracebacks and unmount failures are the only trace of why a
+        // volume was torn down uncleanly, so they must survive the default
+        // log level. Stderr never carries params, hence `.public`.
         Self.readLines(from: stderr.fileHandleForReading, name: "stderr") { line in
-            Logger.helper.debug("\(line, privacy: .public)")
+            if line.contains("Traceback") || line.contains("Error") {
+                Logger.helper.error("\(line, privacy: .public)")
+            } else {
+                Logger.helper.info("\(line, privacy: .public)")
+            }
         } onEnd: { _ in }
 
         let outHandle = stdout.fileHandleForReading

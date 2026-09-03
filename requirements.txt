@@ -2,3 +2,6 @@
 # security floors — this file exists only so `pip install -r requirements.txt`
 # keeps working, and must not list packages or pins of its own.
 -e .[dev]
+
+# Reproducible installs: pip install --require-hashes -r requirements-lock.txt
+# (regenerate with: uv lock && uv export --frozen --no-emit-project --all-extras --format requirements.txt -o requirements-lock.txt)

@@ -2,26 +2,52 @@ import SwiftUI
 
 struct EncryptView: View {
     @Bindable var model: EncryptModel
+    @Environment(AppState.self) private var state
 
     var body: some View {
         Form {
             sourceSection
             protectionSection
-            outputSection
+            if model.sourcePath != nil {
+                outputSection
+            }
+            actionSection
             activitySection
         }
         .formStyle(.grouped)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button("Encrypt file", systemImage: "lock", action: model.encrypt)
-                    .buttonStyle(.borderedProminent)
+                    // Not `.borderedProminent`: macOS 26 renders a disabled
+                    // prominent toolbar button at full saturation, so it reads
+                    // as live. The prominent copy is the inline one, which
+                    // dims correctly.
+                    .labelStyle(.titleAndIcon)
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(!model.canRun)
                     .help(model.validationMessage ?? "Encrypt with the chosen protection (⌘↩)")
             }
         }
+        .alert("That file is already encrypted",
+               isPresented: Binding(get: { model.wrongSection != nil },
+                                    set: { if !$0 { model.wrongSection = nil } }),
+               presenting: model.wrongSection) { target in
+            Button("Open in \(target.section.title)") {
+                model.wrongSection = nil
+                state.open(URL(fileURLWithPath: target.path))
+            }
+            Button("Cancel", role: .cancel) { model.wrongSection = nil }
+        } message: { target in
+            Text("\(Format.fileName(target.path)) is a QuantaCrypt file. Encrypting it again would just wrap it in a second layer — you probably want to open it instead.")
+        }
+        // The outcome lands far below the button that was pressed; without
+        // this a VoiceOver user gets silence and has to go hunting for it.
+        .onChange(of: outcome) { _, new in
+            if let new { AccessibilityNotification.Announcement(new).post() }
+        }
         .sheet(item: $model.sharesToShow) { presentation in
-            SharesSheet(shares: presentation.shares, context: presentation.context)
+            SharesSheet(shares: presentation.shares, context: presentation.context,
+                        onSaved: { model.sharesSaved = true })
         }
         .confirmationDialog("Replace the existing file?", isPresented: $model.confirmReplace, titleVisibility: .visible) {
             Button("Replace file", role: .destructive, action: model.encryptReplacingExisting)
@@ -36,7 +62,8 @@ struct EncryptView: View {
             if let path = model.sourcePath {
                 PathRow(path: path, detail: model.sourceDetail,
                         systemImage: model.sourceIsFolder ? "folder" : "doc",
-                        changeTitle: "Change…", onChange: model.chooseSource)
+                        changeTitle: "Change…", changeLabel: "Change the file to encrypt",
+                        onChange: model.chooseSource)
             } else {
                 DropZone(title: "Drop a file or folder here",
                          subtitle: "Folders are zipped first, then encrypted as one file.",
@@ -55,11 +82,20 @@ struct EncryptView: View {
                 ForEach(ProtectionMode.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            .labelsHidden()
+            // The choice has to be explicable *before* it is made: switching
+            // to Split key to find out what it is produces three QCSHARE-
+            // blobs and a sheet that will not close until files are saved.
+            Text(model.mode == .password
+                 ? "One password opens the file. Anyone who has it can open the file; nobody who doesn't, can."
+                 : "The key is split into shares handed to different people. Any k of them can open the file together; fewer cannot.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             switch model.mode {
             case .password:
                 NewPasswordFields(password: $model.password, confirmation: $model.confirmation,
                                   onSubmit: model.encrypt)
+                WarningStrip(text: "If you forget this password the file is gone — QuantaCrypt cannot recover it, and neither can anyone else.")
             case .splitKey:
                 SplitKeyFields(threshold: $model.threshold, total: $model.total)
             }
@@ -70,10 +106,19 @@ struct EncryptView: View {
         Section("Save to") {
             if let output = model.outputPath {
                 PathRow(path: output, detail: nil, systemImage: "doc.badge.plus",
-                        changeTitle: "Change…", onChange: model.chooseOutput)
-            } else {
-                Text("Choose a file first.")
-                    .foregroundStyle(.secondary)
+                        changeTitle: "Change…", changeLabel: "Change where the encrypted file is saved",
+                        onChange: model.chooseOutput)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var actionSection: some View {
+        if !model.isRunning {
+            Section {
+                PrimaryActionRow(title: "Encrypt file", systemImage: "lock",
+                                 isEnabled: model.canRun, blockedReason: model.validationMessage,
+                                 action: model.encrypt)
             }
         }
     }
@@ -83,7 +128,8 @@ struct EncryptView: View {
         if model.isRunning || model.error != nil || model.status != nil || model.result != nil {
             Section {
                 if model.isRunning {
-                    ProgressPanel(progress: model.progress, onCancel: model.cancel)
+                    ProgressPanel(progress: model.progress, isCancelling: model.isCancelling,
+                                  onCancel: model.cancel)
                 }
                 if let error = model.error {
                     ErrorPanel(error: error)
@@ -116,24 +162,43 @@ struct EncryptView: View {
                     .foregroundStyle(.green)
             }
             if result.mode == "shamir", let k = result.threshold, let n = result.total {
-                Text("Any \(k) of the \(n) shares unlock it. Test decrypting with \(k) shares before you hand them out.")
+                Text("Any \(k) of the \(n) shares unlock it. Check it opens with \(k) shares before you hand them out.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // The original is still sitting there in plain text. Saying so is
+            // the difference between "I encrypted my file" and the truth.
+            if let source = model.sourcePath {
+                Label("The original \(Format.fileName(source)) is untouched, still readable, in \(Format.tildePath(Format.directory(source))).",
+                      systemImage: "doc.text")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
+                // Verify writes nothing, so this is a safe thing to press —
+                // and the only way to learn the password works while it is
+                // still fresh in mind.
+                Button("Check it opens") { state.verifyEncrypted(result.output) }
                 Button("Show in Finder") { Finder.reveal(result.output) }
                 if result.mode == "shamir", let shares = result.shares, let k = result.threshold, let n = result.total {
                     Button("Show shares again") {
                         model.sharesToShow = SharesPresentation(
                             shares: shares,
                             context: ShareFiles.Context(stem: Format.stem(result.output),
-                                                        protectedName: result.filename, k: k, n: n))
+                                                        protectedName: result.filename, k: k, n: n, kind: .qcxFile))
                     }
                 }
                 Button("Encrypt another file", action: model.reset)
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private var outcome: String? {
+        if let error = model.error { return error.message }
+        if let result = model.result { return "Encrypted \(result.filename)." }
+        return nil
     }
 }

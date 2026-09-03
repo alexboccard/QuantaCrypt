@@ -157,9 +157,10 @@ open htmlcov/index.html
 ## Native macOS app (preview)
 
 `macos/` contains a SwiftUI shell that drives the same Python core through a
-bundled helper (`qc-core`). It is the planned replacement for the Tkinter
-windows; see `docs/design/native-macos-ui.md` for the plan and
-`RELEASING.md` for how to build it. The Tkinter app remains the shipped UI
+bundled helper (`qc-core`). `python scripts/build.py --native` produces one
+`QuantaCrypt.app` (interface plus core) and its DMG. It is the planned
+replacement for the Tkinter windows; see `docs/design/native-macos-ui.md`
+for the plan and `RELEASING.md` for the build. The Tkinter app remains the shipped UI
 until the native one reaches parity.
 
 ---

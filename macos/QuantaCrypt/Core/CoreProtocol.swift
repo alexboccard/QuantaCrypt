@@ -95,8 +95,9 @@ enum CoreRequest: Sendable, Equatable {
         case .password(let pw):
             p["password"] = .string(pw)
         case .splitKey(let k, let n):
-            p["k"] = .number(Double(k))
-            p["n"] = .number(Double(n))
+            // The helper's `_int_pair` requires JSON integers; never send `3.0`.
+            p["k"] = .integer(k)
+            p["n"] = .integer(n)
         case .shares(let shares):
             p["shares"] = .array(shares.map(JSONValue.string))
         }
@@ -153,8 +154,7 @@ struct WireEvent: Decodable, Sendable {
         case "done":
             return .done(result ?? .object([:]))
         case "error":
-            return .error(CoreError(code: CoreError.Code(wire: code), message: message ?? "Something went wrong.",
-                                    detail: detail ?? ""))
+            return .error(CoreError.fromWire(code: code, message: message, detail: detail))
         default:
             return nil
         }
@@ -179,12 +179,15 @@ struct CoreError: Error, Sendable, Equatable, LocalizedError {
     enum Code: String, Sendable {
         case wrongCredentials = "wrong_credentials"
         case cancelled
+        case notFound = "not_found"
+        case permissionDenied = "permission_denied"
+        case alreadyExists = "already_exists"
         case io
         case format
-        case notFound = "not_found"
-        case busy
         case unsupported
+        case busy
         case invalidRequest = "invalid_request"
+        case invalidInput = "invalid_input"
         case `internal`
         // Client-side conditions, never sent by the helper.
         case helperUnavailable = "helper_unavailable"
@@ -202,6 +205,28 @@ struct CoreError: Error, Sendable, Equatable, LocalizedError {
 
     var errorDescription: String? { message }
     var isCancellation: Bool { code == .cancelled }
+
+    /// Build the error for a helper `error` event. Every code but one keeps
+    /// the helper's message verbatim: `invalid_input` (an unreadable share,
+    /// too few shares, a missing password) and `format` (a payload that
+    /// failed authentication after the key was proven) are written for the
+    /// user. `invalid_request` alone means the app sent something the helper
+    /// could not accept (a missing or malformed parameter, or a line it
+    /// could not frame) — that is our bug, so the user gets a message that
+    /// says so and the helper's own text moves into the details.
+    static func fromWire(code: String?, message: String?, detail: String?) -> CoreError {
+        let code = Code(wire: code)
+        // Never a bare "Something went wrong": if the helper sends an error
+        // with no message, the user still needs a cause and a next step.
+        let helperMessage = message ?? "The helper reported a problem but didn't say what. Try again — if it keeps happening, restart the helper in Settings."
+        guard code == .invalidRequest else {
+            return CoreError(code: code, message: helperMessage, detail: detail ?? "")
+        }
+        let combined = [helperMessage, detail ?? ""].filter { !$0.isEmpty }.joined(separator: " — ")
+        return CoreError(code: .invalidRequest,
+                         message: "QuantaCrypt sent a request the helper rejected. This is a bug in the app, not a problem with your file — please report it.",
+                         detail: combined)
+    }
 
     static let helperExited = CoreError(
         code: .helperExited,

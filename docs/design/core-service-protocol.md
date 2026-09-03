@@ -47,8 +47,12 @@ it back. Requests run concurrently on worker threads; control ops (`cancel`,
 {"id": "r1", "event": "error", "code": "wrong_credentials", "message": "<friendly text>", "detail": "<raw exception>"}
 ```
 
-Error codes: `wrong_credentials`, `cancelled`, `io`, `permission_denied`,
-`format`, `not_found`, `busy`, `unsupported`, `invalid_request`, `internal`. `message` is the same
+Error codes: `wrong_credentials`, `cancelled`, `invalid_request` (the CLIENT
+sent a malformed request — a UI treats it as its own bug), `invalid_input`
+(the USER supplied something unusable: an unreadable share, too few shares,
+no password; the message is written for them), `not_found`, `already_exists`, `permission_denied`, `io`, `format` (the file
+itself is unreadable or its payload fails authentication AFTER the key was
+proven — never reported as a wrong password), `busy`, `unsupported`, `internal`. `message` is the same
 `friendly_error` text the Tk UI shows; `detail` is for logs and disclosure
 triangles.
 
@@ -72,18 +76,21 @@ reports one, else `null`.
 | `volume_unmount` | `mount_point` | `{mount_point}` |
 | `volume_list` | — | `{volumes: [{mount_point, volume_path, stats: {file_count, dir_count, total_plaintext_size, container_size, ...} \| null}]}` |
 | `cancel` | `target` (request id) | `{cancelled: bool}` |
-| `shutdown` | — | `{}` then the process unmounts everything and exits |
+| `shutdown` | — | cancels in-flight work, unmounts every volume, THEN answers `{unmount_failed: [mount points]}` and exits |
 
 **Vocabulary.** Requests accept `mode` = `password` (alias `single`) or
 `shamir`; results always report the on-disk format's `mode` = `single` or
 `shamir`, because that is what `inspect` reads back from a file.
 
-**Cancellation coverage.** `encrypt`, `decrypt` and `volume_create` poll
-the token between stages and per chunk; `volume_mount` checks it before
-the FUSE call only; `fuse_check`, `volume_unmount`, `volume_list` and the
-inspect ops are short and never cancel. A client should fail such
-requests locally after a grace period rather than wait for a
-`cancelled` event.
+**Cancellation semantics.** A `cancelled` error means *nothing was
+written*: handlers raise it when they observe the token between stages or
+chunks (`encrypt`, `decrypt`, `volume_create`), and `volume_create` removes a
+container it had already written when the cancel lands after the write. A
+handler that finishes despite a late cancel is reported as `done` — the
+client must treat `done` as authoritative. `volume_mount` checks the token
+before the FUSE call only; `fuse_check`, `volume_unmount`, `volume_list` and
+the inspect ops are short and never cancel, so a client should fail such
+requests locally after a grace period.
 
 Passwords and shares travel in the request JSON. That is acceptable because
 stdin is a private pipe from the parent process; the same secrets already
@@ -91,11 +98,17 @@ live in the parent's memory. The service never logs params.
 
 ### Lifecycle
 
-- EOF on stdin → no more requests: in-flight work finishes (a one-shot
-  client can write one request and close the pipe), then every volume is
-  saved and unmounted and the process exits 0.
-- `shutdown` or SIGTERM → the abrupt form: cancel in-flight requests
-  first, then unmount and exit.
+- EOF on stdin → no more requests: in-flight work may finish for up to
+  300 s (a one-shot client can write one request and close the pipe), then
+  every volume is saved and unmounted and the process exits 0.
+- `shutdown` → cancel in-flight requests, join workers, unmount volumes,
+  answer `done` with any `unmount_failed` mount points, exit. The
+  acknowledgement comes *after* the work so a client can start its escalation
+  timer on it.
+- SIGTERM → the handler flags the loop, cancels workers and raises out of
+  the blocked stdin read; teardown then runs in `run()`'s `finally` on the
+  main thread outside the signal handler (which may be holding the mount
+  lock), so the process never deadlocks on itself.
 - One writer lock serialises stdout; events from different requests
   interleave line-by-line.
 - Output files are written to `<output>.tmp` and `os.replace`d; decrypt

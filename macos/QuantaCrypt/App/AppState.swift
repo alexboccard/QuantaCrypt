@@ -55,7 +55,14 @@ final class AppState {
 
     /// Launch the helper and read its version for the status item.
     func start() {
-        Task { await refreshHelperStatus() }
+        Task {
+            // Without this the status item keeps showing "ready" after the
+            // helper has died — the one condition it exists to report.
+            await core.onUnexpectedExit { [weak self] in
+                Task { @MainActor in self?.helperStatus = .failed(.helperExited) }
+            }
+            await refreshHelperStatus()
+        }
     }
 
     func refreshHelperStatus() async {
@@ -84,18 +91,96 @@ final class AppState {
         for url in urls { open(url) }
     }
 
+    /// Route a document to its section. The sidebar only switches when the
+    /// model actually took the file; a model busy with a job keeps the
+    /// current section and explains inline (in its own section, where the
+    /// running job and its Cancel button are) — see `openNote` for the
+    /// copy shown wherever the user currently is.
     func open(_ url: URL) {
+        let target: AppSection
+        let accepted: Bool
         switch url.pathExtension.lowercased() {
         case "qcx":
-            section = .decrypt
-            decrypt.load(path: url.path)
+            target = .decrypt
+            accepted = decrypt.load(path: url.path)
         case "qcv":
-            section = .volumes
-            volumes.prepareMount(path: url.path)
+            target = .volumes
+            accepted = volumes.prepareMount(path: url.path)
         default:
-            section = .encrypt
-            encrypt.setSource(url.path)
+            target = .encrypt
+            accepted = encrypt.setSource(url.path)
         }
+        if accepted {
+            section = target
+            openNote = nil
+        } else {
+            openNote = OpenNote(text: EncryptModel.busyMessage(for: url.path), section: target, url: url)
+        }
+    }
+
+    /// Shown in the window's status bar when an open was refused, so the
+    /// message is visible even when the busy section is not the current one.
+    /// The URL is kept so the document is offered again once the job that
+    /// blocked it finishes, instead of being silently dropped.
+    struct OpenNote: Equatable {
+        let text: String
+        let section: AppSection
+        let url: URL
+    }
+    var openNote: OpenNote?
+
+    /// Whether the section that refused a document is still working. Drives
+    /// the note's two shapes: "wait" while busy, "open it now" once idle.
+    func isBusy(_ section: AppSection) -> Bool {
+        switch section {
+        case .encrypt: return encrypt.isRunning
+        case .decrypt: return decrypt.isRunning
+        case .volumes: return volumes.createRunning || volumes.mountRunning
+        }
+    }
+
+    // MARK: Quitting
+
+    /// Something that must be settled before the app may exit. Discovered in
+    /// `applicationShouldTerminate`, which otherwise takes the shares — the
+    /// only copy of a split key — down with the process.
+    enum QuitBlocker: Equatable {
+        case unsavedShares(String)
+        case runningJob
+
+        var messageText: String {
+            switch self {
+            case .unsavedShares: return "Save the shares first"
+            case .runningJob: return "A job is still running"
+            }
+        }
+
+        var informativeText: String {
+            switch self {
+            case .unsavedShares(let name):
+                return "Without them, \(name) can never be opened again. Quitting now discards them."
+            case .runningJob:
+                return "Quitting cancels it. Nothing partial is left behind, but the work is lost."
+            }
+        }
+
+        var quitTitle: String {
+            switch self {
+            case .unsavedShares: return "Quit and discard shares"
+            case .runningJob: return "Quit and cancel"
+            }
+        }
+    }
+
+    var quitBlocker: QuitBlocker? {
+        if encrypt.sharesToShow != nil, !encrypt.sharesSaved {
+            return .unsavedShares(encrypt.sharesToShow?.context.protectedName ?? "the file")
+        }
+        if volumes.sharesToShow != nil, !volumes.sharesSaved {
+            return .unsavedShares(volumes.sharesToShow?.context.protectedName ?? "the volume")
+        }
+        if AppSection.allCases.contains(where: isBusy) { return .runningJob }
+        return nil
     }
 
     // MARK: Menu commands
@@ -118,5 +203,19 @@ final class AppState {
     func mountVolume() {
         section = .volumes
         volumes.chooseVolumeToMount()
+    }
+
+    /// "Check it opens" on the encrypt result: load the new `.qcx` into
+    /// Decrypt, where Verify only proves the credential without writing
+    /// anything. Closing the loop on the encrypt journey while the password
+    /// is still in the user's head.
+    func verifyEncrypted(_ path: String) {
+        guard decrypt.load(path: path) else {
+            openNote = OpenNote(text: EncryptModel.busyMessage(for: path),
+                                section: .decrypt, url: URL(fileURLWithPath: path))
+            return
+        }
+        section = .decrypt
+        decrypt.verifyPrompt = true
     }
 }

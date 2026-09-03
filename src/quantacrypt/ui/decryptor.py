@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """QuantaCrypt Decryptor — decryption GUI with password and Shamir modes."""
-import base64 as _b64
-import json
 import os
 import re
-import struct
+import shutil
 import subprocess
 import sys
 import threading
 import time as _time
-import uuid
+import zipfile
 
 import tkinter as tk
 from tkinter import filedialog
 
 from quantacrypt.core import crypto as cc
+from quantacrypt.core import package as pkg
+from quantacrypt.core.errors import CorruptPayload, classify_error
 from quantacrypt.core.package import load_pkg  # noqa: F401  (re-exported for callers/tests)
-from quantacrypt.core.crypto import (
-    MAGIC, FORMAT_VERSION, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION,
-)
+from quantacrypt.core.crypto import MAGIC  # noqa: F401  (re-exported; tests compare it)
 from quantacrypt.ui.shared import (
     C, F, SP, ICON, REVEAL_LABEL,
-    accel, bind_shortcut,
+    accel, bind_shortcut, safe_after,
     styled_entry, bind_context_menu, fmt_size, rule, section_label,
     card, kv_row, confirm, alert, reveal_path, friendly_error,
     FlatButton, SegmentedControl, StagedProgressBar,
@@ -30,13 +28,28 @@ from quantacrypt.ui.shared import (
 
 P = SP["xl"]  # outer page padding
 
-STAGES = [
-    ("Verifying password",  0.55, "Argon2id"),
-    ("Loading key",         0.05, "Parsing"),
-    ("Recovering key",      0.10, "Reconstructing"),
-    ("Unlocking",           0.15, "Decapsulat"),
-    ("Decrypting file",     0.15, "Decrypting payload"),
+# (friendly name, weight, keyword in the core.package progress message).
+# One list per credential mode so no dot is ever skipped: a password file
+# never "recovers" shares and a split-key file never runs Argon2id.
+STAGES_SINGLE = [
+    ("Verifying password",  0.55, "argon2id"),
+    ("Loading key",         0.05, "kyber private key"),
+    ("Unlocking",           0.15, "decapsulat"),
+    ("Decrypting file",     0.25, "decrypting payload"),
 ]
+STAGES_SHAMIR = [
+    ("Recovering key",      0.15, "combining"),
+    ("Loading key",         0.15, "kyber private key"),
+    ("Unlocking",           0.30, "decapsulat"),
+    ("Decrypting file",     0.40, "decrypting payload"),
+]
+STAGE_VERIFY  = ("Checking key", 0.15, "integrity")
+STAGE_EXTRACT = [("Extracting folder", 1.0, "extracting")]
+STAGES = STAGES_SINGLE  # backward-compatible alias
+
+# "Extract folder" bounds — above these the user is asked first.
+_EXTRACT_MAX_BYTES   = 4 << 30
+_EXTRACT_MAX_ENTRIES = 100_000
 
 # Copy that appears in more than one place — hoisted so the reset path can't
 # drift from the initial build (it had: "Select an encrypted file" vs "...
@@ -59,18 +72,36 @@ def get_wl():
         _WL = Mnemonic("english").wordlist
     return _WL
 
-_MAX_TAIL = 1 << 20  # 1 MB tail search window
 _MAX_SHARE_FILE = 1 << 20  # share .txt files are a few KB; refuse anything huge
 
-def _find_stage(msg):
+def _stages_for(mode, verify=False):
+    """Stage list for THIS run.  Verify swaps the payload stage for the
+    first-chunk check, which is all it does."""
+    stages = list(STAGES_SINGLE if mode == "single" else STAGES_SHAMIR)
+    if verify:
+        stages[-1] = STAGE_VERIFY
+    return stages
+
+
+def _find_stage(msg, stages=None):
     """Map a raw core progress string to (stage index, friendly label).
-    The label is the STAGES name plus any NN% the core reported — the raw
+    The label is the stage name plus any NN% the core reported — the raw
     string itself ("Decrypting payload... 45%") is never shown."""
-    for i, (name, _, kw) in enumerate(STAGES):
-        if kw.lower() in msg.lower():
+    low = (msg or "").lower()
+    for i, (name, _, kw) in enumerate(stages or STAGES):
+        if kw in low:
             m = re.search(r"(\d+)%", msg)
             return i, (f"{name}  {m.group(1)}%" if m else name)
     return None, None
+
+
+def _zip_member_ok(name):
+    """False for any archive path that could land outside the destination:
+    absolute, drive-prefixed, or containing a '..' component."""
+    n = (name or "").replace("\\", "/")
+    if not n or n.startswith("/") or re.match(r"^[A-Za-z]:", n):
+        return False
+    return ".." not in n.split("/")
 
 
 def _open_file(path):
@@ -95,39 +126,9 @@ def _share_list(nums):
 
 
 def _extract_share_codes(text, wl=None):
-    """Find every share in free text, in order of appearance, as QCSHARE- codes.
-    Recognises QCSHARE- lines and 50-word mnemonic blocks (the share files
-    the encryptor writes contain both; the mnemonic is only converted when
-    the code for the same share wasn't already found)."""
-    codes = []
-    seen = set()
-    lines = [ln.strip() for ln in text.splitlines()]
-    for ln in lines:
-        if ln.startswith("QCSHARE-") and ln not in seen:
-            seen.add(ln); codes.append(ln)
-    if wl is None:
-        try: wl = get_wl()
-        except Exception: wl = None
-    if wl:
-        wl_set = set(wl)
-        block = []
-        def _flush():
-            if len(block) == 50:
-                try:
-                    code = cc.encode_share(cc.mnemonic_to_share(" ".join(block)))
-                except Exception:
-                    code = None
-                if code and code not in seen:
-                    seen.add(code); codes.append(code)
-            block.clear()
-        for ln in lines:
-            toks = ln.lower().split()
-            if toks and all(t in wl_set for t in toks):
-                block.extend(toks)
-            else:
-                _flush()
-        _flush()
-    return codes
+    """Share extraction lives in core/package.py so both UIs agree."""
+    from quantacrypt.core.package import extract_share_codes
+    return extract_share_codes(text)
 
 
 # ── WordEntry ─────────────────────────────────────────────────────────────────
@@ -135,10 +136,12 @@ def _extract_share_codes(text, wl=None):
 class WordEntry(tk.Frame):
     MAX_DROP = 8
 
-    def __init__(self, parent, number, wl, on_confirm=None, on_done=None, **kw):
+    def __init__(self, parent, number, wl, on_confirm=None, on_done=None,
+                 on_change=None, **kw):
         super().__init__(parent, bg=C["surface2"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
         self._wl=wl; self._cb=on_confirm; self._done_cb=on_done; self._nxt=None
+        self._chg=on_change   # fired on EVERY edit, so counters never go stale
         self._dd=None; self._lb=None; self._open=False
         tk.Label(self, text=f"{number:02d}", font=F["small"],
                  bg=C["surface2"], fg=C["text3"], width=2).pack(side="left", padx=(SP["xs"],0))
@@ -174,6 +177,7 @@ class WordEntry(tk.Frame):
         return None
 
     def _typed(self,*_):
+        if self._chg: self._chg()
         t = self._v.get().strip().lower()
         if not t: self._close(); self._set_b(C["border"]); return
         m = [w for w in self._wl if w.startswith(t)]
@@ -347,6 +351,8 @@ class MnemonicShareInput(tk.Frame):
         self._wl=wl; self._cells=[]; self._expanded = start_expanded
         self._on_change = on_change
         self._last_n = -1
+        self._upd_job = None   # pending after_idle → one refresh per burst of edits
+        self._pbar_w = 0
 
         hdr = tk.Frame(self, bg=C["surface"],
                        highlightbackground=C["border"], highlightthickness=1,
@@ -376,6 +382,7 @@ class MnemonicShareInput(tk.Frame):
 
         self._pbar = tk.Canvas(hdr, height=2, bg=C["surface2"], highlightthickness=0)
         self._pbar.pack(fill="x", side="bottom")
+        self._pbar.bind("<Configure>", lambda e: self._draw_pbar(e.width))
 
         for w in (hdr, self._chevron, left):
             w.bind("<Button-1>", lambda e: self.toggle())
@@ -389,7 +396,8 @@ class MnemonicShareInput(tk.Frame):
 
         for i in range(50):
             cell = WordEntry(self._grid_frame, i+1, wl, on_confirm=self._confirmed,
-                             on_done=on_done if i == 49 else None)
+                             on_done=on_done if i == 49 else None,
+                             on_change=self._schedule_upd)
             cell.grid(row=i//10, column=i%10, padx=2, pady=2, sticky="ew")
             self._cells.append(cell)
         for i in range(49):
@@ -399,7 +407,7 @@ class MnemonicShareInput(tk.Frame):
             self._grid_frame.pack(fill="x")
         # (collapsed: grid_frame stays unpacked until toggle)
 
-        self._tick()
+        self._upd()
 
     def toggle(self):
         """Expand or collapse the word-entry grid."""
@@ -435,29 +443,38 @@ class MnemonicShareInput(tk.Frame):
     def clear(self):
         for c in self._cells: c.set("")
         self._upd()
-        self.after(0, self._tick)   # restart tick loop (it stops when is_complete() was True)
     def _confirmed(self,_): self._upd()
 
-    def _tick(self):
+    def _schedule_upd(self):
+        """Every WordEntry edit lands here; one after_idle refresh per burst
+        (set_words fires 50 edits) keeps the counter exact without polling."""
+        if self._upd_job is None:
+            try:
+                self._upd_job = self.after_idle(self._upd)
+            except tk.TclError:
+                pass
+
+    def _draw_pbar(self, w=None):
+        if w is not None: self._pbar_w = w
+        w = self._pbar_w
+        if w <= 1: return
+        n = self.valid_count()
+        col = C["success"] if n==50 else (C["warning"] if n>=25 else C["accent_text"])
+        self._pbar.delete("all")
+        f = int(w*n/50)
+        if f: self._pbar.create_rectangle(0,0,f,2, fill=col, outline="")
+
+    def _upd(self):
+        self._upd_job = None
         try:
             if not self.winfo_exists(): return
         except Exception: return
-        self._upd()
-        if not self.is_complete(): self.after(300, self._tick)
-
-    def _upd(self):
         n = self.valid_count()
-        col = C["success"] if n==50 else (C["warning"] if n>=25 else C["accent_text"])
         glyph = f"  {ICON['ok']}" if n == 50 else ""
         self._count.config(
             text=f"{n} / 50 words{glyph}",
             fg=C["success"] if n==50 else (C["warning"] if n>0 else C["text3"]))
-        self.update_idletasks()
-        w = self._pbar.winfo_width()
-        if w > 1:
-            self._pbar.delete("all")
-            f = int(w*n/50)
-            if f: self._pbar.create_rectangle(0,0,f,2, fill=col, outline="")
+        self._draw_pbar()
         if n != self._last_n:
             self._last_n = n
             if self._on_change: self._on_change()
@@ -562,11 +579,9 @@ class _Tooltip:
 
 
 def _section(parent, text):
-    """section_label() plus a handle on its text label so it can be relabelled
-    (the Secret section reads PASSWORD or SHARES depending on the file)."""
-    section_label(parent, text, padx=P)
-    row = parent.winfo_children()[-1]
-    return row.winfo_children()[0]
+    """Section heading; returns the text label so the Secret section can be
+    relabelled PASSWORD / SHARES per file."""
+    return section_label(parent, text, padx=P)
 
 
 class DecryptorApp(tk.Toplevel):
@@ -589,8 +604,11 @@ class DecryptorApp(tk.Toplevel):
         self._mode_val = self._meta["mode"] if self._meta else None
         self._busy     = False
         self._verifying = False  # which flow the worker is running (for cancel copy)
+        self._extracting = False
         self._cancel   = False   # signals worker thread to abort
-        self._tmp_path = None    # tracks temp file for cleanup on close
+        self._close_pending = False  # close requested while a worker runs
+        self._finished_ok = False    # worker wrote output after a close request
+        self._run_stages = list(STAGES)
         self._imode    = tk.StringVar(value="mnemonic")
         self._inputs   = []      # MnemonicShareInput panels (mnemonic mode)
         self._entries  = []      # QCSHARE- entries (raw mode)
@@ -685,30 +703,43 @@ class DecryptorApp(tk.Toplevel):
 
     def _close(self):
         if self._busy:
-            # Signal worker to stop, clean up temp file, then close
-            self._cancel = True
-            self._set_status("Cancelling — please wait…")
-            # Poll until worker finishes (or force close after 5s)
-            self._poll_close(0)
+            # Never destroy the window under a running worker: Argon2id
+            # can't be interrupted and may outlast any fixed timeout, and a
+            # worker that passes its cancel checks still writes the file.
+            # Ask it to stop and close only once it has actually returned.
+            if not self._close_pending:
+                self._close_pending = True
+                self._cancel = True
+                try: self._cancel_btn.enable(False)
+                except Exception: pass
+                self._set_status("Cancelling — this window closes when the current step finishes…")
+                self._poll_close()
             return
-        # Clean up any leftover temp file
-        if self._tmp_path:
-            try: os.remove(self._tmp_path)
-            except OSError: pass
-            self._tmp_path = None
         self.destroy()
         if self._on_close:
             self._on_close()
         else:
             self.master.destroy()  # no launcher — quit app
 
-    def _poll_close(self, attempts):
-        """Poll until the worker thread finishes, then close."""
-        if self._busy and attempts < 50:  # up to ~5 seconds
-            self.after(100, self._poll_close, attempts + 1)
-        else:
-            self._busy = False
-            self._close()
+    def _poll_close(self):
+        """Wait for the worker to return, then close — unless it finished
+        and wrote a file, in which case the result card must stay visible."""
+        try:
+            if not self.winfo_exists(): return
+        except Exception: return
+        if self._busy:
+            self.after(100, self._poll_close)
+            return
+        self._close_pending = False
+        if self._finished_ok:
+            self._finished_ok = False
+            self._set_status("Finished before it could be cancelled — see the result below.")
+            return
+        self._close()
+
+    def _after(self, fn, delay=0):
+        """Worker → main-thread hop that tolerates a closed window."""
+        safe_after(self, fn, delay)
 
     def _center(self, center_at=None):
         self.update_idletasks()
@@ -727,10 +758,15 @@ class DecryptorApp(tk.Toplevel):
         if self._busy:
             self._flash_busy()
             return
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
-        parts = raw.split("} {")
-        path = parts[0]
+        # TkDnD braces only paths containing spaces, so "/a/x.qcx /a/y.qcx"
+        # is two items — let Tcl split the list (same as the encryptor).
+        try:
+            parts = [p for p in self.tk.splitlist(event.data) if p]
+        except Exception:
+            raw = event.data.strip()
+            if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
+            parts = raw.split("} {")
+        path = parts[0] if parts else ""
         if os.path.isdir(path):
             self._set_error("That's a folder — drop a single .qcx file instead.")
             return
@@ -773,7 +809,10 @@ class DecryptorApp(tk.Toplevel):
             fw = self.focus_get()
             if fw and fw.winfo_toplevel() is not self: return
             cv.yview_scroll(delta, "units")
-        cv.bind_all("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
+        # Bound on THIS toplevel (every descendant carries it in its bindtags),
+        # not bind_all: a root-wide binding outlives the window and the two
+        # wizards would replace each other's handler.
+        self.bind("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
 
         # 1. File — uses shared FileCard from shared_ui
         _section(b, "1  FILE")
@@ -829,6 +868,8 @@ class DecryptorApp(tk.Toplevel):
                                     anchor="w", justify="left", wraplength=490)
         self._err_detail.pack(fill="x", padx=P, pady=(0,SP["s"]))
 
+        # Placeholder bar; every run builds its own (see _new_prog) so the
+        # stage dots match what will actually happen.
         self._prog = StagedProgressBar(b, [(n,w) for n,w,_ in STAGES])
         # Cancel button row shown alongside the progress bar while busy.
         self._cancel_row = tk.Frame(b, bg=C["bg"])
@@ -1402,8 +1443,8 @@ class DecryptorApp(tk.Toplevel):
                 self.after(50, lambda: self._cv.yview_moveto(1.0))
                 return
         self._set_status(""); self._busy = True; self._verifying = verify
-        self._cancel = False
-        self._prog.pack(fill="x", padx=P, pady=(0,SP["xs"]), before=self._results)
+        self._extracting = False; self._cancel = False; self._finished_ok = False
+        self._new_prog(_stages_for(self._mode_val, verify=verify))
         self._cancel_row.pack(fill="x", padx=P, pady=(0, SP["s"]), before=self._results)
         self._cancel_btn.enable(True)
         self._prog.start(); self._freeze(); self._wiz.set_step(2)
@@ -1473,103 +1514,54 @@ class DecryptorApp(tk.Toplevel):
             except Exception: pass
         self._refresh_add_btn()
 
+    def _new_prog(self, stages):
+        """Replace the progress bar with one whose dots match ``stages``
+        and pack it into the progress slot above the results."""
+        old = getattr(self, "_prog", None)
+        if old is not None:
+            try: old.stop(); old.destroy()
+            except Exception: pass
+        self._run_stages = list(stages)
+        self._prog = StagedProgressBar(self._body, [(n, w) for n, w, _ in stages])
+        self._prog.pack(fill="x", padx=P, pady=(0, SP["xs"]), before=self._results)
+        return self._prog
+
     def _prog_cb(self, msg):
         # Friendly stage name + percentage only; the raw core string never reaches the bar
-        idx, label = _find_stage(msg)
-        if idx is not None: self.after(0, self._prog.advance, idx, label)
+        idx, label = _find_stage(msg, self._run_stages)
+        if idx is not None:
+            self._after(lambda: self._prog.advance(idx, label) if self._busy else None)
 
     def _run(self, out_dir, pw_captured, shares_captured=None):
-        """Worker thread — streaming decryption."""
-        tmp = os.path.join(out_dir, f".qcx_decrypt_{uuid.uuid4().hex[:8]}.tmp")
-        self._tmp_path = tmp
+        """Worker thread.  The whole pipeline — key derivation, HMAC check,
+        0600 mkstemp output, never-overwrite naming — is core.package's
+        decrypt_qcx, shared with qc-core so the two can't drift."""
         try:
-            if self._cancel:
-                return
-            meta = self._meta
-
-            # Derive final_key from whichever credential mode was used
+            res = pkg.decrypt_qcx(
+                self._qcx_path, out_dir,
+                password=pw_captured, shares=shares_captured,
+                progress=self._prog_cb, cancel_check=lambda: self._cancel)
+            pw_captured = None  # noqa: F841 — release str reference
             if self._mode_val == "single":
-                self.after(0, self._prog.advance, 0, "Verifying your password...")
-                # Encode to bytes and drop the str reference right away.
-                # Python can't actively zero strings, but releasing the only
-                # reference lets the GC reclaim the memory; the bytes object
-                # is harder to spot in a heap dump.
-                pw_bytes = pw_captured.encode()
-                pw_captured = None  # noqa: F841 — release str reference
-                argon_key = cc.argon2id_derive(pw_bytes, _b64.b64decode(meta["argon_salt"]))
-                del pw_bytes
-                self.after(0, self._prog.advance, 1, "Loading encryption key...")
-                sk = cc.aes_gcm_decrypt(argon_key,
-                                        _b64.b64decode(meta["kyber_sk_enc_nonce"]),
-                                        _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 2, "Unlocking file protection...")
-                kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
-                final_key = cc.xor_bytes(argon_key, kem_ss)
-                hmac_key  = final_key
-                # Mark stage 3 done so no dot is skipped in the visual sequence
-                self.after(0, self._prog.advance, 3, "Key ready")
-            else:
-                self.after(0, self._prog.advance, 0, f"Reading {len(shares_captured)} shares...")
-                share_dicts = [cc.decode_share(s) for s in shares_captured]
-                self.after(0, self._prog.advance, 1, "Combining shares to recover the key...")
-                master_key = cc.shamir_recover(share_dicts[:meta["threshold"]])
-                self.after(0, self._prog.advance, 2, "Loading encryption key...")
-                sk = cc.aes_gcm_decrypt(master_key,
-                                        _b64.b64decode(meta["kyber_sk_enc_nonce"]),
-                                        _b64.b64decode(meta["kyber_sk_enc"]))
-                self.after(0, self._prog.advance, 3, "Unlocking file protection...")
-                kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
-                final_key = cc.xor_bytes(master_key, kem_ss)
-                hmac_key  = master_key
-
-            # Verify metadata HMAC before touching the payload
-            cc._verify_meta_hmac(hmac_key, meta)
-
-            self.after(0, self._prog.advance, 4, "Decrypting your file...")
-            with open(tmp, "wb") as f:
-                fname, sz, ts = cc.decrypt_streaming(
-                    self._qcx_path, f, meta, final_key,
-                    progress_cb=self._prog_cb,
-                    cancel_check=lambda: self._cancel)
-            out_size = os.path.getsize(tmp)
-
-            # Build the final output path from the original filename stored in
-            # the payload.  basename() already blocks path traversal; also
-            # strip null bytes and control characters that would land in the
-            # filesystem as invisible / unusable filenames, and fall back to
-            # a generic name if nothing usable remains.
-            orig_basename = os.path.basename(fname) if fname else ""
-            orig_basename = "".join(
-                ch for ch in orig_basename
-                if ch.isprintable() and ch not in ("/", "\0")
-            ).strip().strip(".")
-            if not orig_basename:
-                orig_basename = "decrypted"
-            out = os.path.join(out_dir, orig_basename)
-            root, ext = os.path.splitext(orig_basename)
-            n = 2
-            while os.path.exists(out):
-                out = os.path.join(out_dir, f"{root}_{n}{ext}")
-                n += 1
-            os.replace(tmp, out)
-
-            if self._mode_val == "single":
-                self.after(0, self._clear_pw)
-            # n > 2 means the loop renamed the output to avoid an existing file
-            self.after(0, self._done, out, out_size, fname, sz, ts, n > 2)
+                self._after(self._clear_pw)
+            self._after(lambda: self._done(
+                res["output"], res["size"], res["filename"],
+                res["original_size"], res["timestamp"], res["renamed"]))
         except cc.CancelledOperation:
-            try: os.remove(tmp)
-            except OSError: pass
-            self.after(0, self._cancelled)
+            self._after(self._cancelled)
         except Exception as ex:
-            try: os.remove(tmp)
-            except OSError: pass
-            self.after(0, self._fail, ex)
+            self._after(lambda exc=ex: self._fail(exc))
 
     def _clear_pw(self):
-        """Clear password entry on the main thread after successful decryption."""
+        """Clear the password entry on the main thread after a successful
+        decryption.  It is still frozen (disabled) at this point and a
+        disabled Entry silently ignores delete(), so lift the state first."""
         if hasattr(self, "_pw"):
-            try: self._pw.delete(0, "end")
+            try:
+                prev = str(self._pw.cget("state"))
+                self._pw.config(state="normal")
+                self._pw.delete(0, "end")
+                self._pw.config(state=prev)
             except Exception: pass
 
     def _collect_shares(self):
@@ -1621,83 +1613,23 @@ class DecryptorApp(tk.Toplevel):
         self._begin(verify=True, err=self._validate())
 
     def _verify_run(self, pw_captured, shares_captured=None):
-        """Worker thread: derive keys, verify HMAC, decrypt first chunk. No output written."""
-        def _check_cancel():
+        """Worker thread: derive + HMAC-check the key (core.package
+        derive_final_key), then decrypt chunk 0 only (verify_first_chunk).
+        No output is written."""
+        try:
+            final_key, _hmac_key = pkg.derive_final_key(
+                self._meta, password=pw_captured, shares=shares_captured,
+                progress=self._prog_cb, cancel_check=lambda: self._cancel)
+            pw_captured = None  # noqa: F841 — release str reference
             if self._cancel:
                 raise cc.CancelledOperation()
-        try:
-            meta = self._meta
-            if self._mode_val == "single":
-                self.after(0, self._prog.advance, 0, "Verifying your password...")
-                pw_bytes = pw_captured.encode()
-                pw_captured = None  # noqa: F841 — release str reference
-                argon_key = cc.argon2id_derive(pw_bytes, _b64.b64decode(meta["argon_salt"]))
-                del pw_bytes
-                _check_cancel()
-                self.after(0, self._prog.advance, 1, "Loading encryption key...")
-                sk = cc.aes_gcm_decrypt(argon_key,
-                                        _b64.b64decode(meta["kyber_sk_enc_nonce"]),
-                                        _b64.b64decode(meta["kyber_sk_enc"]))
-                _check_cancel()
-                self.after(0, self._prog.advance, 2, "Unlocking file protection...")
-                kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
-                final_key = cc.xor_bytes(argon_key, kem_ss)
-                hmac_key  = final_key
-                self.after(0, self._prog.advance, 3, "Key ready")
-            else:
-                self.after(0, self._prog.advance, 0, f"Reading {len(shares_captured)} shares...")
-                share_dicts = [cc.decode_share(s) for s in shares_captured]
-                self.after(0, self._prog.advance, 1, "Combining shares to recover the key...")
-                master_key = cc.shamir_recover(share_dicts[:meta["threshold"]])
-                _check_cancel()
-                self.after(0, self._prog.advance, 2, "Loading encryption key...")
-                sk = cc.aes_gcm_decrypt(master_key,
-                                        _b64.b64decode(meta["kyber_sk_enc_nonce"]),
-                                        _b64.b64decode(meta["kyber_sk_enc"]))
-                _check_cancel()
-                self.after(0, self._prog.advance, 3, "Unlocking file protection...")
-                kem_ss    = cc.kyber_decaps(sk, _b64.b64decode(meta["kyber_kem_ct"]))
-                final_key = cc.xor_bytes(master_key, kem_ss)
-                hmac_key  = master_key
-            _check_cancel()
-
-            # Step 1: verify metadata HMAC
-            self.after(0, self._prog.advance, 4, "Checking file integrity...")
-            cc._verify_meta_hmac(hmac_key, meta)
-
-            # Step 2: decrypt first chunk only — proves AES key is correct without full decrypt
-            import struct as _struct
-            payload_offset = meta.get("payload_offset", 0)
-            base_nonce = _b64.b64decode(meta["payload_nonce"])
-            aes_key = cc.derive_aes_key(final_key)
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            cipher = AESGCM(aes_key)
-            with open(self._qcx_path, "rb") as f:
-                f.seek(payload_offset)
-                seq_raw = f.read(4)
-                if len(seq_raw) < 4:
-                    raise ValueError("File appears truncated")
-                seq = _struct.unpack(">I", seq_raw)[0]
-                if seq != 0:
-                    raise ValueError(f"First chunk has unexpected sequence number {seq} — file may be corrupt")
-                ct_len = _struct.unpack(">I", f.read(4))[0]
-                # Unauthenticated, attacker-controlled length — bound the
-                # allocation (same guard as stream_decrypt_payload).
-                if ct_len > cc.CHUNK_SIZE + 16:
-                    raise ValueError(
-                        f"Chunk declares an implausible size ({ct_len} "
-                        "bytes) — file may be corrupt"
-                    )
-                ct = f.read(ct_len)
-            nonce = cc._chunk_nonce(base_nonce, 0)
-            chunk_count = meta["payload_chunk_count"]
-            aad = cc._chunk_aad(0, chunk_count == 1)
-            cipher.decrypt(nonce, ct, aad)  # raises if wrong key
-            self.after(0, self._verify_done)
+            self._prog_cb("Checking file integrity...")
+            pkg.verify_first_chunk(self._qcx_path, self._meta, final_key)
+            self._after(self._verify_done)
         except cc.CancelledOperation:
-            self.after(0, self._cancelled)
+            self._after(self._cancelled)
         except Exception as ex:
-            self.after(0, self._fail, ex)
+            self._after(lambda exc=ex: self._fail(exc))
 
     def _verify_done(self):
         """Show verification success without writing any output."""
@@ -1721,7 +1653,7 @@ class DecryptorApp(tk.Toplevel):
         FlatButton(btn_row, f"Decrypt another {ICON['arrow']}", self._reset,
                    primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         self.after(50, lambda: self._cv.yview_moveto(1.0))
-        self.after(60, go.focus_set)
+        self.after(60, lambda: go.focus_set() if go.winfo_exists() else None)
 
     def _reset_and_decrypt(self):
         """After a successful verify, decrypt with the credentials still in the
@@ -1730,7 +1662,8 @@ class DecryptorApp(tk.Toplevel):
         self._start()
 
     def _done(self, path, size, fname="", sz=0, ts=0, renamed=False):
-        self._busy=False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
+        self._busy=False; self._finished_ok=True
+        self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
         # Immediately disable the Decrypt button — _thaw() re-enables it,
         # but on success it must stay disabled until "Decrypt another" is clicked.
         # Doing this before building the card avoids a visible flash of the enabled state.
@@ -1813,33 +1746,139 @@ class DecryptorApp(tk.Toplevel):
                              primary=False, small=True)
         another.pack(side="left")
         # If output looks like a folder-encrypted zip, offer one-click extraction
-        import zipfile as _zf
-        _is_folder_zip = (fname or "").endswith(".zip") and os.path.isfile(path) and _zf.is_zipfile(path)
+        _is_folder_zip = (fname or "").endswith(".zip") and os.path.isfile(path) and zipfile.is_zipfile(path)
         if _is_folder_zip:
-            def _extract(p=path):
-                import zipfile
-                out_dir = os.path.dirname(os.path.abspath(p))
-                try:
-                    with zipfile.ZipFile(p) as zf:
-                        names = zf.namelist()
-                        # Validate paths to prevent directory traversal attacks
-                        real_out = os.path.realpath(out_dir)
-                        for member in names:
-                            target = os.path.realpath(os.path.join(out_dir, member))
-                            if not target.startswith(real_out + os.sep) and target != real_out:
-                                raise ValueError(f"Path traversal detected in archive: {member}")
-                        zf.extractall(out_dir)
-                    top = os.path.join(out_dir, names[0].split("/")[0]) if names else out_dir
-                    self._reveal(top)
-                    alert(self, "Folder extracted", f"The folder was extracted to:\n{out_dir}")
-                except Exception as ex:
-                    alert(self, "Extraction failed", friendly_error(ex))
-            FlatButton(btn_row, "Extract folder", _extract, primary=True, small=True).pack(side="left", padx=(SP["s"],0))
+            FlatButton(btn_row, "Extract folder", lambda p=path: self._extract_folder(p),
+                       primary=True, small=True).pack(side="left", padx=(SP["s"],0))
         else:
             FlatButton(btn_row, "Open file", lambda: _open_file(path), primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         FlatButton(btn_row, REVEAL_LABEL, lambda: self._reveal(path), primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         self.after(50, lambda: self._cv.yview_moveto(1.0))
-        self.after(60, another.focus_set)
+        self.after(60, lambda: another.focus_set() if another.winfo_exists() else None)
+
+    # ── Extract folder ────────────────────────────────────────────────────────
+
+    def _extract_folder(self, zpath):
+        """Unpack the decrypted folder archive next to it, into a directory
+        that does not exist yet (never over an existing one), on a worker
+        thread with the progress bar and Cancel.  Entries that could escape
+        the destination are rejected up front; oversized archives are
+        confirmed first."""
+        if self._busy: return
+        out_dir = os.path.dirname(os.path.abspath(zpath))
+        try:
+            with zipfile.ZipFile(zpath) as zf:
+                infos = zf.infolist()
+        except Exception as ex:
+            alert(self, "Extraction failed", friendly_error(ex)); return
+        bad = [i.filename for i in infos if not _zip_member_ok(i.filename)]
+        if bad:
+            alert(self, "Archive not extracted",
+                  f"The archive contains an unsafe path ({bad[0]!r}) that could write "
+                  "outside the destination folder, so nothing was extracted.")
+            return
+        total = sum(i.file_size for i in infos)
+        if len(infos) > _EXTRACT_MAX_ENTRIES or total > _EXTRACT_MAX_BYTES:
+            if not confirm(self, "Large archive",
+                           f"This archive expands to {fmt_size(total)} in {len(infos):,} entries. "
+                           "Extract it anyway?", yes="Extract", no="Cancel"):
+                return
+        roots = {i.filename.replace("\\", "/").split("/")[0] for i in infos}
+        single_root = roots.pop() if len(roots) == 1 else None
+        top = single_root or os.path.splitext(os.path.basename(zpath))[0] or "extracted"
+        dest, renamed = pkg.unique_path(out_dir, top)
+
+        self._set_status("")
+        self._busy = True; self._extracting = True; self._verifying = False
+        self._cancel = False; self._finished_ok = False
+        self._new_prog(STAGE_EXTRACT)
+        self._cancel_row.pack(fill="x", padx=P, pady=(0, SP["s"]), before=self._results)
+        self._cancel_btn.enable(True)
+        self._prog.start(); self._freeze()
+        self.after(50, lambda: self._cv.yview_moveto(1.0))
+        threading.Thread(target=self._extract_run,
+                         args=(zpath, dest, single_root, total, renamed), daemon=True).start()
+
+    def _extract_run(self, zpath, dest, strip_root, declared, renamed):
+        """Worker: stream every member into ``dest`` (created fresh here).
+        Bytes written are bounded by the archive's own index so a mismatch
+        aborts instead of filling the disk; a cancel or failure removes
+        the half-written directory."""
+        written = 0
+        created = False   # only a directory THIS run made is ever removed
+        try:
+            try:
+                os.makedirs(dest)
+            except FileExistsError:
+                raise RuntimeError(
+                    f"A folder named {os.path.basename(dest)} appeared in "
+                    f"{os.path.dirname(dest)} just before extraction started — "
+                    "nothing was extracted.") from None
+            created = True
+            real_dest = os.path.realpath(dest)
+            with zipfile.ZipFile(zpath) as zf:
+                infos = zf.infolist()
+                n = len(infos) or 1
+                for i, info in enumerate(infos, 1):
+                    if self._cancel:
+                        raise cc.CancelledOperation()
+                    rel = info.filename.replace("\\", "/")
+                    if strip_root and rel.startswith(strip_root):
+                        rel = rel[len(strip_root):]
+                    parts = [p for p in rel.split("/") if p]
+                    target = os.path.join(dest, *parts) if parts else dest
+                    if os.path.commonpath([real_dest, os.path.realpath(target)]) != real_dest:
+                        raise ValueError(f"Archive entry escapes the destination: {info.filename}")
+                    if info.is_dir() or not parts:
+                        os.makedirs(target, exist_ok=True)
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        while True:
+                            chunk = src.read(1 << 20)
+                            if not chunk: break
+                            written += len(chunk)
+                            if written > declared + (1 << 20):
+                                raise ValueError("Archive contents don't match its index — extraction stopped.")
+                            dst.write(chunk)
+                            if self._cancel:
+                                raise cc.CancelledOperation()
+                    self._prog_cb(f"Extracting folder... {int(i / n * 100)}%")
+            self._after(lambda: self._extract_done(dest, renamed))
+        except cc.CancelledOperation:
+            if created:
+                shutil.rmtree(dest, ignore_errors=True)
+            self._after(self._cancelled)
+        except Exception as ex:
+            if created:
+                shutil.rmtree(dest, ignore_errors=True)
+            self._after(lambda exc=ex: self._extract_failed(exc))
+
+    def _extract_end(self, ok):
+        """Back to the post-decrypt result state (Decrypt stays disabled
+        until "Decrypt another", as _done left it)."""
+        self._busy = False; self._extracting = False; self._cancel = False
+        if ok: self._prog.complete()
+        else:  self._prog.stop(); self._prog.pack_forget()
+        self._cancel_row.pack_forget()
+        self._thaw()
+        self._btn.enable(False)
+
+    def _extract_done(self, dest, renamed):
+        self._extract_end(ok=True)
+        self._finished_ok = True
+        name = os.path.basename(dest)
+        note = (f"\n\nA folder named {os.path.basename(os.path.dirname(dest))}/"
+                f"{name.rsplit('_', 1)[0]} already existed, so it was extracted as {name}."
+                if renamed else "")
+        self._set_status(f"{ICON['ok']} Folder extracted to {dest}")
+        self._reveal(dest)
+        alert(self, "Folder extracted", f"The folder was extracted to:\n{dest}{note}")
+
+    def _extract_failed(self, exc):
+        self._extract_end(ok=False)
+        self._set_error("Extraction failed — nothing was kept.", friendly_error(exc))
+        alert(self, "Extraction failed", friendly_error(exc))
 
     def _reveal(self, path):
         if not reveal_path(path):
@@ -1889,9 +1928,12 @@ class DecryptorApp(tk.Toplevel):
 
     def _cancelled(self):
         """Post-cancel UI reset."""
+        if self._extracting:
+            self._extract_end(ok=False)
+            self._set_status("Extraction cancelled — nothing was kept.")
+            return
         self._busy = False
         self._cancel = False
-        self._tmp_path = None
         self._prog.stop()
         self._prog.pack_forget()
         self._cancel_row.pack_forget()
@@ -1905,18 +1947,25 @@ class DecryptorApp(tk.Toplevel):
     def _fail(self, exc):
         """Worker failure → one plain sentence on the status line.  Only the
         two credential cases get bespoke copy; everything else goes through
-        friendly_error() so the two wizards can't drift apart again."""
-        self._busy=False; self._cancel=False; self._tmp_path=None
+        friendly_error() so the two wizards can't drift apart again.
+
+        The credential cases are decided by core.errors.classify_error, not
+        by the exception's type name: a payload that fails authentication
+        AFTER derive_final_key proved the key (CorruptPayload, code
+        ``format``) is a damaged copy and must never be called a wrong
+        password — that advice sends the user to re-type a correct one."""
+        self._busy=False; self._cancel=False
         self._prog.stop(); self._prog.pack_forget(); self._cancel_row.pack_forget(); self._thaw()
         self._wiz.set_step(2)  # stay at Decrypt step — error is shown there
-        if isinstance(exc, BaseException):
-            msg = str(exc) or type(exc).__name__
-            wrong_key = "InvalidTag" in msg or "InvalidTag" in type(exc).__name__
-        else:  # tolerate a pre-mapped string
-            msg = str(exc); exc = RuntimeError(msg)
-            wrong_key = "InvalidTag" in msg
+        if not isinstance(exc, BaseException):   # tolerate a pre-mapped string
+            exc = RuntimeError(str(exc))
+        msg = str(exc) or type(exc).__name__
+        code, _message, _detail = classify_error(exc)
+        wrong_key = code == "wrong_credentials"
         detail = ""
-        if wrong_key and self._mode_val == "single":
+        if isinstance(exc, CorruptPayload):
+            text = friendly_error(exc)   # the key was right; this copy is damaged
+        elif wrong_key and self._mode_val == "single":
             self._pw_failures += 1
             text = ("Wrong password — check Caps Lock, use Show to see what you typed, "
                     "and try again.")
@@ -1925,7 +1974,7 @@ class DecryptorApp(tk.Toplevel):
         elif wrong_key or "Checksum" in msg or "out of range" in msg.lower():
             text = self._shares_wrong_copy()
         else:
-            text = friendly_error(exc)
+            text = friendly_error(exc)   # format / io / invalid_input: the helper's own sentence
         self._set_error(text, detail)
         notify("Decryption failed", text, sound=False)
         # Defer focus so _thaw's state=normal is processed first

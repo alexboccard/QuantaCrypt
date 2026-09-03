@@ -23,19 +23,38 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
-    from quantacrypt.core.service import Service
+    from quantacrypt.core.service import Service, ServiceStop
 
     # Line-buffered, UTF-8 stdio regardless of locale; nothing but protocol
     # lines may reach stdout, so logging goes to stderr.
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore[union-attr]
+    import logging
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+                        format="qc-core %(levelname)s %(name)s: %(message)s")
     svc = Service(sys.stdin, sys.stdout)
 
+    # The only SIGTERM path in the helper (fuse_ops' handlers are not
+    # installed here: mounts run on worker threads).  The handler must not
+    # do the teardown itself — it runs on the main thread, which may be
+    # blocked inside unmount_volume() holding _mount_lock; it only asks the
+    # loop to stop, and run()'s finally does the work.
+    stopping = {"raised": False}
+
     def _term(_signum, _frame):
-        svc.shutdown()
-        raise SystemExit(0)
+        svc.request_stop()
+        # Raise once, to unwind the blocked stdin read.  A second signal
+        # (the client's escalation) must not interrupt the teardown that
+        # is already running in run()'s finally.
+        if not stopping["raised"]:
+            stopping["raised"] = True
+            raise ServiceStop()
 
     signal.signal(signal.SIGTERM, _term)
-    svc.run()
+    signal.signal(signal.SIGINT, _term)
+    try:
+        svc.run()
+    except ServiceStop:
+        pass
     return 0
 
 

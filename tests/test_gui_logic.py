@@ -432,16 +432,88 @@ class TestWizardStepDuringEncryption:
         assert "set_step(3)" not in src, "_start should not set wizard to step 3 (Output)"
 
 
-@requires_tkinter
-class TestDecryptorFailStep:
-    """Fix 7: _fail stays at step 2 (Decrypt), not retreats to step 1."""
+def _fail_stand_in(mode="single", k=2, n=3):
+    """Bare namespace carrying only what DecryptorApp._fail touches, so the
+    error-classification branches run without a display."""
+    import types
+    from quantacrypt.ui.decryptor import DecryptorApp
+    obj = types.SimpleNamespace(
+        _busy=True, _cancel=True, _mode_val=mode, _pw_failures=0,
+        _meta={"mode": mode, "threshold": k, "total": n},
+        _prog=types.SimpleNamespace(stop=lambda: None, pack_forget=lambda: None),
+        _cancel_row=types.SimpleNamespace(pack_forget=lambda: None),
+        _thaw=lambda: None, _focus_credential=lambda: None,
+        _cv=types.SimpleNamespace(yview_moveto=lambda f: None),
+        steps=[], errors=[], afters=[],
+    )
+    obj._wiz = types.SimpleNamespace(set_step=obj.steps.append)
+    obj._set_error = lambda text, detail="": obj.errors.append((text, detail))
+    obj.after = lambda ms, fn=None: obj.afters.append(fn)
+    obj._shares_wrong_copy = lambda: DecryptorApp._shares_wrong_copy(obj)
+    obj._fail = lambda exc: DecryptorApp._fail(obj, exc)
+    return obj
 
-    def test_fail_sets_step_2(self):
-        import inspect
-        import quantacrypt.ui.decryptor as decryptor
-        src = inspect.getsource(decryptor.DecryptorApp._fail)
-        assert "set_step(2)" in src, "_fail should keep wizard at step 2"
-        assert "set_step(1)" not in src, "_fail should not retreat to step 1"
+
+@requires_tkinter
+class TestDecryptorFail:
+    """Behaviour of DecryptorApp._fail (replaces the getsource checks for
+    'stays at step 2' and 'Checksum branch uses fixed copy')."""
+
+    @pytest.fixture(autouse=True)
+    def _quiet_notify(self):
+        from unittest.mock import patch
+        import quantacrypt.ui.decryptor as dec_mod
+        with patch.object(dec_mod, "notify"):
+            yield
+
+    def test_wrong_password_counts_and_stays_on_decrypt_step(self):
+        from cryptography.exceptions import InvalidTag
+        from quantacrypt.ui.decryptor import NO_RECOVERY_NOTE
+        obj = _fail_stand_in("single")
+        for i in range(1, 4):
+            obj._fail(InvalidTag())
+            text, detail = obj.errors[-1]
+            assert text.startswith("Wrong password")
+            assert obj._pw_failures == i
+            assert detail == (NO_RECOVERY_NOTE if i >= 3 else "")
+        assert obj.steps == [2, 2, 2] and obj._busy is False and obj._cancel is False
+
+    def test_corrupt_payload_is_never_called_a_wrong_password(self):
+        """F-101 (Tk): the key was proven before the payload failed — the
+        helper's 'damaged copy' sentence, no attempt counter, no Caps Lock."""
+        from quantacrypt.core.errors import CorruptPayload
+        msg = ("The file's contents are damaged or were altered after encryption — "
+               "the password is right, but this copy can't be restored.")
+        for mode in ("single", "shamir"):
+            obj = _fail_stand_in(mode)
+            obj._fail(CorruptPayload(msg))
+            text, detail = obj.errors[-1]
+            assert text == msg
+            assert "Wrong password" not in text and "don't unlock" not in text
+            assert obj._pw_failures == 0 and detail == ""
+
+    def test_format_class_errors_show_the_helper_message(self):
+        from quantacrypt.core.errors import InvalidInput
+        obj = _fail_stand_in("single")
+        obj._fail(ValueError("File appears truncated"))
+        assert "truncated" in obj.errors[-1][0] and obj._pw_failures == 0
+        obj._fail(InvalidInput("Need 2 different shares to open this file, got 1"))
+        assert obj.errors[-1][0] == "Need 2 different shares to open this file, got 1"
+
+    def test_shamir_wrong_key_and_checksum_use_fixed_copy(self):
+        from cryptography.exceptions import InvalidTag
+        obj = _fail_stand_in("shamir")
+        obj._fail(InvalidTag())
+        assert obj.errors[-1][0] == obj._shares_wrong_copy() and obj._pw_failures == 0
+        raw = "Checksum mismatch: 0xdeadbeef != 0xcafebabe"
+        obj._fail(ValueError(raw))
+        assert obj.errors[-1][0] == obj._shares_wrong_copy()
+        assert "0xdeadbeef" not in obj.errors[-1][0]   # never the raw message
+
+    def test_pre_mapped_string_still_tolerated(self):
+        obj = _fail_stand_in("single")
+        obj._fail("InvalidTag")
+        assert obj.errors[-1][0].startswith("Wrong password") and obj._pw_failures == 1
 
 
 @requires_tkinter
@@ -533,26 +605,6 @@ class TestFnameSanitization:
     def test_basename_on_normal_name_unchanged(self):
         import os
         assert os.path.basename("document.pdf") == "document.pdf"
-
-
-@requires_tkinter
-class TestShareChecksumError:
-    """Fix 16: Share checksum error shows sanitized message."""
-
-    def test_fail_sanitizes_checksum_error(self):
-        import inspect
-        import quantacrypt.ui.decryptor as decryptor
-        src = inspect.getsource(decryptor.DecryptorApp._fail)
-        # Should NOT use f-string with {msg} for Checksum branch
-        # Find the checksum branch
-        lines = src.split("\n")
-        for i, line in enumerate(lines):
-            if "Checksum" in line and "elif" in line:
-                # Next line should be the error message
-                next_line = lines[i+1] if i+1 < len(lines) else ""
-                assert "{msg}" not in next_line, \
-                    "Checksum error should use a fixed string, not f'{msg}'"
-                break
 
 
 @requires_tkinter
@@ -1137,15 +1189,33 @@ class TestLoadPkgValidation:
 
 @requires_tkinter
 class TestEncryptorDecSizeGuard:
-    """BUG-A: dec_size getsize must not propagate OSError."""
+    """BUG-A: a decryptor binary that vanishes between _find_dec and
+    getsize must not crash the worker — _done still runs with dec_size 0."""
 
-    def test_dec_size_oserror_is_caught(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._run)
-        # After the fix an except OSError clause guards the getsize
-        assert "except OSError" in src, "_run should catch OSError around dec_size getsize"
-        assert "dec_size = 0" in src, "dec_size should default to 0 on OSError"
+    def test_dec_size_oserror_is_caught(self, tmp_path):
+        import types
+        from unittest.mock import patch
+        import quantacrypt.ui.encryptor as enc_mod
+        from quantacrypt.ui.encryptor import EncryptorApp
+        gone = str(tmp_path / "no-such-decryptor")
+        import threading
+        obj = types.SimpleNamespace(done=[], failed=[], _find_dec=lambda: gone,
+                                    _cancel_event=threading.Event(), _prog_cb=lambda m: None)
+        obj._done = lambda *a, **k: obj.done.append((a, k))
+        obj._fail = lambda exc: obj.failed.append(exc)
+        obj._cancelled = lambda: obj.failed.append("cancelled")
+        params = {"path": "/in/x", "out": "/out/x.qcx", "mode": "password",
+                  "pw": "pw", "n": 3, "k": 2, "embed": True, "is_folder": False}
+        with patch.object(enc_mod.pkg, "encrypt_to_qcx",
+                          return_value={"shares": []}) as enc, \
+             patch.object(enc_mod, "safe_after", lambda w, fn, delay=0: fn()):
+            EncryptorApp._run(obj, params)
+        assert enc.call_args.kwargs["embed_binary"] == gone
+        assert not obj.failed
+        (out, shares, embedded, dec_size), kw = obj.done[0]
+        assert out == "/out/x.qcx" and shares == [] and embedded is True
+        assert dec_size == 0 and kw == {"mnemonics": []}
+        assert params["pw"] is None, "password must be dropped from the worker params"
 
 
 
@@ -1367,3 +1437,412 @@ class TestFriendlyErrorInvalidTag:
             pass
         assert friendly_error(WeirdError()) == \
             "WeirdError (no additional detail)"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Round-3 F-207: behaviour tests for the rewritten UI helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _shares_2_of_3():
+    from quantacrypt.core import crypto as cc
+    import secrets
+    raw = cc.shamir_split(secrets.token_bytes(cc.KEY_BYTES), 3, 2)
+    return [cc.encode_share(s) for s in raw]
+
+
+@requires_tkinter
+class TestWriteNewPrivateFile:
+    """shared.write_new_private_file: O_EXCL, 0600, <stem>_N on collision,
+    terminates on a dangling symlink (F-202)."""
+
+    def test_fresh_file_is_0600_and_not_renamed(self, tmp_path):
+        from quantacrypt.ui.shared import write_new_private_file
+        p = str(tmp_path / "a.shares.txt")
+        out, renamed = write_new_private_file(p, "secret\n")
+        assert out == p and renamed is False
+        assert os.stat(out).st_mode & 0o777 == 0o600
+        assert open(out).read() == "secret\n"
+
+    def test_collision_goes_to_stem_2_and_leaves_original(self, tmp_path):
+        from quantacrypt.ui.shared import write_new_private_file
+        p = str(tmp_path / "a.shares.txt")
+        write_new_private_file(p, "first\n")
+        out, renamed = write_new_private_file(p, "second\n")
+        assert renamed is True and os.path.basename(out) == "a.shares_2.txt"
+        assert open(p).read() == "first\n" and open(out).read() == "second\n"
+        out3, _ = write_new_private_file(p, "third\n")
+        assert os.path.basename(out3) == "a.shares_3.txt"
+
+    def test_dangling_symlink_is_skipped_not_looped(self, tmp_path):
+        from quantacrypt.ui.shared import write_new_private_file
+        p = str(tmp_path / "a.txt")
+        os.symlink(str(tmp_path / "missing-target"), p)
+        assert not os.path.exists(p) and os.path.lexists(p)
+        out, renamed = write_new_private_file(p, "x")
+        assert renamed is True and os.path.basename(out) == "a_2.txt"
+        assert os.path.islink(p), "the symlink itself must be left alone"
+
+    def test_attempts_are_capped(self, tmp_path):
+        from quantacrypt.ui import shared
+        p = str(tmp_path / "a.txt")
+        os.symlink("/nonexistent/x", p)
+        for n in range(2, shared._MAX_NAME_ATTEMPTS + 1):
+            os.symlink("/nonexistent/x", str(tmp_path / f"a_{n}.txt"))
+        with pytest.raises(FileExistsError):
+            shared.write_new_private_file(p, "x")
+
+
+@requires_tkinter
+class TestSafeAfter:
+    """shared.safe_after: hop is dropped (not raised) when after() fails,
+    and the callback is skipped once the widget is gone."""
+
+    class _Widget:
+        def __init__(self, exists=True, raise_on_after=None):
+            self.exists = exists; self.raise_on_after = raise_on_after; self.queued = []
+        def after(self, delay, fn):
+            if self.raise_on_after:
+                raise self.raise_on_after
+            self.queued.append(fn)
+        def winfo_exists(self):
+            return self.exists
+
+    def test_non_threaded_tcl_runtimeerror_is_swallowed(self):
+        from quantacrypt.ui.shared import safe_after
+        w = self._Widget(raise_on_after=RuntimeError("main thread is not in main loop"))
+        safe_after(w, lambda: (_ for _ in ()).throw(AssertionError("must not run")))
+
+    def test_destroyed_window_tclerror_is_swallowed(self):
+        import tkinter as tk
+        from quantacrypt.ui.shared import safe_after
+        w = self._Widget(raise_on_after=tk.TclError("bad window path name"))
+        safe_after(w, lambda: None)
+
+    def test_callback_runs_only_while_widget_exists(self):
+        import tkinter as tk
+        from quantacrypt.ui.shared import safe_after
+        calls = []
+        w = self._Widget()
+        safe_after(w, lambda: calls.append(1))
+        assert len(w.queued) == 1
+        w.exists = False
+        w.queued[0]()
+        assert calls == [], "fn must be skipped after the widget was destroyed"
+        w.exists = True
+        w.queued[0]()
+        assert calls == [1]
+        # a TclError raised by fn itself (widget died mid-callback) is contained
+        def _boom(): raise tk.TclError("invalid command name")
+        safe_after(w, _boom)
+        w.queued[1]()
+
+
+@requires_tkinter
+class TestVolumeManagerParseShareText:
+    """F-201: the mount panel's parser must read the app's own share files."""
+
+    def _save_all_text(self, shares, k=2, n=3):
+        # Exactly the layout VolumeManagerApp._show_shares_dialog._save_all writes
+        lines = [f"QuantaCrypt recovery shares — {k} of {n} needed", ""]
+        for i, share in enumerate(shares):
+            lines += [f"Share {i + 1} of {n}:", share, ""]
+        return "\n".join(lines)
+
+    def test_saved_shares_file_parses_to_every_code(self):
+        from quantacrypt.core import package as pkg
+        from quantacrypt.ui.volume_manager import _parse_share_text
+        shares = _shares_2_of_3()
+        got = pkg.normalize_shares(_parse_share_text(self._save_all_text(shares)))
+        assert got == shares
+
+    def test_encryptor_individual_share_file_parses(self, tmp_path):
+        import types
+        from unittest.mock import patch
+        from quantacrypt.core import package as pkg
+        import quantacrypt.ui.encryptor as enc_mod
+        from quantacrypt.ui.encryptor import EncryptorApp
+        from quantacrypt.ui.volume_manager import _parse_share_text
+        shares = _shares_2_of_3()
+        obj = types.SimpleNamespace(
+            _shares_pending={"__single__"}, _result_k=2, _result_n=3,
+            _k=types.SimpleNamespace(get=lambda: 2), _n=types.SimpleNamespace(get=lambda: 3),
+            _out=types.SimpleNamespace(get=lambda: ""),
+            _results=types.SimpleNamespace(winfo_children=lambda: []))
+        with patch.object(enc_mod.filedialog, "askdirectory", return_value=str(tmp_path)), \
+             patch.object(enc_mod.messagebox, "showerror"):
+            EncryptorApp._save_individual_shares(obj, shares, "vault.txt",
+                                                 qcx_path=None, banner_frame=object())
+        for i, share in enumerate(shares, 1):
+            body = open(tmp_path / f"vault.share-{i}-of-3.txt").read()
+            # header, prose, the code AND its 50-word phrase → exactly one share
+            assert pkg.normalize_shares(_parse_share_text(body)) == [share]
+
+    def test_phrase_across_lines_and_bad_code_named(self):
+        from quantacrypt.core import crypto as cc
+        from quantacrypt.core import package as pkg
+        from quantacrypt.ui.volume_manager import _parse_share_text
+        shares = _shares_2_of_3()
+        mn = cc.share_to_mnemonic({**cc.decode_share(shares[1]), "threshold": 2})
+        text = "my notes\n" + shares[0] + "\n" + mn.replace(" ", "\n", 7) + "\n" + shares[0]
+        entries = _parse_share_text(text)
+        assert entries == [shares[0], shares[0], shares[1]]
+        assert pkg.normalize_shares(entries) == [shares[0], shares[1]]
+        with pytest.raises(ValueError, match="Share 1"):
+            pkg.normalize_shares(_parse_share_text("QCSHARE-garbage"))
+        assert _parse_share_text("just some prose, no shares here") == []
+
+
+@requires_tkinter
+class TestExtractShareCodesDelegation:
+    def test_decryptor_delegates_to_core(self):
+        from unittest.mock import patch
+        from quantacrypt.core import package as pkg
+        from quantacrypt.ui.decryptor import _extract_share_codes
+        shares = _shares_2_of_3()
+        text = "QuantaCrypt Key Shares\nThreshold: 2 of 3\n\nShare 1 — QCSHARE- code:\n" \
+               + shares[0] + "\n\n" + shares[2] + "\n"
+        assert _extract_share_codes(text) == pkg.extract_share_codes(text) == [shares[0], shares[2]]
+        sentinel = ["SENTINEL"]
+        with patch.object(pkg, "extract_share_codes", return_value=sentinel) as m:
+            assert _extract_share_codes("anything") is sentinel
+        m.assert_called_once_with("anything")
+
+
+@requires_tkinter
+class TestShareFileNamesWholeRun:
+    """F-015: per-run collision handling — never a mix of two stems."""
+
+    def test_no_collision_keeps_stem(self, tmp_path):
+        from quantacrypt.ui.encryptor import _share_file_names
+        names, renamed = _share_file_names(str(tmp_path), "doc", 3)
+        assert renamed is False
+        assert [os.path.basename(n) for n in names] == \
+            ["doc.share-1-of-3.txt", "doc.share-2-of-3.txt", "doc.share-3-of-3.txt"]
+
+    def test_one_existing_file_moves_the_whole_set(self, tmp_path):
+        from quantacrypt.ui.encryptor import _share_file_names
+        (tmp_path / "doc.share-2-of-3.txt").write_text("old")
+        names, renamed = _share_file_names(str(tmp_path), "doc", 3)
+        assert renamed is True
+        assert [os.path.basename(n) for n in names] == \
+            ["doc_2.share-1-of-3.txt", "doc_2.share-2-of-3.txt", "doc_2.share-3-of-3.txt"]
+        os.symlink("/nonexistent", str(tmp_path / "doc_2.share-1-of-3.txt"))  # dangling counts
+        names, _ = _share_file_names(str(tmp_path), "doc", 3)
+        assert os.path.basename(names[0]) == "doc_3.share-1-of-3.txt"
+
+    def test_cap(self, tmp_path):
+        from quantacrypt.ui.encryptor import _share_file_names
+        (tmp_path / "doc.share-1-of-2.txt").write_text("x")
+        for n in range(2, 100):
+            (tmp_path / f"doc_{n}.share-1-of-2.txt").write_text("x")
+        with pytest.raises(FileExistsError):
+            _share_file_names(str(tmp_path), "doc", 2)
+
+
+@requires_tkinter
+class TestRetryFailedKeepsFolderAndGuards:
+    """F-203: 'Retry N failed' keeps the chosen output folder and runs the
+    unsaved-shares guard BEFORE replacing the selection."""
+
+    def _obj(self, pending):
+        import types
+        from quantacrypt.ui.encryptor import EncryptorApp
+        var = types.SimpleNamespace(v="/chosen/out")
+        var.get = lambda: var.v
+        var.set = lambda s: setattr(var, "v", s)
+        obj = types.SimpleNamespace(
+            _batch_out_var=var, _batch_paths=["/in/a", "/in/b", "/in/c"],
+            _shares_pending=set(pending), _show_done=True, started=[],
+            _build_batch_ui=lambda: None, _set_status=lambda m: None)
+        obj._start = lambda: obj.started.append(1)
+        obj._check_shares_saved = lambda: EncryptorApp._check_shares_saved(obj)
+        obj._set_batch_paths = lambda paths, keep_out=False: EncryptorApp._set_batch_paths(obj, paths, keep_out)
+        obj._retry_failed = lambda paths: EncryptorApp._retry_failed(obj, paths)
+        return obj
+
+    def test_go_back_leaves_everything_untouched(self):
+        from unittest.mock import patch
+        import quantacrypt.ui.encryptor as enc_mod
+        obj = self._obj({"/chosen/out/a.qcx"})
+        with patch.object(enc_mod.messagebox, "askyesno", return_value=False):
+            obj._retry_failed(["/in/b"])
+        assert obj.started == [] and obj._batch_paths == ["/in/a", "/in/b", "/in/c"]
+        assert obj._shares_pending == {"/chosen/out/a.qcx"} and obj._show_done is True
+
+    def test_retry_keeps_output_folder(self):
+        from unittest.mock import patch
+        import quantacrypt.ui.encryptor as enc_mod
+        obj = self._obj({"/chosen/out/a.qcx"})
+        with patch.object(enc_mod.messagebox, "askyesno", return_value=True) as m:
+            obj._retry_failed(["/in/b", "/in/c"])
+        assert m.call_count == 1, "the guard must run exactly once (not again in _start)"
+        assert obj.started == [1] and obj._batch_paths == ["/in/b", "/in/c"]
+        assert obj._batch_out_var.get() == "/chosen/out"
+        assert obj._shares_pending == set()
+        # a fresh selection (not a retry) still defaults the folder
+        obj._set_batch_paths(["/elsewhere/x"])
+        assert obj._batch_out_var.get() == "/elsewhere"
+
+
+@requires_tkinter
+class TestExtractRunRemovesOnlyOwnDirectory:
+    """F-204: a destination that already existed is never rmtree'd."""
+
+    def _obj(self):
+        import types
+        from quantacrypt.ui.decryptor import DecryptorApp
+        obj = types.SimpleNamespace(_cancel=False, failed=[], done=[], cancelled=[])
+        obj._after = lambda fn, delay=0: fn()
+        obj._prog_cb = lambda msg: None
+        obj._extract_failed = lambda exc: obj.failed.append(exc)
+        obj._extract_done = lambda dest, renamed: obj.done.append(dest)
+        obj._cancelled = lambda: obj.cancelled.append(1)
+        obj._extract_run = lambda *a: DecryptorApp._extract_run(obj, *a)
+        return obj
+
+    def _zip(self, tmp_path):
+        import zipfile
+        z = tmp_path / "docs.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("docs/a.txt", "alpha")
+        return str(z)
+
+    def test_pre_existing_destination_survives(self, tmp_path):
+        dest = tmp_path / "docs"
+        dest.mkdir(); (dest / "keep.txt").write_text("mine")
+        obj = self._obj()
+        obj._extract_run(self._zip(tmp_path), str(dest), "docs", 5, False)
+        assert obj.done == [] and len(obj.failed) == 1
+        assert "appeared" in str(obj.failed[0])
+        assert (dest / "keep.txt").read_text() == "mine"
+
+    def test_own_directory_is_removed_on_failure(self, tmp_path):
+        dest = tmp_path / "docs"
+        obj = self._obj()
+        obj._extract_run(str(tmp_path / "missing.zip"), str(dest), None, 5, False)
+        assert len(obj.failed) == 1 and not dest.exists()
+
+    def test_success_path(self, tmp_path):
+        dest = tmp_path / "docs"
+        obj = self._obj()
+        obj._extract_run(self._zip(tmp_path), str(dest), "docs", 5, False)
+        assert obj.done == [str(dest)] and (dest / "a.txt").read_text() == "alpha"
+
+
+@requires_tkinter
+class TestDecryptorDropParsing:
+    """F-210: a multi-item drop is split like the encryptor does."""
+
+    def _obj(self, splitlist):
+        import types
+        from quantacrypt.ui.decryptor import DecryptorApp
+        obj = types.SimpleNamespace(_busy=False, status=[], errors=[], loaded=[], opened=[],
+                                    tk=types.SimpleNamespace(splitlist=splitlist))
+        obj._set_status = lambda m, d="": obj.status.append(m)
+        obj._set_error = lambda m, d="": obj.errors.append(m)
+        obj._file_card = types.SimpleNamespace(load=obj.loaded.append)
+        obj._on_file = obj.opened.append
+        obj._flash_busy = lambda: None
+        obj._on_drop = lambda ev: DecryptorApp._on_drop(obj, ev)
+        return obj
+
+    def test_two_unbraced_paths_use_the_first(self, tmp_path):
+        import types
+        a = tmp_path / "x.qcx"; b = tmp_path / "y.qcx"
+        a.write_bytes(b"1"); b.write_bytes(b"2")
+        obj = self._obj(lambda s: tuple(s.split()))
+        obj._on_drop(types.SimpleNamespace(data=f"{a} {b}"))
+        assert obj.opened == [str(a)] and obj.errors == []
+        assert obj.status and "Only one file" in obj.status[-1]
+
+    def test_splitlist_failure_falls_back_to_braces(self, tmp_path):
+        import types
+        d = tmp_path / "a b"; d.mkdir()
+        a = d / "x.qcx"; a.write_bytes(b"1")
+        def _boom(s): raise RuntimeError("no tcl")
+        obj = self._obj(_boom)
+        obj._on_drop(types.SimpleNamespace(data="{" + str(a) + "}"))
+        assert obj.opened == [str(a)]
+
+
+@requires_tkinter
+class TestMountErrorBlame:
+    """F-211: a PermissionError about the .qcv must not blame the mount point."""
+
+    def test_blames_mount_point_only_for_its_own_path(self):
+        from quantacrypt.ui.volume_manager import _blames_mount_point
+        mp = "/Users/me/QuantaCrypt Volumes/vault"
+        assert _blames_mount_point(PermissionError(13, "denied", mp), mp)
+        assert _blames_mount_point(PermissionError(13, "denied", "/Users/me/QuantaCrypt Volumes"), mp)
+        assert _blames_mount_point(PermissionError(13, "denied"), mp)   # unknown → default advice
+        assert not _blames_mount_point(PermissionError(13, "denied", "/Users/me/vault.qcv"), mp)
+
+
+@requires_tkinter
+class TestStagedProgressBarSingleTimer:
+    """The ETA loop is armed from start() only: many advance() calls leave
+    one pending _time_job (plus at most the dot-pulse job)."""
+
+    def test_only_one_eta_job_after_many_advances(self):
+        import tkinter as tk
+        from quantacrypt.ui.shared import StagedProgressBar
+        try:
+            root = tk.Tk(); root.withdraw()
+        except tk.TclError as exc:
+            pytest.skip(f"no Tk display: {exc}")
+        try:
+            bar = StagedProgressBar(root, [("a", 0.5), ("b", 0.5)])
+            bar.start()
+            first = bar._time_job
+            for i in range(200):
+                bar.advance(0, "a")
+            for i in range(200):
+                bar.advance(1, f"b {i % 100}%")
+            assert bar._time_job == first, "advance() must never re-arm the ETA loop"
+            pending = root.tk.call("after", "info")
+            assert len(pending) <= 2, f"{len(pending)} timers queued: {pending}"
+            bar.stop()
+            assert bar._time_job is None and bar._pulse_job is None
+            assert not root.tk.call("after", "info")
+            bar.destroy()
+        finally:
+            root.destroy()
+
+
+@requires_tkinter
+class TestPasswordStrengthBarStaleResults:
+    """A worker result for text the user has since changed is dropped, and
+    the submit path never scores on the main thread (F-213)."""
+
+    def _obj(self):
+        import types
+        from quantacrypt.ui.shared import PasswordStrengthBar
+        obj = types.SimpleNamespace(_seq=5, _last=("old", 1, "Weak", ""), lbl=[], tip=[], drawn=[],
+                                    _refresh_job=None, _inflight=None,
+                                    _SUBMIT_WAIT_S=PasswordStrengthBar._SUBMIT_WAIT_S)
+        obj._lbl = types.SimpleNamespace(config=lambda **k: obj.lbl.append(k))
+        obj._tip = types.SimpleNamespace(config=lambda **k: obj.tip.append(k))
+        obj._draw = lambda score, pw: obj.drawn.append((score, pw))
+        obj._colour = PasswordStrengthBar._colour
+        obj._apply = lambda *a: PasswordStrengthBar._apply(obj, *a)
+        obj.score_for = lambda pw: PasswordStrengthBar.score_for(obj, pw)
+        return obj
+
+    def test_stale_seq_is_dropped_current_applied(self):
+        obj = self._obj()
+        obj._apply(4, "stale", 4, "Strong", "")
+        assert obj._last == ("old", 1, "Weak", "") and obj.drawn == []
+        obj._apply(5, "new", 3, "Good", "tip")
+        assert obj._last == ("new", 3, "Good", "tip") and obj.drawn == [(3, "new")]
+
+    def test_score_for_uses_cache_or_last_score_never_sync(self):
+        import threading
+        obj = self._obj()
+        obj._score = lambda pw: (_ for _ in ()).throw(AssertionError("scored on the main thread"))
+        assert obj.score_for("old") == 1                    # cached
+        assert obj.score_for("something-else") == 1         # worker's last score, no sync run
+        holder = {"seq": 5, "res": (4, "Strong", "")}
+        ev = threading.Event(); ev.set()
+        obj._inflight = ("typed-fast", ev, holder)          # worker already finished
+        assert obj.score_for("typed-fast") == 4
+        assert obj._last[0] == "typed-fast"

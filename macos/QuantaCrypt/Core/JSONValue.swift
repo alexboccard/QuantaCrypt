@@ -5,6 +5,9 @@ enum JSONValue: Codable, Equatable, Sendable {
     case null
     case bool(Bool)
     case number(Double)
+    /// Encode-side only: JSON has one number type, so decoding always yields
+    /// `.number`. Use it for parameters the helper requires to be integers.
+    case integer(Int)
     case string(String)
     case array([JSONValue])
     case object([String: JSONValue])
@@ -34,6 +37,7 @@ enum JSONValue: Codable, Equatable, Sendable {
         case .null: try c.encodeNil()
         case .bool(let b): try c.encode(b)
         case .number(let d): try c.encode(d)
+        case .integer(let i): try c.encode(i)
         case .string(let s): try c.encode(s)
         case .array(let a): try c.encode(a)
         case .object(let o): try c.encode(o)
@@ -47,8 +51,20 @@ enum JSONValue: Codable, Equatable, Sendable {
 
     var stringValue: String? { if case .string(let s) = self { return s }; return nil }
     var boolValue: Bool? { if case .bool(let b) = self { return b }; return nil }
-    var doubleValue: Double? { if case .number(let d) = self { return d }; return nil }
-    var intValue: Int? { doubleValue.map { Int($0) } }
+    var doubleValue: Double? {
+        switch self {
+        case .number(let d): return d
+        case .integer(let i): return Double(i)
+        default: return nil
+        }
+    }
+    var intValue: Int? {
+        switch self {
+        case .integer(let i): return i
+        case .number(let d): return d.isFinite && d.magnitude < 9.0e15 ? Int(d) : nil
+        default: return nil
+        }
+    }
 
     /// Re-decode this tree as a typed result struct.
     func decoded<T: Decodable>(as type: T.Type = T.self) throws -> T {

@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """QuantaCrypt Encryptor — encryption GUI with password and Shamir modes."""
-import json
 import os
 import re
-import stat
 import subprocess
 import sys
-import tempfile
 import threading
-import zipfile
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from quantacrypt.core import crypto as cc
+from quantacrypt.core import package as pkg
+from quantacrypt.core.package import (  # noqa: F401  (re-exported for tests)
+    folder_stats as _folder_stats,
+    batch_output_paths as _batch_output_paths,
+    zip_folder as _zip_folder,
+)
 from quantacrypt.ui.shared import (
     C, F, SP, ICON, REVEAL_LABEL,
-    accel, bind_shortcut, confirm, friendly_error, reveal_path,
+    accel, bind_shortcut, confirm, friendly_error, reveal_path, safe_after,
+    write_new_private_file,
     styled_entry, bind_context_menu, fmt_size, rule, section_label,
     FlatButton, SegmentedControl, StagedProgressBar,
     PasswordStrengthBar, FileCard, WizardSteps, ClipboardTimer,
     notify,
-)
-
-
-from quantacrypt.core.package import (  # noqa: E402
-    folder_stats as _folder_stats,
-    batch_output_paths as _batch_output_paths,
-    zip_folder as _zip_folder,
 )
 
 # Friendly stage names + relative weights.  The list shown to the user is
@@ -93,6 +89,51 @@ def _reveal(path, open_file=False):
         return False
 
 
+def _mnemonics_for(shares, k, known=None):
+    """One mnemonic per share (None where a code can't be decoded).  The
+    threshold is injected because decode_share carries none — without it
+    every mnemonic would encode threshold=0.  ``known`` is the list the
+    core already returned with the codes (package.shares_with_mnemonics);
+    when it lines up with ``shares`` it is used as-is."""
+    if known and len(known) == len(shares) and all(known):
+        return list(known)
+    out = []
+    for s in shares:
+        try:
+            out.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _root_of(widget):
+    """The Tk root above ``widget`` — the owner for timers that must outlive
+    the wizard window (clipboard auto-clear)."""
+    try:
+        top = widget.winfo_toplevel()
+        return getattr(top, "master", None) or top
+    except Exception:
+        return widget
+
+
+def _share_file_names(folder, stem, n):
+    """Paths for one run of individual share files.  Collision handling is
+    per RUN (as the native app does): if any ``<stem>.share-i-of-n.txt``
+    exists (or is a dangling symlink), the whole set moves to
+    ``<stem>_N.share-…`` so one run never mixes two stems and a recipient
+    can match "share-2-of-3" to its set.  Returns ``(paths, renamed)``."""
+    import errno
+    for suffix in range(1, 100):
+        s = stem if suffix == 1 else f"{stem}_{suffix}"
+        names = [os.path.join(folder, f"{s}.share-{i}-of-{n}.txt") for i in range(1, n + 1)]
+        if not any(os.path.lexists(p) for p in names):
+            return names, suffix > 1
+    raise FileExistsError(
+        errno.EEXIST,
+        f"99 sets of share files named {stem}.share-… already exist here — "
+        "choose another folder", folder)
+
+
 class ShareCard(tk.Frame):
     def __init__(self, parent, idx, raw, mnemonic=None, **kw):
         super().__init__(parent, bg=C["surface"],
@@ -124,7 +165,10 @@ class ShareCard(tk.Frame):
         self._clip_lbl = tk.Label(btn_row, text="", font=F["small"],
                                    bg=C["surface"], fg=C["text3"])
         self._clip_lbl.pack(side="left", padx=(SP["s"],0))
-        self._clip_timer = ClipboardTimer(self, self._clip_lbl)
+        # Owned by the ROOT, not the card: a pending after() dies with its
+        # owner, and the wizard is routinely destroyed inside the 60 s
+        # ("Test decryption →", Home) — the clipboard must still clear.
+        self._clip_timer = ClipboardTimer(_root_of(self), self._clip_lbl)
 
     def _current(self):
         return self._mn if (self._use_mn and self._mn) else self._raw
@@ -279,11 +323,14 @@ class EncryptorApp(tk.Toplevel):
             cur = out.get().strip() if out is not None else ""
             names.insert(0, os.path.basename(cur) if cur else "the encrypted file")
         shown = ", ".join(names[:3]) + (f" and {len(names)-3} more" if len(names) > 3 else "")
+        # Parented so it can't open behind the wizard (the unit test drives
+        # this on a bare namespace, hence the guard).
+        opts = {"parent": self} if isinstance(self, tk.Misc) else {}
         if not messagebox.askyesno(
                 "Shares not saved",
                 f"Save the shares first — without them, {shown} can never be "
                 f"opened again.\n\nLeave and discard the shares?",
-                icon="warning", default="no"):
+                icon="warning", default="no", **opts):
             return False
         return True
 
@@ -383,7 +430,10 @@ class EncryptorApp(tk.Toplevel):
             fw = self.focus_get()
             if fw and fw.winfo_toplevel() is not self: return
             cv.yview_scroll(delta, "units")
-        cv.bind_all("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
+        # Bound on THIS toplevel (every descendant carries it in its bindtags),
+        # not bind_all: a root-wide binding outlives the window and the two
+        # wizards would replace each other's handler.
+        self.bind("<MouseWheel>", lambda e: _scroll(int(-e.delta)))
 
         # 1. File/Folder/Batch picker
         section_label(b,"1  SOURCE",padx=P)
@@ -393,7 +443,7 @@ class EncryptorApp(tk.Toplevel):
             self._src_type)
         self._src_toggle.pack(fill="x",padx=P,pady=(0,SP["s"]))
         self._src_type.trace_add("write", self._on_src_type)
-        self._file_card=FileCard(b, self._on_file,
+        self._file_card=FileCard(b, self._on_file, on_folder=self._on_folder,
                                  prompt="Select a file to encrypt",
                                  sub="Click anywhere")
         self._file_card.pack(fill="x",padx=P)
@@ -519,11 +569,9 @@ class EncryptorApp(tk.Toplevel):
 
     @staticmethod
     def _section(parent, text):
-        """section_label() plus a handle on its text Label so the heading
-        can be relabelled later (the helper itself returns nothing)."""
-        section_label(parent, text, padx=EncryptorApp._P)
-        row = parent.winfo_children()[-1]
-        return row.winfo_children()[0]
+        """Section heading; returns its text Label so the heading can be
+        relabelled later (PASSWORD ↔ SHARES)."""
+        return section_label(parent, text, padx=EncryptorApp._P)
 
     # Per-field show/hide toggle with text button
     def _toggle_pw(self, field=0):
@@ -656,13 +704,7 @@ class EncryptorApp(tk.Toplevel):
         except (tk.TclError, ValueError):
             cur = None
         for key, btn in getattr(self, "_preset_btns", {}).items():
-            on = key == cur
-            bg, fg = (C["accent"], C["text"]) if on else (C["surface2"], C["text2"])
-            # FlatButton restores its own _bg on <Leave>, so the rest colour
-            # has to move with the tint or hovering would undo it.
-            btn._bg, btn._fg = bg, fg
-            btn._hov = C["accent_hover"] if on else C["surface3"]
-            btn.config(bg=bg, fg=fg)
+            btn.set_tint(key == cur)
 
     def _secret_ok(self):
         """True when the secret step is complete for the current mode."""
@@ -829,13 +871,13 @@ class EncryptorApp(tk.Toplevel):
             self._file_card.pack(fill="x", padx=self._P, after=self._src_toggle)
             drop = " · or drag & drop" if getattr(self, "_dnd_ok", False) else ""
             if mode == "folder":
-                self._file_card._is_folder_mode = True
+                self._file_card.set_folder_mode(True)
                 if not self._is_folder:
                     self._file_card.reset("Select a folder to encrypt",
                                           "Click anywhere" + (drop + " a folder" if drop else ""))
                     self._path = None; self._is_folder = False
             else:  # file
-                self._file_card._is_folder_mode = False
+                self._file_card.set_folder_mode(False)
                 if self._is_folder:
                     self._file_card.reset("Select a file to encrypt", "Click anywhere" + drop)
                     self._path = None; self._is_folder = False
@@ -922,16 +964,19 @@ class EncryptorApp(tk.Toplevel):
         """Ask before discarding an existing non-trivial selection."""
         if len(self._batch_paths) <= 1:
             return True
-        return messagebox.askyesno(
-            "Replace selection?",
-            f"You have {len(self._batch_paths)} files selected.\n\n"
-            "Replace them with a new selection?",
-            icon="question", default="no")
+        return confirm(self, "Replace selection?",
+                       f"You have {len(self._batch_paths)} files selected. "
+                       "Replace them with a new selection?",
+                       yes="Replace", no="Keep")
 
-    def _set_batch_paths(self, paths):
+    def _set_batch_paths(self, paths, keep_out=False):
+        """Replace the batch selection.  The output folder defaults to the
+        first file's folder; ``keep_out`` keeps a folder the user already
+        chose (Retry N failed must not silently move the outputs)."""
         self._batch_paths = list(paths); self._show_done = False
         if hasattr(self, "_batch_out_var") and paths:
-            self._batch_out_var.set(os.path.dirname(os.path.abspath(paths[0])))
+            if not (keep_out and self._batch_out_var.get().strip()):
+                self._batch_out_var.set(os.path.dirname(os.path.abspath(paths[0])))
         self._set_status("")
 
     def _on_batch_select(self):
@@ -1003,10 +1048,9 @@ class EncryptorApp(tk.Toplevel):
                 count, total = 0, 0
             def _apply():
                 # Ignore a stale scan if the user has already picked elsewhere
-                if self._path == path and self._is_folder and self.winfo_exists():
+                if self._path == path and self._is_folder:
                     self._file_card.load_folder(path, count, total)
-            try: self.after(0, _apply)
-            except Exception: pass
+            safe_after(self, _apply)
         threading.Thread(target=_scan, daemon=True).start()
         self._set_status(""); self._refresh_step()
         self._on_embed_toggle()
@@ -1085,40 +1129,33 @@ class EncryptorApp(tk.Toplevel):
             self.after(50, lambda: self._cv.yview_moveto(1.0))  # Scroll after layout reflow
             return
         out=self._out.get().strip()
-        # Warn if password is rated Weak (zxcvbn score 0 or 1)
+        # Warn if password is rated Weak (zxcvbn score 0 or 1).  The strength
+        # bar already scored this text on a worker thread — reuse it rather
+        # than running zxcvbn again on the main thread.
         if self._mode.get() == "single":
             pw = self._pw1v.get()
-            try:
-                from zxcvbn import zxcvbn as _zx
-                score = _zx(pw)["score"]
-            except ImportError:
-                score = 4  # zxcvbn not available — skip check
-            if score < 2:
-                if not messagebox.askyesno(
-                        "Weak password",
-                        "Your password is rated Weak.\n\n"
-                        "A weak password could be guessed relatively easily. "
-                        "Consider using a longer password with a mix of words, numbers, and symbols.\n\n"
-                        "Continue with this password anyway?",
-                        icon="warning", default="no"):
+            if self._strength.score_for(pw) < 2:
+                if not confirm(self, "Weak password",
+                               "Your password is rated Weak and could be guessed relatively "
+                               "easily. A longer password mixing words, numbers and symbols "
+                               "is safer.\n\nContinue with this password anyway?",
+                               yes="Use it anyway", no="Choose another", danger=True):
                     return
         # K=N means every shareholder must participate — unusual and worth confirming.
         if self._mode.get() == "shamir":
             k, n = self._k.get(), self._n.get()
             if k == n:
-                if not messagebox.askyesno(
-                        "All people required",
-                        f"You've set \"required to unlock\" and \"total people\" both to {n}.\n\n"
-                        f"This means every single person must participate — "
-                        f"if even one person loses their share, the file can never be unlocked.\n\n"
-                        f"If you want some safety margin, set \"required to unlock\" lower than \"total people\".\n\n"
-                        f"Continue with {k}-of-{n}?",
-                        icon="warning", default="no"):
+                if not confirm(self, "All people required",
+                               f"\"Required to unlock\" and \"total people\" are both {n}, so every "
+                               "single person must participate — if even one share is lost, the "
+                               "file can never be unlocked. For a safety margin, set \"required "
+                               f"to unlock\" lower.\n\nContinue with {k}-of-{n}?",
+                               yes=f"Continue with {k}-of-{n}", no="Go back", danger=True):
                     return
         if os.path.exists(out):
-            if not messagebox.askyesno("Overwrite?",
-                    f"{os.path.basename(out)} already exists. Overwrite it?",
-                    icon="warning", default="no"):
+            if not confirm(self, "Overwrite?",
+                           f"{os.path.basename(out)} already exists. Overwrite it?",
+                           yes="Overwrite", no="Cancel", danger=True):
                 return
         self._set_status(""); self._busy=True
         self._cancel_event.clear()
@@ -1181,7 +1218,8 @@ class EncryptorApp(tk.Toplevel):
 
     def _prog_cb(self,msg):
         sem = _find_stage(msg)
-        if sem is not None: self.after(0, self._advance, sem, msg)
+        if sem is not None:
+            safe_after(self, lambda: self._advance(sem, msg))
 
     def _start_batch(self):
         """Encrypt all selected files in sequence with the same settings.
@@ -1202,9 +1240,9 @@ class EncryptorApp(tk.Toplevel):
         if would_overwrite:
             names = ", ".join(would_overwrite[:3])
             if len(would_overwrite) > 3: names += f" … (+{len(would_overwrite)-3} more)"
-            if not messagebox.askyesno("Overwrite?",
-                    f"These files already exist and will be overwritten:\n{names}\n\nContinue?",
-                    icon="warning", default="no"):
+            if not confirm(self, "Overwrite?",
+                           f"These files already exist and will be overwritten:\n{names}",
+                           yes="Overwrite", no="Cancel", danger=True):
                 return
         self._set_status(""); self._busy = True
         self._cancel_event.clear()
@@ -1253,69 +1291,52 @@ class EncryptorApp(tk.Toplevel):
             end = start + stages[idx][2] / tot_w
             m = re.search(r"(\d+)%", msg or "")
             sub = min(int(m.group(1)), 100) / 100.0 if m else 0.0
-            self.after(0, self._advance_batch, i, total, sem, start + sub * (end - start))
+            inner = start + sub * (end - start)
+            safe_after(self, lambda: self._advance_batch(i, total, sem, inner))
         return _cb
 
     def _run_batch(self, bp):
-        """Worker: encrypt each file in bp["paths"] one by one.  Stops at
-        the next chunk boundary after Cancel; files already written stay."""
+        """Worker: encrypt each file in bp["paths"] one by one through
+        core.package.encrypt_to_qcx.  Stops at the next chunk boundary
+        after Cancel; files already written stay."""
         succeeded, failed = [], []
         total = len(bp["paths"])
         cancelled = False
         _cancel_check = self._cancel_event.is_set
+        dec = self._find_dec() if bp["embed"] else None
         for i, (path, out) in enumerate(zip(bp["paths"], bp["outs"]), 1):
             if _cancel_check():
                 cancelled = True
                 break
-            orig = os.path.basename(path)
-            tmp  = out + ".tmp"
             cb = self._batch_prog_cb(i, total)
-            self.after(0, self._advance_batch, i, total, self._batch_inner[0][0], 0.0)
+            first = self._batch_inner[0][0]
+            safe_after(self, lambda i=i, first=first: self._advance_batch(i, total, first, 0.0))
             try:
-                dec = self._find_dec() if bp["embed"] else None
-                with open(tmp, "wb") as f:
-                    if dec:
-                        with open(dec, "rb") as df:
-                            while True:
-                                c = df.read(1 << 20)
-                                if not c: break
-                                f.write(c)
-                    payload_offset = f.tell()
-                    if bp["mode"] == "single":
-                        meta = cc.encrypt_single_streaming(
-                            path, f, bp["pw"], filename=orig,
-                            progress_cb=cb, cancel_check=_cancel_check)
-                        shares = []
-                    else:
-                        meta, shares = cc.encrypt_shamir_streaming(
-                            path, f, bp["n"], bp["k"], filename=orig,
-                            progress_cb=cb, cancel_check=_cancel_check)
-                    meta["payload_offset"] = payload_offset
-                    cb("Writing binary... 100%")
-                    blob = json.dumps({"meta": meta}, separators=(",",":")).encode()
-                    f.write(cc.MAGIC + len(blob).to_bytes(4,"big") + blob)
-                os.replace(tmp, out)
-                try:
-                    m = os.stat(out).st_mode
-                    os.chmod(out, m | stat.S_IXUSR | stat.S_IXGRP)
-                except OSError: pass
-                succeeded.append((out, shares))
+                res = pkg.encrypt_to_qcx(
+                    path, out, mode=bp["mode"], password=bp["pw"],
+                    k=bp["k"], n=bp["n"], progress=cb,
+                    cancel_check=_cancel_check, embed_binary=dec)
+                succeeded.append((out, [sh["code"] for sh in res["shares"]],
+                                  [sh["mnemonic"] for sh in res["shares"]]))
             except cc.CancelledOperation:
-                try: os.remove(tmp)
-                except OSError: pass
                 cancelled = True
                 break
             except Exception as ex:
-                try: os.remove(tmp)
-                except OSError: pass
                 failed.append((path, ex))
-        self.after(0, self._done_batch, succeeded, failed, bp, cancelled)
+        bp["pw"] = None
+        safe_after(self, lambda: self._done_batch(succeeded, failed, bp, cancelled))
 
     def _retry_failed(self, paths):
-        """Re-run the batch with only the files that failed."""
-        self._set_batch_paths(paths)
+        """Re-run the batch with only the files that failed, into the SAME
+        output folder.  The unsaved-shares guard runs before anything is
+        replaced so a "Go back" leaves the summary (and its share cards)
+        exactly as it was."""
+        if not self._check_shares_saved():
+            return
+        self._shares_pending = set()
+        self._set_batch_paths(paths, keep_out=True)
         self._build_batch_ui()
-        self._start()   # goes through the shares guard, then _start_batch
+        self._start()
 
     def _done_batch(self, succeeded, failed, bp, cancelled=False):
         """Show batch completion summary."""
@@ -1359,7 +1380,7 @@ class EncryptorApp(tk.Toplevel):
         tk.Label(ok, text=bp["out_dir"], font=F["caption"],
                  bg=C["surface"], fg=C["text3"], wraplength=380,
                  anchor="w", justify="left").pack(fill="x", padx=SP["l"], pady=(0,SP["xs"]))
-        for out_path, shares in succeeded[:5]:
+        for out_path, shares, _mn in succeeded[:5]:
             row = tk.Frame(ok, bg=C["surface"]); row.pack(fill="x", padx=SP["l"], pady=(0,SP["xs"]))
             tk.Label(row, text=f"  {ICON['ok']}  {os.path.basename(out_path)}", font=F["caption"],
                      bg=C["surface"], fg=C["success"]).pack(side="left")
@@ -1376,9 +1397,8 @@ class EncryptorApp(tk.Toplevel):
                      font=F["caption"], bg=C["surface"], fg=C["error"], anchor="w",
                      justify="left", wraplength=490).pack(fill="x", padx=SP["l"], pady=(0,SP["xs"]))
         # Shamir shares: render a share section per file that had shares generated
-        files_with_shares = [(out_path, shares) for out_path, shares in succeeded if shares]
+        files_with_shares = [(out_path, shares, mn) for out_path, shares, mn in succeeded if shares]
         if files_with_shares:
-            from quantacrypt.core import crypto as _cc
             warn = tk.Frame(self._results, bg=C["surface"],
                             highlightbackground=C["warning"], highlightthickness=1)
             warn.pack(fill="x", pady=(SP["s"],0))
@@ -1392,7 +1412,7 @@ class EncryptorApp(tk.Toplevel):
                           "for each encrypted file before closing.",
                      font=F["caption"], bg=C["surface"], fg=C["text3"],
                      wraplength=490, anchor="w").pack(fill="x", padx=SP["l"], pady=(0,SP["s"]))
-            for out_path, shares in files_with_shares:
+            for out_path, shares, known_mn in files_with_shares:
                 # Per-file collapsible section
                 sec = tk.Frame(self._results, bg=C["surface"],
                                highlightbackground=C["border"], highlightthickness=1)
@@ -1405,16 +1425,11 @@ class EncryptorApp(tk.Toplevel):
                                _s, os.path.splitext(os.path.basename(_p))[0], qcx_path=_p, banner_frame=_sec),
                            primary=True, small=False).pack(side="right")
                 # Share cards (collapsed — just the save button is enough for batch)
-                mnemonics = []
-                for s in shares:
-                    try:
-                        mnemonics.append(_cc.share_to_mnemonic({**_cc.decode_share(s), "threshold": k}))
-                    except Exception:
-                        mnemonics.append(None)
+                mnemonics = _mnemonics_for(shares, k, known_mn)
                 for i, sh in enumerate(shares, 1):
                     mn = mnemonics[i-1] if i-1 < len(mnemonics) else None
                     ShareCard(sec, i, sh, mnemonic=mn).pack(fill="x", padx=SP["s"], pady=(0,SP["s"]))
-            self._shares_pending = {op for op, _sh in files_with_shares}
+            self._shares_pending = {op for op, _sh, _mn in files_with_shares}
         btn_row = tk.Frame(ok, bg=C["surface"]); btn_row.pack(fill="x", padx=SP["l"], pady=(SP["s"],SP["m"]))
         first = None
         if failed:
@@ -1431,7 +1446,8 @@ class EncryptorApp(tk.Toplevel):
                        lambda: self._reveal_ui(succeeded[0][0]),
                        primary=False, small=True).pack(side="left", padx=(SP["s"],0))
         self.after(50, lambda: self._cv.yview_moveto(1.0))
-        self.after(50, (first or again).focus_set)
+        _fb = first or again
+        self.after(50, lambda: _fb.focus_set() if _fb.winfo_exists() else None)
 
     def _reveal_ui(self, path, open_file=False):
         """_reveal + a status line when the OS handler couldn't be launched."""
@@ -1440,95 +1456,32 @@ class EncryptorApp(tk.Toplevel):
             self._set_status(f"Couldn't {what} — the file is at {path}")
 
     def _run(self, p):
-        """Worker thread — streaming: O(64 KB) RAM regardless of file size.
-        For folder inputs, zips the folder to a temp file first, then encrypts
-        the zip.  The temp zip is always deleted before returning."""
-        out = p["out"]; tmp = out + ".tmp"
-        zip_tmp = None   # path to temporary zip (folder mode only)
+        """Worker thread.  core.package.encrypt_to_qcx does the work —
+        folder staging (0600 zip beside the output), the optional embedded
+        decryptor, streaming AES-GCM, the MAGIC tail and the atomic
+        rename — so the Tk wizard and qc-core write byte-identical files."""
+        out = p["out"]
         try:
             dec = self._find_dec() if p["embed"] else None
-
-            # ── Folder: compress to a temporary zip first ─────────────────────
             if p["is_folder"]:
-                folder_name = os.path.basename(os.path.abspath(p["path"]))
-                orig        = folder_name + ".zip"
-                self.after(0, self._advance, STAGE_COMPRESS, None)
-                # Stage the plaintext zip next to the OUTPUT file, not in
-                # $TMPDIR: the system temp dir may sit on a different,
-                # unencrypted volume, and a crash mid-encryption would
-                # strand the full plaintext archive there invisibly.  In
-                # the output directory a leftover is at least on the
-                # volume the user chose for the ciphertext, visible next
-                # to the expected result.  mkstemp gives it 0600.
-                fd, zip_tmp = tempfile.mkstemp(
-                    prefix=f".{os.path.basename(out)}.qc-staging-",
-                    suffix=".zip",
-                    dir=os.path.dirname(os.path.abspath(out)) or None)
-                os.close(fd)
-                _zip_folder(p["path"], zip_tmp,
-                            progress_cb=lambda msg: self.after(
-                                0, self._advance, STAGE_COMPRESS, msg),
-                            cancel_check=self._cancel_event.is_set)
-                src_path = zip_tmp
-            else:
-                orig     = os.path.basename(p["path"])
-                src_path = p["path"]
-
-            with open(tmp, "wb") as f:
-                # Write embedded decryptor binary first (if requested)
-                if dec:
-                    with open(dec, "rb") as df:
-                        while True:
-                            chunk = df.read(1 << 20)
-                            if not chunk: break
-                            f.write(chunk)
-
-                # Record where the chunk payload starts (for decryptor seeking)
-                payload_offset = f.tell()
-
-                # Stream-encrypt the source (file or zip) into the output file
-                _cancel_check = self._cancel_event.is_set
-                if p["mode"] == "single":
-                    meta = cc.encrypt_single_streaming(
-                        src_path, f, p["pw"], filename=orig,
-                        progress_cb=self._prog_cb, cancel_check=_cancel_check)
-                    shares = []
-                else:
-                    meta, shares = cc.encrypt_shamir_streaming(
-                        src_path, f, p["n"], p["k"], filename=orig,
-                        progress_cb=self._prog_cb, cancel_check=_cancel_check)
-
-                # Store payload_offset so decryptor can seek directly to chunks
-                meta["payload_offset"] = payload_offset
-
-                self.after(0, self._advance, STAGE_WRITE, None)
-                # Write metadata tail: MAGIC + uint32 length + JSON
-                pkg  = {"meta": meta}
-                blob = json.dumps(pkg, separators=(",", ":")).encode()
-                f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
-
-            os.replace(tmp, out)   # atomic replace
-            try:
-                m = os.stat(out).st_mode; os.chmod(out, m | stat.S_IXUSR | stat.S_IXGRP)
-            except OSError: pass
+                safe_after(self, lambda: self._advance(STAGE_COMPRESS, None))
+            res = pkg.encrypt_to_qcx(
+                p["path"], out, mode=p["mode"], password=p["pw"],
+                k=p["k"], n=p["n"], progress=self._prog_cb,
+                cancel_check=self._cancel_event.is_set, embed_binary=dec)
+            shares = [sh["code"] for sh in res["shares"]]
+            mnemonics = [sh["mnemonic"] for sh in res["shares"]]
             try:
                 dec_size = os.path.getsize(dec) if dec else 0
             except OSError:
                 dec_size = 0
-            self.after(0, self._done, out, shares, bool(dec), dec_size)
+            safe_after(self, lambda: self._done(out, shares, bool(dec), dec_size,
+                                                mnemonics=mnemonics))
         except cc.CancelledOperation:
-            try: os.remove(tmp)
-            except OSError: pass
-            self.after(0, self._cancelled)
+            safe_after(self, self._cancelled)
         except Exception as ex:
-            try: os.remove(tmp)
-            except OSError: pass
-            self.after(0, self._fail, ex)
+            safe_after(self, lambda exc=ex: self._fail(exc))
         finally:
-            # Always remove the temporary zip regardless of success or failure
-            if zip_tmp:
-                try: os.remove(zip_tmp)
-                except OSError: pass
             # Clear password from worker params to reduce memory exposure
             p["pw"] = None
 
@@ -1546,7 +1499,7 @@ class EncryptorApp(tk.Toplevel):
                 if os.path.isfile(p): return p
         return None
 
-    def _done(self,out,shares,embedded=True,dec_size=0):
+    def _done(self,out,shares,embedded=True,dec_size=0,mnemonics=None):
         self._busy=False; self._prog.complete(); self._cancel_row.pack_forget(); self._thaw()
         # set_step past the last step index → all circles show ✓ (complete state)
         self._wiz.set_step(len(self.STEPS)); self._show_done = True
@@ -1602,7 +1555,7 @@ class EncryptorApp(tk.Toplevel):
         FlatButton(btn_row,"Open file",lambda:self._reveal_ui(out,open_file=True),primary=False,small=True).pack(side="left",padx=(SP["s"],0))
         if not shares:
             self.after(50, lambda: self._cv.yview_moveto(1.0))
-            self.after(50, again_btn.focus_set)
+            self.after(50, lambda: again_btn.focus_set() if again_btn.winfo_exists() else None)
             return
         self._shares_pending = {"__single__"}   # guard: warn if user navigates away
         self._pending_shares = shares  # keep ref for save dialog
@@ -1640,20 +1593,10 @@ class EncryptorApp(tk.Toplevel):
         self._copy_all_clip_lbl = tk.Label(timer_row, text="", font=F["small"],
                                             bg=C["surface"], fg=C["text3"])
         self._copy_all_clip_lbl.pack(side="left")
-        self._copy_all_timer = ClipboardTimer(self, self._copy_all_clip_lbl)
-        self.after(50, save_btn.focus_set)
-        try:
-            # Inject threshold so the mnemonic's embedded threshold byte is correct.
-            # decode_share returns {index, value, modulus} — no threshold field.
-            # Without this injection, every mnemonic encodes threshold=0 and the
-            # self-check in decryptor._collect_shares is always bypassed.
-            mnemonics = []
-            for s in shares:
-                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
-        except Exception:
-            # Pad to full length so indexing below never fails
-            while len(mnemonics) < len(shares):
-                mnemonics.append(None)
+        # Root-owned (see ShareCard): the clear must survive this window closing.
+        self._copy_all_timer = ClipboardTimer(_root_of(self), self._copy_all_clip_lbl)
+        self.after(50, lambda: save_btn.focus_set() if save_btn.winfo_exists() else None)
+        mnemonics = _mnemonics_for(shares, k, mnemonics)
         for i,sh in enumerate(shares,1):
             mn=mnemonics[i-1] if i-1<len(mnemonics) else None
             ShareCard(self._results,i,sh,mnemonic=mn).pack(fill="x",pady=(0,SP["s"]))
@@ -1846,50 +1789,53 @@ class EncryptorApp(tk.Toplevel):
                 with open(qcx_path, "rb") as fh:
                     fingerprint = hashlib.sha256(fh.read(65536)).hexdigest()[:12]
             except Exception: pass
-        mnemonics = []
-        for s in shares:
-            try:
-                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
-            except Exception:
-                mnemonics.append(None)
-        saved = []
+        mnemonics = _mnemonics_for(shares, k)
+        saved, renamed = [], []
         try:
+            # Collision handling is per run: every file of this set gets the
+            # same stem (<stem>_2.share-i-of-n.txt), never a mix of two.
+            fnames, run_renamed = _share_file_names(folder, stem, n)
             for i, s in enumerate(shares, 1):
-                fname = os.path.join(folder, f"{stem}.share-{i}-of-{n}.txt")
+                fname = fnames[i-1]
                 mn = mnemonics[i-1] if i-1 < len(mnemonics) else None
                 fp_line = (f"File fingerprint:  {fingerprint}...\n") if fingerprint else ""
-                with open(fname, "w") as f:
-                    f.write(
-                        f"QuantaCrypt Share {i} of {n}\n"
-                        f"{'='*60}\n"
-                        f"Encrypted file:    {qcx_name}\n"
-                        f"{fp_line}"
-                        f"Threshold:         Any {k} of {n} shares are needed to decrypt\n"
-                        f"{'='*60}\n\n"
-                        f"This file contains one of the {n} keys to {qcx_name or 'the encrypted file'}. "
-                        f"Either format below works — use whichever is easier.\n\n"
-                        f"KEEP THIS FILE PRIVATE. Do not share it with other shareholders.\n\n"
-                        f"── QCSHARE- code (for copy-paste) ──────────────────────\n"
-                        f"{s}\n\n"
+                text = (
+                    f"QuantaCrypt Share {i} of {n}\n"
+                    f"{'='*60}\n"
+                    f"Encrypted file:    {qcx_name}\n"
+                    f"{fp_line}"
+                    f"Threshold:         Any {k} of {n} shares are needed to decrypt\n"
+                    f"{'='*60}\n\n"
+                    f"This file contains one of the {n} keys to {qcx_name or 'the encrypted file'}. "
+                    f"Either format below works — use whichever is easier.\n\n"
+                    f"KEEP THIS FILE PRIVATE. Do not share it with other shareholders.\n\n"
+                    f"── QCSHARE- code (for copy-paste) ──────────────────────\n"
+                    f"{s}\n\n"
+                )
+                if mn:
+                    text += (
+                        f"── 50-word mnemonic (for offline backup) ───────────────\n"
+                        f"{mn}\n\n"
                     )
-                    if mn:
-                        f.write(
-                            f"── 50-word mnemonic (for offline backup) ───────────────\n"
-                            f"{mn}\n\n"
-                        )
-                    f.write(
-                        f"── How to decrypt ───────────────────────────────────────\n"
-                        f"1. Collect {k} share files from {k} of the {n} shareholders.\n"
-                        f"2. Open quantacrypt and load the encrypted file.\n"
-                        f"3. Paste each QCSHARE- code (or type the 50 words) into the\n"
-                        f"   corresponding share slot.\n"
-                        f"4. Click Decrypt.\n"
-                    )
-                saved.append(fname)
+                text += (
+                    f"── How to decrypt ───────────────────────────────────────\n"
+                    f"1. Collect {k} share files from {k} of the {n} shareholders.\n"
+                    f"2. Open quantacrypt and load the encrypted file.\n"
+                    f"3. Paste each QCSHARE- code (or type the 50 words) into the\n"
+                    f"   corresponding share slot.\n"
+                    f"4. Click Decrypt.\n"
+                )
+                # 0600 + O_EXCL: an earlier run's share files with the same
+                # stem are the only copies of ITS key — never replace them.
+                written, was_renamed = write_new_private_file(fname, text)
+                saved.append(written)
+                if was_renamed:
+                    renamed.append(os.path.basename(written))
         except OSError as e:
+            opts = {"parent": self} if isinstance(self, tk.Misc) else {}
             messagebox.showerror("Save failed",
                 f"Could not write share file:\n{e}\n\n"
-                f"Saved {len(saved)} of {n} files before the error.")
+                f"Saved {len(saved)} of {n} files before the error.", **opts)
             # Partial save: some recipients' files are missing, so this
             # file's shares stay pending (the leave-guard dialog still
             # offers "Leave anyway?" as the escape hatch).
@@ -1905,10 +1851,14 @@ class EncryptorApp(tk.Toplevel):
         # Update the warning banner to show success.
         # banner_frame may be self._shares_warn (single-file) or a per-file sec frame (batch).
         target = banner_frame if banner_frame is not None else getattr(self, "_shares_warn", None)
+        note = ("Each recipient gets their own file. Distribute one file per person.\n"
+                "Recommended: test decryption before distributing.")
+        if run_renamed or renamed:
+            shown = [os.path.basename(p) for p in saved] if run_renamed else renamed
+            note += ("\nShare files with that name already existed there, so these were saved as "
+                     + ", ".join(shown) + " — the earlier files were left untouched.")
         EncryptorApp._show_saved_banner(
-            self, target, f"{n} share files saved", os.path.basename(folder),
-            "Each recipient gets their own file. Distribute one file per person.\n"
-            "Recommended: test decryption before distributing.",
+            self, target, f"{n} share files saved", os.path.basename(folder), note,
             saved[0] if saved else folder)
 
     def _show_saved_banner(self, target, title, where, note, reveal):
@@ -1941,12 +1891,7 @@ class EncryptorApp(tk.Toplevel):
         if not p: return
         k = self._result_k or self._k.get()
         n = self._result_n or self._n.get()
-        mnemonics = []
-        for s in shares:
-            try:
-                mnemonics.append(cc.share_to_mnemonic({**cc.decode_share(s), "threshold": k}))
-            except Exception:
-                mnemonics.append(None)
+        mnemonics = _mnemonics_for(shares, k)
         # Compute a short fingerprint of the .qcx file to help match shares to file later
         qcx_ref = ""
         qcx_path = self._out.get().strip()
@@ -1961,18 +1906,21 @@ class EncryptorApp(tk.Toplevel):
         # Wrap the file write in try/except so a full disk or
         # permission error doesn't leave _shares_pending=True forever, trapping
         # the user in an unsaved-shares dialog they can never clear.
+        text = f"QuantaCrypt Key Shares\nThreshold: {k} of {n}{qcx_ref}\n{'='*60}\n\n"
+        for i,s in enumerate(shares,1):
+            text += f"Share {i} — QCSHARE- code:\n{s}\n\n"
+            mn=mnemonics[i-1]
+            if mn: text += f"Share {i} — 50-word mnemonic:\n{mn}\n\n"
+            text += "-"*60+"\n\n"
         try:
-            with open(p,"w") as f:
-                f.write(f"QuantaCrypt Key Shares\nThreshold: {k} of {n}{qcx_ref}\n{'='*60}\n\n")
-                for i,s in enumerate(shares,1):
-                    f.write(f"Share {i} — QCSHARE- code:\n{s}\n\n")
-                    mn=mnemonics[i-1]
-                    if mn: f.write(f"Share {i} — 50-word mnemonic:\n{mn}\n\n")
-                    f.write("-"*60+"\n\n")
+            # 0600 + O_EXCL — an existing file with that name is somebody's
+            # only key material, so this goes to <stem>_2 instead.
+            p, renamed = write_new_private_file(p, text)
         except OSError as _e:
             messagebox.showerror("Save failed",
                 f"Could not write shares file:\n{_e}\n\n"
-                "Your shares have NOT been saved. Please try a different location.")
+                "Your shares have NOT been saved. Please try a different location.",
+                parent=self)
             return
         self._shares_pending.discard("__single__")   # shares are now saved
         try:
@@ -1980,9 +1928,12 @@ class EncryptorApp(tk.Toplevel):
                 if isinstance(w, ShareCard):
                     w.mark_saved()
         except Exception: pass
+        note = "Recommended: test decryption with one share set before distributing."
+        if renamed:
+            note += (f"\nA file with that name already existed, so this one was saved as "
+                     f"{os.path.basename(p)} — the earlier file was left untouched.")
         self._show_saved_banner(
-            getattr(self, "_shares_warn", None), "Shares saved", os.path.basename(p),
-            "Recommended: test decryption with one share set before distributing.", p)
+            getattr(self, "_shares_warn", None), "Shares saved", os.path.basename(p), note, p)
 
 def main(): EncryptorApp().mainloop()
 if __name__=="__main__": main()

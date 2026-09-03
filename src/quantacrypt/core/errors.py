@@ -10,6 +10,23 @@ from __future__ import annotations
 import errno as _errno
 
 
+class InvalidRequest(ValueError):
+    """The CLIENT sent a malformed request (missing/ill-typed parameter).
+    Maps to ``invalid_request``; a UI should treat that as its own bug."""
+
+
+class InvalidInput(ValueError):
+    """The USER supplied something unusable — a share that does not parse,
+    too few shares, a missing password, an output inside its own source.
+    Maps to ``invalid_input``; the message is written for the user."""
+
+
+class CorruptPayload(ValueError):
+    """The credentials were proven (envelope decrypted, HMAC verified) but the
+    payload failed authentication: bit-rot, truncation or tampering.  Must
+    never be reported as a wrong password."""
+
+
 def friendly_error(exc: BaseException) -> str:
     """Translate a raw exception into a user-facing, actionable message.
 
@@ -17,8 +34,16 @@ def friendly_error(exc: BaseException) -> str:
     falls back to ``str(exc)`` (or the type name when the message is empty —
     cryptography's ``InvalidTag`` stringifies to "").
     """
+    if isinstance(exc, (InvalidRequest, InvalidInput, CorruptPayload)):
+        return str(exc)
     if isinstance(exc, FileNotFoundError):
         return "File not found — it may have been moved or deleted."
+    if isinstance(exc, FileExistsError):
+        name = exc.filename or str(exc)
+        return f"{name} already exists — choose a different name."
+    if isinstance(exc, KeyError):
+        return (f"The file is missing the field {exc.args[0]!r} — it may be corrupt "
+                "or from an unsupported version.")
     if isinstance(exc, PermissionError):
         return ("Access denied — check you have permission to read / write "
                 "this file, and that it isn't open in another app.")
@@ -57,8 +82,9 @@ def friendly_error(exc: BaseException) -> str:
 def classify_error(exc: BaseException) -> tuple[str, str, str]:
     """Return ``(code, message, detail)`` for an exception.
 
-    Codes: wrong_credentials, cancelled, not_found, permission_denied, io,
-    format, unsupported, busy, internal.
+    Codes: wrong_credentials, cancelled, invalid_request, invalid_input,
+    not_found, already_exists, permission_denied, io, format, unsupported,
+    busy, internal.
     """
     from quantacrypt.core.crypto import CancelledOperation
 
@@ -66,21 +92,36 @@ def classify_error(exc: BaseException) -> tuple[str, str, str]:
     message = friendly_error(exc)
     if isinstance(exc, CancelledOperation):
         return "cancelled", "Cancelled — nothing was written.", detail
+    if isinstance(exc, InvalidRequest):
+        return "invalid_request", message, detail
+    if isinstance(exc, InvalidInput):
+        return "invalid_input", message, detail
+    if isinstance(exc, CorruptPayload):
+        return "format", message, detail
     if isinstance(exc, FileNotFoundError):
         return "not_found", message, detail
+    if isinstance(exc, FileExistsError):
+        return "already_exists", message, detail
     if isinstance(exc, PermissionError):
         return "permission_denied", message, detail
     if isinstance(exc, OSError):
         return "io", message, detail
+    if isinstance(exc, KeyError):
+        return "format", message, detail
     lower = (str(exc) or type(exc).__name__).lower()
     if "invalidtag" in lower or "authentication" in lower or "incorrect" in lower:
         return "wrong_credentials", message, detail
-    if "already mounted" in lower or "in use" in lower or "busy" in lower:
+    if ("already mounted" in lower or "in use" in lower or "busy" in lower
+            or "another process" in lower):
         return "busy", message, detail
     if "version" in lower and ("newer" in lower or "older" in lower or "unsupported" in lower):
         return "unsupported", message, detail
     if isinstance(exc, ValueError):
         return "format", message, detail
-    if isinstance(exc, (NotImplementedError, RuntimeError)) and "fuse" in lower:
+    if isinstance(exc, (NotImplementedError, RuntimeError)) and (
+            "fusepy" in lower or "backend" in lower or "not available" in lower
+            or "not installed" in lower):
         return "unsupported", message, detail
+    if isinstance(exc, RuntimeError) and "mount" in lower:
+        return "io", message, detail
     return "internal", message, detail

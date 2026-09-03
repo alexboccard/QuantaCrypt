@@ -39,7 +39,7 @@ and shows a banner when a newer version is available.
 ## Local build (without CI)
 
 ```bash
-pip install ".[dev]"
+pip install --require-hashes -r requirements-lock.txt && pip install --no-deps -e .
 
 # Build for current machine's architecture
 python scripts/build.py
@@ -54,6 +54,22 @@ python scripts/build.py --arch arm64 --skip-tests
 
 Output lands in `dist/quantacrypt.app` and `dist/quantacrypt-{arch}.dmg`.
 
+### Native app in one command
+
+```bash
+python scripts/build.py --native --skip-tests      # → dist/QuantaCrypt.app + dist/QuantaCrypt-native-<arch>.dmg
+python scripts/build.py --native --skip-tests --no-dmg
+```
+
+`--native` builds the `qc-core` helper bundle, renders the app and document
+icons from `src/quantacrypt/assets/` into `macos/QuantaCrypt/Resources/`,
+runs `xcodegen generate` and a Release `xcodebuild`, verifies that the helper
+is inside the bundle and that the signature checks, copies the app to
+`dist/`, and wraps it in the same drag-to-Applications DMG as the Tk app.
+Set `CODESIGN_IDENTITY` for a Developer ID build (ad-hoc otherwise). The
+result is a single `.app`: the SwiftUI interface plus the Python core at
+`Contents/Helpers/qc-core.app`.
+
 ### Core helper for the native shell
 
 The SwiftUI app in `macos/` does not embed Python; it launches `qc-core`, a
@@ -66,7 +82,7 @@ python scripts/build.py --helper --skip-tests            # → dist/qc-core.app 
 ```
 
 The build runs a smoke request against the binary and fails if it does not
-answer. The Xcode project copies `dist/qc-core.app` into
+answer. `--native` runs this for you. The Xcode project copies `dist/qc-core.app` into
 `QuantaCrypt.app/Contents/Helpers/` (see `macos/project.yml`); build the
 helper first, then the app:
 
@@ -83,6 +99,21 @@ Follow [Semantic Versioning](https://semver.org):
 - **Patch** (1.0.1) — bug fixes only
 
 The `.qcx` file format has its own `FORMAT_VERSION` (currently 1) in `crypto.py`, which is independent of the app version and only changes when the binary format itself changes.
+
+## Dependency lock
+
+`uv.lock` is the source of truth; `requirements-lock.txt` is its hash-pinned
+export with every extra, used by CI, the release workflow and local builds
+(`pip install --require-hashes`). After changing `pyproject.toml`:
+
+```bash
+uv lock
+uv export --frozen --no-emit-project --all-extras --format requirements.txt -o requirements-lock.txt
+```
+
+CI also runs `pip-audit` against the lock. The python.org installer used for
+the x86_64 release build is verified against `PYTHON_PKG_SHA256` in
+`release.yml`; update both together.
 
 ## Future improvements
 

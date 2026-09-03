@@ -11,18 +11,22 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Callable
 
+from quantacrypt.core import crypto as cc
+from quantacrypt.core import package as pkg
 from quantacrypt.core import volume as vol
+from quantacrypt.core.crypto import CancelledOperation
 from quantacrypt.ui.shared import (
     C, F, SP, ICON, REVEAL_LABEL,
     styled_entry, bind_context_menu, bind_shortcut, fmt_size, rule,
     section_label, card, friendly_error, confirm, alert, reveal_path,
+    safe_after, write_new_private_file,
     FlatButton, SegmentedControl, StagedProgressBar,
     PasswordStrengthBar, ClipboardTimer, RecentVolumes,
     notify,
@@ -89,6 +93,47 @@ def _find_stage(msg: str, stages: list | None = None):
     return None, None
 
 
+_MAX_SHARE_FILE = 1 << 20   # share .txt files are a few KB; refuse anything huge
+
+
+def _parse_share_text(text: str) -> list[str]:
+    """Free text from the mount panel → one entry per share, ready for
+    pkg.normalize_shares.
+
+    The tolerant parse is core's ``extract_share_codes`` (shared with the
+    decryptor and qc-core): QCSHARE- lines are taken as-is and 50-word
+    phrases are gathered only from lines made of BIP-39 words, so headers
+    and prose — this screen's own "Save all shares…" file, the encryptor's
+    ``.share-N-of-M.txt`` — paste cleanly instead of being swallowed into a
+    bogus "mnemonic".  A QCSHARE- line that does not decode is kept verbatim
+    (in place) so normalize_shares can name the typo rather than silently
+    dropping it."""
+    entries: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.upper().startswith("QCSHARE-"):
+            try:
+                entries.append(cc.encode_share(cc.decode_share(line)))
+            except Exception:
+                entries.append(line)
+    for code in pkg.extract_share_codes(text):
+        if code not in entries:
+            entries.append(code)   # from a 50-word phrase
+    return entries
+
+
+def _blames_mount_point(exc: PermissionError, mount_point: str) -> bool:
+    """True when the PermissionError is about the mount point (or a parent
+    of it) rather than, say, an unreadable .qcv file.  Unknown → True so
+    the mount-point advice stays the default for os.makedirs failures."""
+    fn = getattr(exc, "filename", None)
+    if not fn:
+        return True
+    fn_abs = os.path.abspath(str(fn))
+    mp_abs = os.path.abspath(mount_point)
+    return fn_abs == mp_abs or mp_abs.startswith(fn_abs.rstrip(os.sep) + os.sep)
+
+
 # ── Volume Manager Window ────────────────────────────────────────────────────
 
 class VolumeManagerApp(tk.Toplevel):
@@ -123,6 +168,9 @@ class VolumeManagerApp(tk.Toplevel):
         self._status_job = None
         self._tickers: dict[str, dict] = {}
         self._empty_note = ""
+        # Split-key shares of the volume just created — held here (not in a
+        # dialog local) until the user has saved them and dismissed the dialog.
+        self._pending_shares: list[str] | None = None
 
         self._build()
         self._center()
@@ -164,10 +212,38 @@ class VolumeManagerApp(tk.Toplevel):
             if not ok:
                 return
             self._cancel_event.set()
+        elif self._pending_shares:
+            # The shares dialog is up (or was reached around) — these are
+            # the only way the new volume will ever open.
+            if not confirm(self, "Shares not saved",
+                           "The recovery shares of the volume you just created "
+                           "haven't been saved. Closing this window throws them "
+                           "away and the volume can never be opened.",
+                           yes="Discard shares", no="Go back", danger=True):
+                return
+        elif self._has_typed_input():
+            if not confirm(self, "Discard what you typed?",
+                           "Your password or shares haven't been used yet. "
+                           "Closing this window throws them away.",
+                           yes="Discard", no="Keep editing", danger=True):
+                return
         self._cancel_jobs()
         self.destroy()
         if self._on_close:
             self._on_close()
+
+    def _has_typed_input(self) -> bool:
+        """A password or shares typed on either panel and not yet used."""
+        for var in ("_pw_var", "_pw2_var", "_mount_pw_var"):
+            try:
+                if getattr(self, var).get():
+                    return True
+            except Exception:
+                pass
+        try:
+            return bool(self._mount_shares_text.get("1.0", "end").strip())
+        except Exception:
+            return False
 
     def _cancel_jobs(self):
         for job in (self._refresh_job, self._status_job):
@@ -182,13 +258,7 @@ class VolumeManagerApp(tk.Toplevel):
 
     def _after(self, fn, delay: int = 0):
         """``after()`` that tolerates a window the worker has outlived."""
-        def _safe():
-            if self.winfo_exists():
-                fn()
-        try:
-            self.after(delay, _safe)
-        except (tk.TclError, RuntimeError):
-            pass  # window destroyed / interpreter shutting down
+        safe_after(self, fn, delay)
 
     def _center(self):
         self.update_idletasks()
@@ -347,7 +417,8 @@ class VolumeManagerApp(tk.Toplevel):
             pw_row, "Show", lambda: self._toggle_show(self._pw_entry, self._pw_show),
             primary=False, small=True)
         self._pw_show.pack(side="left", padx=(SP["s"], 0))
-        PasswordStrengthBar(self._pw_frame, self._pw_var).pack(fill="x", pady=(SP["xs"], 0))
+        self._pw_strength = PasswordStrengthBar(self._pw_frame, self._pw_var)
+        self._pw_strength.pack(fill="x", pady=(SP["xs"], 0))
 
         tk.Label(self._pw_frame, text="Confirm password", font=F["body_b"],
                  bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(SP["s"], 0))
@@ -456,11 +527,9 @@ class VolumeManagerApp(tk.Toplevel):
             if pw != pw2:
                 self._fail_create("The two passwords don't match.", self._pw2_entry)
                 return
-            try:
-                from zxcvbn import zxcvbn as _zx
-                score = _zx(pw)["score"]
-            except ImportError:
-                score = 4  # estimator missing — skip the check
+            # Scored on the strength bar's worker thread as the user typed —
+            # reuse that instead of freezing the window on Create.
+            score = self._pw_strength.score_for(pw)
             if score < 2 and not confirm(
                     self, "Weak password",
                     "This password is rated Weak and could be guessed. A longer "
@@ -493,12 +562,10 @@ class VolumeManagerApp(tk.Toplevel):
             real = os.path.realpath(path)
             for mp, info in get_mounted_volumes().items():
                 if os.path.realpath(info.get("volume_path", "")) == real:
-                    messagebox.showerror(
-                        "Volume is mounted",
-                        f"That volume is currently mounted at {mp}.\n\n"
-                        "Creating over a mounted volume would destroy it. "
-                        "Unmount it first.",
-                        parent=self)
+                    alert(self, "Volume is mounted",
+                          f"That volume is currently mounted at {mp}.\n\n"
+                          "Creating over a mounted volume would destroy it. "
+                          "Unmount it first.")
                     return
         except Exception:
             pass  # fuse_ops unavailable → nothing can be mounted
@@ -513,23 +580,19 @@ class VolumeManagerApp(tk.Toplevel):
                 probe_fd = _acquire_volume_lock(path)
                 os.close(probe_fd)
             except RuntimeError:
-                messagebox.showerror(
-                    "Volume is mounted",
-                    "That volume appears to be mounted by another "
-                    "QuantaCrypt process.\n\n"
-                    "Creating over a mounted volume would destroy it. "
-                    "Unmount it there first.",
-                    parent=self)
+                alert(self, "Volume is mounted",
+                      "That volume appears to be mounted by another "
+                      "QuantaCrypt process.\n\n"
+                      "Creating over a mounted volume would destroy it. "
+                      "Unmount it there first.")
                 return
             except Exception:
                 pass  # probe unavailable → fall through to the prompt
-            if not messagebox.askyesno(
-                    "Overwrite volume?",
-                    f"{os.path.basename(path)} already exists.\n\n"
-                    "Creating a new volume here will PERMANENTLY destroy "
-                    "the existing one — its contents cannot be recovered.\n\n"
-                    "Overwrite it?",
-                    icon="warning", default="no", parent=self):
+            if not confirm(self, "Overwrite volume?",
+                           f"{os.path.basename(path)} already exists. Creating a new "
+                           "volume here will PERMANENTLY destroy the existing one — "
+                           "its contents cannot be recovered.\n\nOverwrite it?",
+                           yes="Overwrite", no="Cancel", danger=True):
                 return
 
         # Freeze the form, show the progress row
@@ -559,13 +622,22 @@ class VolumeManagerApp(tk.Toplevel):
                 pass
 
         def _worker():
+            # cancel_check lets the core stop BEFORE the file is opened: a
+            # cancel during the KDF (the long part) leaves a pre-existing
+            # volume the user agreed to overwrite untouched.
+            cancel_check = self._cancel_event.is_set
             try:
                 if auth == "password":
-                    meta = vol.create_volume_single(path, pw, progress_cb=_progress)
+                    meta = vol.create_volume_single(
+                        path, pw, progress_cb=_progress, cancel_check=cancel_check)
                     shares = None
                 else:
                     meta, shares = vol.create_volume_shamir(
-                        path, n, k, progress_cb=_progress)
+                        path, n, k, progress_cb=_progress, cancel_check=cancel_check)
+            except CancelledOperation:
+                _discard_partial()
+                self._after(self._on_create_cancelled)
+                return
             except Exception as e:
                 if self._cancel_event.is_set():
                     _discard_partial()
@@ -587,8 +659,9 @@ class VolumeManagerApp(tk.Toplevel):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _request_cancel(self):
-        """The core has no cancel hook, so 'Cancel' means: let the current
-        step finish, then delete whatever was written."""
+        """Flag the worker: the core checks ``cancel_check`` between stages
+        and raises CancelledOperation, then whatever THIS run wrote is
+        deleted (a not-yet-truncated existing volume survives)."""
         if not self._busy or self._busy_what != "create":
             return
         self._cancel_event.set()
@@ -621,6 +694,8 @@ class VolumeManagerApp(tk.Toplevel):
 
         if shares:
             self._show_shares_dialog(shares, meta)
+            if not self.winfo_exists():
+                return   # the manager was closed while the dialog was up
 
         # Q31: offer to mount it right here instead of pointing at a "tab"
         self._err.config(text=f"{ICON['ok']} Created {name}", fg=C["success"])
@@ -643,8 +718,11 @@ class VolumeManagerApp(tk.Toplevel):
 
     def _show_shares_dialog(self, shares: list[str], meta: dict):
         """Modal 'save your shares' screen (M21): per-share Copy with the
-        clipboard countdown, Save all shares… to a 0600 file, Escape/close
-        behave like the primary button."""
+        clipboard countdown, Save all shares… to a fresh 0600 file.  The
+        shares stay on ``self`` until the dialog is dismissed, and leaving
+        without a save — Escape, the close box or the primary button —
+        asks first: they are the only way to ever open the volume."""
+        self._pending_shares = list(shares)
         win = tk.Toplevel(self)
         win.title("Recovery Shares")
         win.configure(bg=C["bg"])
@@ -655,6 +733,8 @@ class VolumeManagerApp(tk.Toplevel):
         P = SP["xl"]
         k = meta.get("threshold", 2)
         n = meta.get("total", len(shares))
+        vol_name = os.path.basename(self._loc_var.get().strip()) or "the volume"
+        state = {"saved": False, "copied": False}
 
         tk.Label(win, text="Save Your Recovery Shares", font=F["heading"],
                  bg=C["bg"], fg=C["text"]).pack(padx=P, pady=(SP["xl"], SP["xs"]))
@@ -678,6 +758,7 @@ class VolumeManagerApp(tk.Toplevel):
             except tk.TclError:
                 btn.set_text(f"{ICON['err']} Failed")
                 return
+            state["copied"] = True
             btn.set_text(f"{ICON['ok']} Copied")
             win.after(1500, lambda: btn.set_text("Copy") if btn.winfo_exists() else None)
             timer.start()
@@ -721,17 +802,37 @@ class VolumeManagerApp(tk.Toplevel):
             for i, share in enumerate(shares):
                 lines += [f"Share {i + 1} of {n}:", share, ""]
             try:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
-                os.chmod(p, 0o600)
+                # 0600 + O_EXCL: an existing file with that name is someone's
+                # only key material, so this goes to <stem>_2 instead.
+                written, renamed = write_new_private_file(p, "\n".join(lines))
             except OSError as e:
                 alert(win, "Couldn't save the shares", friendly_error(e))
                 return
+            state["saved"] = True
+            note = (f" A file named {os.path.basename(p)} already existed, so this one "
+                    f"was saved as {os.path.basename(written)}." if renamed else "")
             saved_lbl.config(text=f"{ICON['ok']} Saved all {n} shares to "
-                                  f"{os.path.basename(p)} — keep that file somewhere "
-                                  "safe, then split it up.")
+                                  f"{os.path.basename(written)} — keep that file somewhere "
+                                  f"safe, then split it up.{note}")
 
         def _finish():
+            if not state["saved"]:
+                extra = (" Copying isn't enough — the clipboard clears in 60 seconds."
+                         if state["copied"] else "")
+                ok = confirm(win, "Shares not saved",
+                             f"Save the shares first — without them, {vol_name} can "
+                             f"never be opened again.{extra}\n\nLeave and discard the shares?",
+                             yes="Leave and discard", no="Go back", danger=True)
+                # Tk has no grab stack — the confirm took this window's
+                # grab with it; "Go back" must leave the dialog modal.
+                try:
+                    if win.winfo_exists():
+                        win.grab_set()
+                except tk.TclError:
+                    pass
+                if not ok:
+                    return
+            self._pending_shares = None
             win.destroy()
 
         btns = tk.Frame(win, bg=C["bg"])
@@ -1092,10 +1193,19 @@ class VolumeManagerApp(tk.Toplevel):
 
         # Shares input (hidden by default)
         self._mount_shares_frame = tk.Frame(parent, bg=C["bg"])
-        tk.Label(self._mount_shares_frame, text="Recovery shares",
-                 font=F["body_b"], bg=C["bg"], fg=C["text"]).pack(anchor="w")
-        tk.Label(self._mount_shares_frame, text="Paste one share per line.",
-                 font=F["caption"], bg=C["bg"], fg=C["text3"]).pack(anchor="w")
+        sh_hdr = tk.Frame(self._mount_shares_frame, bg=C["bg"])
+        sh_hdr.pack(fill="x")
+        tk.Label(sh_hdr, text="Recovery shares",
+                 font=F["body_b"], bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._mount_load_btn = FlatButton(sh_hdr, "Load from files…",
+                                          self._load_mount_shares_from_files,
+                                          primary=False, small=True)
+        self._mount_load_btn.pack(side="right")
+        tk.Label(self._mount_shares_frame,
+                 text="Paste one share per line — QCSHARE- codes or 50-word phrases — "
+                      "or load the share files this app saved.",
+                 font=F["caption"], bg=C["bg"], fg=C["text3"],
+                 wraplength=self._WRAP, justify="left").pack(anchor="w")
         self._mount_shares_text = tk.Text(
             self._mount_shares_frame, height=4, wrap="word",
             font=F["mono_s"], bg=C["surface2"], fg=C["text"],
@@ -1198,6 +1308,53 @@ class VolumeManagerApp(tk.Toplevel):
         if p:
             self._mount_point_var.set(p)
 
+    def _load_mount_shares_from_files(self):
+        """Open share files (this screen's "Save all shares…" file, the
+        encryptor's .share-N-of-M.txt, any text with QCSHARE- codes or
+        50-word phrases) and append the shares found to the text box — one
+        per line, skipping ones already there.  Same pattern and 1 MB cap
+        as the decryptor's "Load from file…"."""
+        if self._busy:
+            return
+        vol_path = self._mount_path_var.get().strip()
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Choose share files",
+            filetypes=[("Share files", "*.txt"), ("All files", "*")],
+            initialdir=os.path.dirname(vol_path) if vol_path else os.path.expanduser("~"))
+        if not paths:
+            return
+        codes, unreadable = [], []
+        for p in paths:
+            try:
+                if os.path.getsize(p) > _MAX_SHARE_FILE:
+                    unreadable.append(os.path.basename(p)); continue
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                unreadable.append(os.path.basename(p)); continue
+            for c in pkg.extract_share_codes(text):
+                if c not in codes:
+                    codes.append(c)
+        where = "that file" if len(paths) == 1 else "those files"
+        if unreadable:
+            self._fail_mount(f"Couldn't read {', '.join(unreadable)}.")
+        if not codes:
+            alert(self, "No shares found",
+                  f"No QCSHARE- codes or 50-word phrases were found in {where}.")
+            return
+        present = set(_parse_share_text(self._mount_shares_text.get("1.0", "end")))
+        new = [c for c in codes if c not in present]
+        if new:
+            existing = self._mount_shares_text.get("1.0", "end").strip()
+            self._mount_shares_text.insert(
+                "end", ("\n" if existing else "") + "\n".join(new) + "\n")
+        self._mount_err.config(text="")
+        n = len(new)
+        self._set_status(f"Loaded {n} share{'s' if n != 1 else ''} from {where}."
+                         + ("" if n == len(codes) else
+                            f" {len(codes) - n} already in the box."))
+        self._mount_shares_text.focus_set()
+
     def _fail_mount(self, msg: str, focus: tk.Widget | None = None):
         self._mount_err.config(text=msg)
         if focus is not None:
@@ -1263,10 +1420,16 @@ class VolumeManagerApp(tk.Toplevel):
                         self._after(lambda: self._mount_error(
                             "Paste your recovery shares."))
                         return
-                    share_lines = [
-                        s.strip() for s in shares_text.splitlines() if s.strip()
-                    ]
-                    final_key = vol.derive_volume_key_shamir(share_lines, auth_params)
+                    # Same share syntax as qc-core: codes or mnemonics,
+                    # de-duplicated, first k used.
+                    codes = pkg.normalize_shares(_parse_share_text(shares_text))
+                    k = auth_params.get("threshold") or len(codes)
+                    if len(codes) < k:
+                        self._after(lambda: self._mount_error(
+                            f"Need {k} different shares to open this volume, "
+                            f"got {len(codes)}."))
+                        return
+                    final_key = vol.derive_volume_key_shamir(codes[:k], auth_params)
 
                 # Mount via FUSE (mount_volume opens the volume internally)
                 _stage(2)
@@ -1320,7 +1483,8 @@ class VolumeManagerApp(tk.Toplevel):
         self._mount_prog.pack_forget()
         self._end_mount_busy()
         focus = None
-        if isinstance(msg, PermissionError) and mount_point:
+        if (isinstance(msg, PermissionError) and mount_point
+                and _blames_mount_point(msg, mount_point)):
             # Q25: user processes can't create folders under /Volumes on
             # modern macOS — name the fix instead of "Access denied".
             name = os.path.basename(mount_point.rstrip("/")) or "<name>"
@@ -1407,14 +1571,30 @@ class VolumeManagerApp(tk.Toplevel):
         self._refresh_job = self.after(self._REFRESH_MS, self._poll_mounted)
 
     def _poll_mounted(self):
+        """Periodic refresh.  The snapshot (get_mounted_volumes takes the
+        mount lock, which an unmount holds across ``diskutil``; stat()
+        walks the directory index) runs on a worker so a busy unmount can't
+        freeze the window; only the rendering hops back here."""
         self._refresh_job = None
         if not self.winfo_exists():
             return
-        try:
-            self._refresh_mounted_list()
-        except Exception:
-            pass
-        self._schedule_refresh()
+
+        def _worker():
+            try:
+                snap = self._snapshot_mounted()
+            except Exception:
+                snap = None
+
+            def _apply():
+                if snap is not None:
+                    try:
+                        self._render_mounted(*snap)
+                    except Exception:
+                        pass
+                self._schedule_refresh()
+            self._after(_apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     @staticmethod
     def _stats_text(info: dict) -> str:
@@ -1437,17 +1617,28 @@ class VolumeManagerApp(tk.Toplevel):
             parts.append(f"file on disk {fmt_size(cs)}")
         return "  ·  ".join(parts)
 
+    def _snapshot_mounted(self) -> tuple[dict, dict]:
+        """``(mounted, stats_text_by_mount_point)`` — safe to call off the
+        main thread (no widget access)."""
+        from quantacrypt.core.fuse_ops import get_mounted_volumes
+        mounted = get_mounted_volumes()
+        return mounted, {mp: self._stats_text(info) for mp, info in mounted.items()}
+
     def _refresh_mounted_list(self, force: bool = False):
+        """Synchronous refresh for the moments right after our own mount /
+        unmount (the lock is free then); the periodic poll goes through
+        ``_poll_mounted`` on a worker."""
+        self._render_mounted(*self._snapshot_mounted(), force=force)
+
+    def _render_mounted(self, mounted: dict, stats: dict, force: bool = False):
         """Rebuild the mounted-volumes list when the set of mounts changed
         (external ejects disappear); otherwise just refresh the stats lines
         so hover/focus on the row buttons is not disturbed."""
-        from quantacrypt.core.fuse_ops import get_mounted_volumes
-        mounted = get_mounted_volumes()
         key = tuple(sorted(mounted))
         if not force and key == self._last_mounted_key:
             for mp, row in self._rows.items():
                 if mp in mounted:
-                    row["stats"].config(text=self._stats_text(mounted[mp]))
+                    row["stats"].config(text=stats.get(mp, ""))
             return
         self._last_mounted_key = key
 
@@ -1489,15 +1680,15 @@ class VolumeManagerApp(tk.Toplevel):
                                      primary=False, small=True)
             unmount_btn.pack(side="left")
 
-            stats = tk.Label(inner, text=self._stats_text(info), font=F["small"],
-                             bg=C["surface"], fg=C["text3"])
-            stats.pack(anchor="w", pady=(2, 0))
+            stats_lbl = tk.Label(inner, text=stats.get(mp, ""), font=F["small"],
+                                 bg=C["surface"], fg=C["text3"])
+            stats_lbl.pack(anchor="w", pady=(2, 0))
             # Row-level feedback (unmount/reveal outcome) lives in the row
             note = tk.Label(inner, text="", font=F["small"], bg=C["surface"],
                             fg=C["text3"], wraplength=self._WRAP - SP["xl"],
                             justify="left")
 
-            row = {"buttons": (reveal_btn, unmount_btn), "stats": stats, "note": note}
+            row = {"buttons": (reveal_btn, unmount_btn), "stats": stats_lbl, "note": note}
             self._rows[mp] = row
             if mp in self._unmounting:
                 self._set_row_busy(row, "Unmounting…")

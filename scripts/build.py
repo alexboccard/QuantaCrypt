@@ -261,7 +261,7 @@ def _patch_plist(app_path, icon_name, vol_icon_name=None):
     print(f"    Document type: .qcv → {QCV_UTI}")
 
 
-def _create_dmg(app_path, arch_label=""):
+def _create_dmg(app_path, arch_label="", name=None):
     """Create a .dmg installer with a drag-to-Applications layout.
 
     The DMG contains:
@@ -278,7 +278,7 @@ def _create_dmg(app_path, arch_label=""):
         return None
 
     suffix = f"-{arch_label}" if arch_label else ""
-    dmg_path = os.path.join(DIST, f"{NAME}{suffix}.dmg")
+    dmg_path = os.path.join(DIST, f"{name or NAME}{suffix}.dmg")
     volume_name = "QuantaCrypt"
     window_w, window_h = 480, 300
     icon_size = 128
@@ -288,7 +288,7 @@ def _create_dmg(app_path, arch_label=""):
         os.remove(dmg_path)
 
     # Create a temporary writable DMG
-    tmp_dmg = os.path.join(DIST, f"{NAME}_tmp.dmg")
+    tmp_dmg = os.path.join(DIST, f"{name or NAME}_tmp.dmg")
     if os.path.isfile(tmp_dmg):
         os.remove(tmp_dmg)
 
@@ -436,6 +436,9 @@ def _parse_args():
                    help="Skip the test suite (useful for CI split builds)")
     p.add_argument("--test-only", action="store_true",
                    help="Run tests and coverage only — skip the build entirely")
+    p.add_argument("--native", action="store_true",
+                   help="Build the native SwiftUI app: helper + icons + xcodegen + "
+                        "xcodebuild Release → dist/QuantaCrypt.app (+ DMG unless --no-dmg)")
     p.add_argument("--helper", action="store_true",
                    help="Build only the qc-core helper (dist/qc-core.app) "
                         "for the native macOS shell; skips icons and DMG")
@@ -611,7 +614,12 @@ def _build_helper(args):
         cmd += ["--hidden-import", h]
     for mod in ("tkinter", "_tkinter", "tkinterdnd2", "quantacrypt.ui"):
         cmd += ["--exclude-module", mod]
-    cmd += ["--add-data", f"{PKG}:quantacrypt"]
+    # No --add-data of the source tree: the modules are collected through
+    # --paths/--hidden-import; copying src/ would smuggle the excluded Tk
+    # UI and __pycache__ into the helper.
+    cmd += ["--hidden-import", "quantacrypt.core.service",
+            "--hidden-import", "quantacrypt.core.package",
+            "--hidden-import", "quantacrypt.core.errors"]
     cmd.append(os.path.join(PKG, "cli.py"))
     print(f"\n{'='*60}\n  Building helper: {HELPER_NAME}.app\n{'='*60}")
     if args.arch == "x86_64":
@@ -640,6 +648,67 @@ def _build_helper(args):
         print(f"[!] Helper smoke test failed:\n{r.stdout}\n{r.stderr}"); sys.exit(1)
     total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(app) for f in fs)
     print(f"[+] Built {app} ({total / 1_000_000:.1f} MB), smoke test OK")
+NATIVE_DIR = os.path.join(ROOT, "macos")
+NATIVE_NAME = "QuantaCrypt"
+
+
+def _build_native(args):
+    """One command → one .app.  Builds the qc-core helper bundle, renders
+    the app/document icons from src/quantacrypt/assets into the Xcode
+    resources, generates the project, builds Release, copies the result to
+    dist/ and wraps it in the same drag-to-Applications DMG as the Tk app."""
+    _build_helper(args)
+
+    # Icons: the same PNG sources the Tk build uses, rendered to .icns and
+    # dropped where project.yml's resource glob picks them up.
+    res_dir = os.path.join(NATIVE_DIR, NATIVE_NAME, "Resources")
+    os.makedirs(res_dir, exist_ok=True)
+    icon_args, icon_tmp = _build_icon()
+    for tmp, name in ((icon_tmp, "icon.icns"),
+                      (_build_doc_icon(), DOC_ICON_NAME),
+                      (_build_vol_icon(), VOL_ICON_NAME)):
+        if tmp and os.path.isfile(tmp):
+            shutil.move(tmp, os.path.join(res_dir, name))
+            print(f"[+] Icon → {os.path.join(res_dir, name)}")
+
+    if shutil.which("xcodegen") is None:
+        print("[!] xcodegen not found — brew install xcodegen"); sys.exit(1)
+    subprocess.run(["xcodegen", "generate"], cwd=NATIVE_DIR, check=True)
+
+    derived = os.path.join(NATIVE_DIR, "build")
+    identity = os.environ.get("CODESIGN_IDENTITY", "-")
+    cmd = ["xcodebuild", "-project", f"{NATIVE_NAME}.xcodeproj", "-scheme", NATIVE_NAME,
+           "-configuration", "Release", "-derivedDataPath", derived,
+           f"CODE_SIGN_IDENTITY={identity}", "CODE_SIGN_STYLE=Manual"]
+    if args.arch:
+        cmd += [f"ARCHS={args.arch}", "ONLY_ACTIVE_ARCH=NO"]
+    if identity == "-":
+        cmd += ["CODE_SIGNING_ALLOWED=YES"]
+    cmd.append("build")
+    print(f"\n{'='*60}\n  Building native app: {NATIVE_NAME}.app\n{'='*60}")
+    r = subprocess.run(cmd, cwd=NATIVE_DIR, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-4000:]); print(r.stderr[-2000:])
+        print("[!] xcodebuild failed"); sys.exit(1)
+    built = os.path.join(derived, "Build", "Products", "Release", f"{NATIVE_NAME}.app")
+    app = os.path.join(DIST, f"{NATIVE_NAME}.app")
+    shutil.rmtree(app, ignore_errors=True)
+    shutil.copytree(built, app, symlinks=True)
+    helper_exe = os.path.join(app, "Contents", "Helpers", "qc-core.app", "Contents", "MacOS", "qc-core")
+    if not os.path.isfile(helper_exe):
+        print("[!] The helper was not bundled into the app"); sys.exit(1)
+    v = subprocess.run(["codesign", "--verify", "--deep", "--strict", app],
+                       capture_output=True, text=True)
+    if v.returncode != 0:
+        print(f"[!] Signature check failed: {v.stderr.strip()}"); sys.exit(1)
+    total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(app) for f in fs)
+    print(f"[+] Built {app} ({total / 1_000_000:.1f} MB, helper bundled, signature OK)")
+    if not args.no_dmg:
+        import platform
+        _create_dmg(app, args.arch or platform.machine(), name=f"{NATIVE_NAME}-native")
+    else:
+        print("[*] Skipping DMG creation (--no-dmg)")
+
 
 def main():
     args = _parse_args()
@@ -650,6 +719,10 @@ def main():
         _run_tests()
 
     if args.test_only:
+        return
+
+    if args.native:
+        _build_native(args)
         return
 
     if args.helper:

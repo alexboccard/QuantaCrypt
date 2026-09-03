@@ -3613,3 +3613,35 @@ class TestStatfsHostFreeSpace:
         free_bytes = st["f_bavail"] * st["f_frsize"]
         assert free_bytes > 1 << 30, \
             "a large volume must not advertise a full disk"
+
+
+class TestFlushSkipsUnchangedContent:
+    """F-012: an fsync/flush that leaves the bytes identical to the stored
+    content must not re-encrypt and re-append the whole file."""
+
+    @pytest.fixture
+    def fuse_fs(self, tmp_dir):
+        path = os.path.join(tmp_dir, "skip.qcv")
+        meta = vol.create_volume_single(path, "pw")
+        vc = vol.VolumeContainer(path, vol.derive_volume_key_single("pw", meta))
+        vc.open()
+        return QuantaCryptFUSE(vc)
+
+    def test_identical_rewrite_does_not_touch_container(self, fuse_fs, monkeypatch):
+        fs = fuse_fs
+        fs.create("/a.txt", 0o644)
+        fs.write("/a.txt", b"hello world", 0, 0)
+        fs.flush("/a.txt", 0)
+        calls = []
+        real = fs.volume.write_file
+        monkeypatch.setattr(fs.volume, "write_file", lambda v, d: (calls.append(v), real(v, d)))
+        # Same bytes written again (an editor re-saving, rsync --fsync)
+        fs.write("/a.txt", b"hello world", 0, 0)
+        fs.fsync("/a.txt", 0, 0)
+        assert calls == []
+        # A real change still lands
+        fs.write("/a.txt", b"HELLO world", 0, 0)
+        fs.fsync("/a.txt", 0, 0)
+        assert calls == ["/a.txt"]
+        assert fs.read("/a.txt", 64, 0, 0) == b"HELLO world"
+        assert fs.volume.read_file("/a.txt") == b"HELLO world"

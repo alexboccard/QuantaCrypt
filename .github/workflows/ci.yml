@@ -1,5 +1,12 @@
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 # Release builds (release.yml) only run on v* tags — without this workflow,
 # day-to-day pushes and Dependabot PRs land on master with zero automated
 # testing and the 95% coverage gate is honor-system.
@@ -11,9 +18,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v6
 
@@ -27,8 +35,16 @@ jobs:
       - name: Install libfuse
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # Hash-pinned lock (uv.lock → requirements-lock.txt, all extras) so a
+      # release is what was reviewed, not what PyPI serves that day.
+      - name: Install dependencies (hash-pinned)
+        run: |
+          pip install --require-hashes -r requirements-lock.txt
+          pip install --no-deps -e .
+
+      # pip-audit itself comes from the hash-pinned lock (dev extra).
+      - name: Audit dependencies for known advisories
+        run: pip-audit -r requirements-lock.txt --strict --disable-pip
 
       # --cov-fail-under=95 explicitly, rather than trusting pytest-cov to
       # pick fail_under up from pyproject.toml — the gate must not hinge on
@@ -41,6 +57,7 @@ jobs:
   # protocol change that breaks the Swift client is caught before a tag.
   macos-shell:
     runs-on: macos-26
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 
@@ -48,8 +65,10 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev,build,volumes]"
+      - name: Install dependencies (hash-pinned)
+        run: |
+          pip install --require-hashes -r requirements-lock.txt
+          pip install --no-deps -e .
 
       - name: Build qc-core helper (smoke-tested by the build script)
         run: python scripts/build.py --helper --skip-tests

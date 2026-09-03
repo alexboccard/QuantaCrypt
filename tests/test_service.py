@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -103,8 +104,16 @@ def test_classify_error_codes():
     assert classify_error(ValueError("File appears truncated"))[0] == "format"
     assert classify_error(ValueError("created with a newer version"))[0] == "unsupported"
     assert classify_error(RuntimeError("Volume already mounted at /x"))[0] == "busy"
-    assert classify_error(RuntimeError("fuse backend missing"))[0] == "unsupported"
-    assert classify_error(KeyError("boom"))[0] == "internal"
+    assert classify_error(RuntimeError("No FUSE backend found (macFUSE or FUSE-T)"))[0] == "unsupported"
+    assert classify_error(RuntimeError("Volume appears to be mounted by another process"))[0] == "busy"
+    assert classify_error(RuntimeError("FUSE mount failed: mount point does not exist"))[0] == "io"
+    from quantacrypt.core.errors import InvalidRequest
+    assert classify_error(InvalidRequest("Missing parameter(s): path"))[0] == "invalid_request"
+    code, msg, _ = classify_error(FileExistsError(17, "exists", "/v/x.qcv"))
+    assert code == "already_exists" and msg.startswith("/v/x.qcv already exists")
+    code, msg, _ = classify_error(KeyError("payload_nonce"))
+    assert code == "format" and "payload_nonce" in msg and "corrupt" in msg
+    assert classify_error(TypeError("boom"))[0] == "internal"
     code, message, detail = classify_error(ValueError(""))
     assert detail == "ValueError" and "ValueError" in message
     assert friendly_error(IsADirectoryError()) == "That path is a folder, not a file."
@@ -177,10 +186,22 @@ def test_cancel_flow(h):
     h.send("cancel", {"target": "job"}, rid="c1")
     assert h.result("c1") == {"cancelled": True}
     assert stop.wait(2)
-    # Handler returned normally but the token was set → reported as cancelled
-    assert h.error("job")["code"] == "cancelled"
+    # The handler saw the token but chose to finish: its output exists, so
+    # it is reported as done — "cancelled" must mean "nothing was written".
+    assert h.result("job") == {"finished": True}
     h.send("cancel", {"target": "ghost"}, rid="c2")
     assert h.result("c2") == {"cancelled": False}
+
+    def bails(params, ctx):
+        while not ctx.cancelled():
+            time.sleep(0.01)
+        ctx.check()  # raises CancelledOperation → nothing written
+        return {}
+
+    h.svc.ops["bails"] = bails
+    h.send("bails", rid="job2")
+    h.send("cancel", {"target": "job2"}, rid="c3")
+    assert h.error("job2")["code"] == "cancelled"
 
 
 def test_ctx_check_raises_when_cancelled(h):
@@ -200,7 +221,9 @@ def test_ctx_check_raises_when_cancelled(h):
 def test_missing_params_reported_as_format_error(h):
     h.send("inspect", {}, rid="i")
     err = h.error("i")
-    assert err["code"] == "format" and "path" in err["message"]
+    assert err["code"] == "invalid_request" and "path" in err["message"]
+    h.send("inspect", {"path": 42}, rid="i2")
+    assert h.error("i2")["code"] == "invalid_request"
     h.send("encrypt", {"source": "x"}, rid="e")
     assert "output" in h.error("e")["message"]
     h.send("decrypt", {"path": "x"}, rid="d")
@@ -273,12 +296,13 @@ def test_shamir_round_trip_codes_and_mnemonics(h, src_file, out_dir, tmp_path):
     h.send("decrypt", {"path": out, "output_dir": out_dir,
                        "shares": [codes[0], codes[0]]}, rid="d3")
     err = h.error("d3")
-    assert err["code"] == "format" and "Need 2" in err["message"]
+    assert err["code"] == "invalid_input" and "Need 2" in err["message"]
 
     # unreadable share names its position
     h.send("decrypt", {"path": out, "output_dir": out_dir,
                        "shares": [codes[0], "QCSHARE-garbage"]}, rid="d4")
-    assert "Share 2" in h.error("d4")["message"]
+    d4 = h.error("d4")
+    assert d4["code"] == "invalid_input" and "Share 2" in d4["message"]
 
 
 def test_folder_round_trip_and_guards(h, tmp_path, out_dir):
@@ -310,9 +334,13 @@ def test_encrypt_param_validation_and_missing_source(h, src_file, tmp_path):
     h.send("encrypt", {"source": src_file, "output": out, "mode": "weird", "password": "p"}, rid="m")
     assert "Unknown mode" in h.error("m")["message"]
     h.send("encrypt", {"source": src_file, "output": out, "mode": "password"}, rid="np")
-    assert "password" in h.error("np")["message"]
+    assert h.error("np")["code"] == "invalid_request"  # client omitted a required param
     h.send("encrypt", {"source": src_file, "output": out, "mode": "shamir", "k": 5, "n": 3}, rid="kn")
     assert "2 <= k <= n" in h.error("kn")["message"]
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "shamir", "k": 2.5, "n": 3}, rid="kf")
+    assert h.error("kf")["code"] == "invalid_request"
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "password", "password": ["x"]}, rid="pt")
+    assert h.error("pt")["code"] == "invalid_request"
     h.send("encrypt", {"source": str(tmp_path / "missing"), "output": out,
                        "mode": "password", "password": "p"}, rid="nf")
     assert h.error("nf")["code"] == "not_found"
@@ -321,7 +349,7 @@ def test_encrypt_param_validation_and_missing_source(h, src_file, tmp_path):
 
 def test_encrypt_cancel_leaves_no_tmp(h, tmp_path):
     big = tmp_path / "big.bin"
-    big.write_bytes(os.urandom(6 * 1024 * 1024))
+    big.write_bytes(secrets.token_bytes(6 * 1024 * 1024))
     out = str(tmp_path / "big.qcx")
     h.send("encrypt", {"source": str(big), "output": out, "mode": "password", "password": "p"}, rid="e")
     h.send("cancel", {"target": "e"}, rid="c")
@@ -332,7 +360,7 @@ def test_encrypt_cancel_leaves_no_tmp(h, tmp_path):
 
 def test_embed_binary_and_decrypt_to_bad_dir(h, src_file, tmp_path):
     fake_bin = tmp_path / "decryptor.bin"
-    fake_bin.write_bytes(b"#!/bin/sh\necho hi\n" + os.urandom(2048))
+    fake_bin.write_bytes(b"#!/bin/sh\necho hi\n" + secrets.token_bytes(2048))
     out = str(tmp_path / "e.qcx")
     h.send("encrypt", {"source": src_file, "output": out, "mode": "password", "password": "p",
                        "embed_binary": str(fake_bin)}, rid="e")
@@ -341,7 +369,8 @@ def test_embed_binary_and_decrypt_to_bad_dir(h, src_file, tmp_path):
     h.send("inspect", {"path": out}, rid="i")
     assert h.result("i")["embedded"] is True
     h.send("decrypt", {"path": out, "output_dir": str(tmp_path / "nope"), "password": "p"}, rid="d")
-    assert h.error("d")["code"] == "io"
+    err = h.error("d")
+    assert err["code"] == "invalid_input" and "doesn't exist" in err["message"]
 
 
 # ── package helpers ─────────────────────────────────────────────────────────
@@ -465,7 +494,8 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     res = h.result("c")
     assert res["path"].endswith("vault.qcv") and os.path.exists(res["path"])
     h.send("volume_create", {"path": res["path"], "mode": "password", "password": "pw"}, rid="c2")
-    assert h.error("c2")["code"] == "io"
+    c2 = h.error("c2")
+    assert c2["code"] == "already_exists" and "already exists" in c2["message"]
     h.send("volume_create", {"path": str(tmp_path / "s.qcv"), "mode": "shamir", "k": 3, "n": 2}, rid="c3")
     assert "2 <= k <= n" in h.error("c3")["message"]
     h.send("volume_create", {"path": str(tmp_path / "s.qcv"), "mode": "shamir", "k": 2, "n": 3}, rid="c4")
@@ -507,10 +537,12 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     assert h.result("u") == {"mount_point": mp}
     assert mp not in mounted
 
-    # shutdown unmounts what is left and calls exit_fn
+    # shutdown unmounts what is left BEFORE acknowledging, and reports failures
+    monkeypatch.setattr(fo, "unmount_volume",
+                        lambda mp: (_ for _ in ()).throw(RuntimeError("busy")) if mp.endswith("sus") else mounted.pop(mp))
     h.send("shutdown", rid="s")
-    assert h.result("s") == {}
-    assert mounted == {} and h.exited.is_set()
+    assert h.result("s") == {"unmount_failed": [mp + "sus"]}
+    assert not h.exited.is_set()  # exit is run()'s job, after the ack is flushed
 
 
 def test_volume_list_stats_failure_and_no_fuse(h, monkeypatch):
@@ -570,6 +602,7 @@ def test_cli_version_and_stdio_session(tmp_path):
     lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
     assert [l["id"] for l in lines] == ["1", "2", "3"], diag
     assert lines[1]["result"]["version"] == __version__, diag
+    assert lines[2]["result"] == {"unmount_failed": []}, diag
 
 
 def test_run_loop_stops_at_eof(monkeypatch):
@@ -597,3 +630,282 @@ def test_eof_lets_inflight_work_finish():
     ev = json.loads(out.getvalue().splitlines()[-1])
     assert ev["event"] == "done" and ev["result"] == {"finished": True, "cancelled": False}
     assert exited == [True]
+
+
+def test_shutdown_op_exits_loop_without_eof():
+    """The shutdown op must end run() even when the client keeps stdin open."""
+    r, w = os.pipe()
+    reader = os.fdopen(r, "r")
+    writer = os.fdopen(w, "w")
+    out = io.StringIO()
+    exited = []
+    s = Service(reader, out, exit_fn=lambda: exited.append(True))
+    t = threading.Thread(target=s.run, daemon=True)
+    t.start()
+    writer.write(json.dumps({"id": "s", "op": "shutdown"}) + "\n"); writer.flush()
+    t.join(5)
+    assert not t.is_alive(), "run() did not return after shutdown with stdin still open"
+    assert exited == [True]
+    assert json.loads(out.getvalue().splitlines()[-1]) == {"id": "s", "event": "done",
+                                                            "result": {"unmount_failed": []}}
+    writer.close()
+
+
+def test_shutdown_is_idempotent(h):
+    assert h.svc.shutdown(exit_after=False) == []
+    assert h.svc.shutdown(exit_after=False) == []
+    h.svc.shutdown()  # third call: guard returns before exit_fn
+    assert not h.exited.is_set()
+
+
+def test_sigterm_stops_helper_cleanly(tmp_path):
+    """SIGTERM mid-request: the handler must not tear down inside the signal
+    handler; the loop unwinds and the process exits 0 with no .tmp left."""
+    import signal
+    big = tmp_path / "big.bin"
+    big.write_bytes(secrets.token_bytes(8 * 1024 * 1024))
+    out = str(tmp_path / "big.qcx")
+    proc = subprocess.Popen([sys.executable, "-m", "quantacrypt.cli"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    proc.stdin.write(json.dumps({"id": "e", "op": "encrypt", "params": {
+        "source": str(big), "output": out, "mode": "password", "password": "p"}}) + "\n")
+    proc.stdin.flush()
+    # Deterministic: wait for the first progress event, which proves the
+    # handler is installed and the encrypt is in flight, then signal.
+    first = json.loads(proc.stdout.readline())
+    assert first["event"] == "progress", first
+    proc.send_signal(signal.SIGTERM)
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail("helper did not exit after SIGTERM")
+    assert proc.returncode == 0, stderr
+    assert not os.path.exists(out + ".tmp")
+    evs = [json.loads(l) for l in stdout.splitlines() if l.strip()]
+    terminal = [e for e in evs if e["event"] in ("error", "done")]
+    assert terminal, "the in-flight request got no terminal event"
+    assert terminal[-1]["event"] == "error" and terminal[-1]["code"] == "cancelled"
+    assert not os.path.exists(out)
+
+
+def test_verify_only_on_empty_payload(h, tmp_path):
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+    out = str(tmp_path / "empty.qcx")
+    h.send("encrypt", {"source": str(empty), "output": out, "mode": "password", "password": "p"}, rid="e")
+    h.result("e")
+    h.send("decrypt", {"path": out, "password": "p", "verify_only": True}, rid="v")
+    assert h.result("v") == {"verified": True, "mode": "single"}
+    h.send("decrypt", {"path": out, "password": "wrong", "verify_only": True}, rid="w")
+    assert h.error("w")["code"] == "wrong_credentials"
+
+
+def test_volume_create_cancel_removes_partial_file(h, tmp_path, monkeypatch):
+    import quantacrypt.core.volume as vol
+    path = str(tmp_path / "half.qcv")
+
+    def fake_create(p, pw, progress_cb=None, cancel_check=None):
+        open(p, "wb").write(b"partial")
+        raise cc.CancelledOperation("Volume creation cancelled")
+
+    monkeypatch.setattr(vol, "create_volume_single", fake_create)
+    h.send("volume_create", {"path": path, "mode": "password", "password": "pw"}, rid="c")
+    assert h.error("c")["code"] == "cancelled"
+    assert not os.path.exists(path)
+
+
+def test_create_volume_polls_cancel(tmp_path):
+    from quantacrypt.core import volume as vol
+    with pytest.raises(cc.CancelledOperation):
+        vol.create_volume_single(str(tmp_path / "x.qcv"), "pw", cancel_check=lambda: True)
+    assert not os.path.exists(tmp_path / "x.qcv")
+    with pytest.raises(cc.CancelledOperation):
+        vol.create_volume_shamir(str(tmp_path / "y.qcv"), 3, 2, cancel_check=lambda: True)
+
+
+# ── Coverage for the lifecycle and validation branches ──────────────────────
+
+def test_request_stop_unblocks_run_and_cancels_workers():
+    r, w = os.pipe()
+    reader = os.fdopen(r, "r")
+    writer = os.fdopen(w, "w")
+    out = io.StringIO()
+    exited = []
+    s = Service(reader, out, exit_fn=lambda: exited.append(True))
+    seen = threading.Event()
+
+    def sleepy(params, ctx):
+        seen.set()
+        while not ctx.cancelled():
+            time.sleep(0.01)
+        ctx.check()
+        return {}
+
+    s.ops["sleepy"] = sleepy
+    t = threading.Thread(target=s.run, daemon=True)
+    t.start()
+    writer.write(json.dumps({"id": "j", "op": "sleepy"}) + "\n"); writer.flush()
+    assert seen.wait(2)
+    s.request_stop()          # what the SIGTERM handler does before raising
+    writer.write("\n"); writer.flush()   # wake the blocked read (cross-thread)
+    t.join(5)
+    assert not t.is_alive() and exited == [True]
+    evs = [json.loads(l) for l in out.getvalue().splitlines()]
+    assert evs[-1]["id"] == "j" and evs[-1]["code"] == "cancelled"
+    writer.close()
+
+
+def test_optional_param_types_and_unknown_volume_mode(h, tmp_path, src_file):
+    h.send("decrypt", {"path": src_file, "output_dir": 3, "password": "x"}, rid="od")
+    assert h.error("od")["code"] == "invalid_request"
+    h.send("decrypt", {"path": src_file, "output_dir": str(tmp_path), "shares": "not-a-list"}, rid="sl")
+    assert h.error("sl")["code"] == "invalid_request"
+    h.send("volume_create", {"path": str(tmp_path / "v.qcv"), "mode": "weird", "password": "p"}, rid="vm")
+    assert h.error("vm")["code"] == "invalid_request"
+    h.send("volume_create", {"path": str(tmp_path / "v2.qcv"), "mode": "password"}, rid="np")
+    assert h.error("np")["code"] == "invalid_request"
+
+
+def test_package_validation_and_cleanup(tmp_path, src_file):
+    from quantacrypt.core.errors import InvalidRequest
+    out = str(tmp_path / "o.qcx")
+    with pytest.raises(InvalidRequest):
+        pkg.encrypt_to_qcx(src_file, out, mode="nope", password="p")
+    with pytest.raises(InvalidRequest):
+        pkg.encrypt_to_qcx(src_file, out, mode="shamir", k=1, n=1)
+    # Failure after the tmp file exists removes it (embed source unreadable)
+    with pytest.raises(FileNotFoundError):
+        pkg.encrypt_to_qcx(src_file, out, mode="password", password="p",
+                           embed_binary=str(tmp_path / "missing.bin"))
+    assert not os.path.exists(out + ".tmp") and not os.path.exists(out)
+    # chmod failure on the embed path is tolerated
+    fake_bin = tmp_path / "bin"; fake_bin.write_bytes(b"x" * 10)
+    import quantacrypt.core.package as pmod
+    real_chmod = os.chmod
+    pmod.os.chmod = lambda *a, **k: (_ for _ in ()).throw(OSError("ro"))
+    try:
+        res = pkg.encrypt_to_qcx(src_file, out, mode="password", password="p",
+                                 embed_binary=str(fake_bin))
+    finally:
+        pmod.os.chmod = real_chmod
+    assert os.path.exists(res["output"])
+    # decrypt failure after the tmp file exists removes it (wrong password
+    # is caught before; force a failure inside the stream by truncating)
+    with open(out, "r+b") as f:
+        f.truncate(os.path.getsize(out) - 200)
+    with pytest.raises(Exception):
+        pkg.decrypt_qcx(out, str(tmp_path), password="p")
+    assert not [f for f in os.listdir(tmp_path) if f.startswith(".qc-decrypt-")]
+
+
+def test_folder_stats_tolerates_vanishing_files(tmp_path, monkeypatch):
+    d = tmp_path / "f"; d.mkdir(); (d / "a").write_bytes(b"12")
+    import quantacrypt.core.package as pmod
+    monkeypatch.setattr(pmod.os.path, "getsize", lambda p: (_ for _ in ()).throw(OSError("gone")))
+    assert pkg.folder_stats(str(d)) == (1, 0)
+
+
+def test_zip_folder_skips_its_own_archive(tmp_path):
+    d = tmp_path / "f"; d.mkdir(); (d / "a").write_bytes(b"12")
+    dst = d / "inner.zip"   # archive inside the tree being zipped
+    pkg.zip_folder(str(d), str(dst), progress_cb=lambda m: None)
+    import zipfile
+    with zipfile.ZipFile(dst) as zf:
+        assert zf.namelist() == ["f/a"]
+
+
+def test_verify_first_chunk_truncated_length_field(src_file, tmp_path):
+    out = str(tmp_path / "t.qcx")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    meta = pkg.load_pkg(out)["meta"]
+    key, _ = pkg.derive_final_key(meta, password="p")
+    with open(out, "r+b") as f:
+        f.truncate(meta.get("payload_offset", 0) + 6)
+    with pytest.raises(ValueError, match="truncated"):
+        pkg.verify_first_chunk(out, meta, key)
+
+
+def test_friendly_error_newer_version():
+    assert "newer version" in friendly_error(ValueError("unsupported format version 9"))
+
+
+def test_extract_share_codes_tolerates_headers_and_prose(src_file, tmp_path):
+    out = str(tmp_path / "s.qcx")
+    res = pkg.encrypt_to_qcx(src_file, out, mode="shamir", k=2, n=3)
+    sh = res["shares"]
+    text = (f"QuantaCrypt share file for notes.txt\nShare 1 of 3:\n{sh[0]['code']}\n\n"
+            f"Share 2 of 3 (50-word phrase):\n{sh[1]['mnemonic']}\n\nKeep this safe.\n"
+            f"{sh[0]['code']}\n")  # duplicate collapses
+    codes = pkg.extract_share_codes(text)
+    assert codes == [sh[0]["code"], sh[1]["code"]]
+    assert pkg.extract_share_codes("nothing here") == []
+    # A mnemonic wrapped across lines still counts
+    words = sh[2]["mnemonic"].split()
+    wrapped = "\n".join(" ".join(words[i:i + 7]) for i in range(0, 50, 7))
+    assert pkg.extract_share_codes("Share 3:\n" + wrapped) == [sh[2]["code"]]
+
+
+def test_corrupt_payload_is_not_a_wrong_password(h, src_file, tmp_path, out_dir):
+    out = str(tmp_path / "c.qcx")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    meta = pkg.load_pkg(out)["meta"]
+    off = meta.get("payload_offset", 0) + 8 + 5  # inside chunk 0's ciphertext
+    with open(out, "r+b") as f:
+        f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 0xFF]))
+    h.send("decrypt", {"path": out, "password": "p", "verify_only": True}, rid="v")
+    err = h.error("v")
+    assert err["code"] == "format" and "damaged" in err["message"]
+    h.send("decrypt", {"path": out, "output_dir": out_dir, "password": "p"}, rid="d")
+    err = h.error("d")
+    assert err["code"] == "format" and "damaged" in err["message"]
+    assert not [f for f in os.listdir(out_dir) if f.startswith(".qc-decrypt-")]
+    # A genuinely wrong password is still reported as such
+    h.send("decrypt", {"path": out, "password": "nope", "verify_only": True}, rid="w")
+    assert h.error("w")["code"] == "wrong_credentials"
+
+
+def test_place_without_clobber_survives_a_race(tmp_path, monkeypatch):
+    import quantacrypt.core.package as pmod
+    (tmp_path / "f.txt").write_text("old")
+    tmp = tmp_path / ".t"; tmp.write_text("new")
+    real_link = os.link
+    calls = []
+
+    def racy_link(src, dst):
+        # Someone creates f_2.txt between the existence check and our link
+        if dst.endswith("f_2.txt") and not calls:
+            calls.append(1)
+            open(dst, "w").write("intruder")
+        return real_link(src, dst)
+
+    monkeypatch.setattr(pmod.os, "link", racy_link)
+    out, renamed = pmod._place_without_clobber(str(tmp), str(tmp_path), "f.txt")
+    assert renamed and out.endswith("f_3.txt")
+    assert (tmp_path / "f.txt").read_text() == "old"
+    assert (tmp_path / "f_2.txt").read_text() == "intruder"
+    assert open(out).read() == "new" and not tmp.exists()
+    # Filesystems without hard links fall back to replace
+    tmp2 = tmp_path / ".t2"; tmp2.write_text("v2")
+    monkeypatch.setattr(pmod.os, "link", lambda s, d: (_ for _ in ()).throw(OSError(1, "no links")))
+    out2, _ = pmod._place_without_clobber(str(tmp2), str(tmp_path), "g.txt")
+    assert open(out2).read() == "v2"
+
+
+def test_encrypt_failure_leaves_no_temp(src_file, tmp_path, monkeypatch):
+    import quantacrypt.core.package as pmod
+    monkeypatch.setattr(pmod.cc, "encrypt_single_streaming",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        pkg.encrypt_to_qcx(src_file, str(tmp_path / "x.qcx"), mode="password", password="p")
+    assert not [f for f in os.listdir(tmp_path) if ".qc-enc-" in f]
+
+
+def test_run_request_always_emits_a_terminal_event(h):
+    def bad(params, ctx):
+        raise KeyError()  # no args: str(exc) is "" — the classifier must cope
+
+    h.svc.ops["bad"] = bad
+    h.send("bad", rid="b")
+    assert h.final("b")["event"] == "error"

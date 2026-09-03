@@ -4,7 +4,6 @@ import Observation
 @MainActor
 @Observable
 final class VolumesModel {
-    enum Job { case create, mount }
     enum MountCredential: String, CaseIterable, Identifiable {
         case password = "Password"
         case shares = "Split key"
@@ -24,9 +23,6 @@ final class VolumesModel {
     var fuseCheckNote: String?
     var fuseError: CoreError?
 
-    // Which section the toolbar's primary action drives.
-    var activeJob: Job = .mount
-
     // Create
     var createName = ""
     var createDirectory = (Paths.homeDirectory as NSString).appendingPathComponent("Documents")
@@ -37,16 +33,25 @@ final class VolumesModel {
     var createTotal = 3
     var createProgress: CoreProgress?
     var createRunning = false
+    var createCancelling = false
     var createError: CoreError?
     var createStatus: String?
     var createResult: VolumeCreateResult?
-    var sharesToShow: SharesPresentation?
+    var sharesToShow: SharesPresentation? {
+        didSet { if sharesToShow != nil { sharesSaved = false } }
+    }
+    /// Whether the shares on screen have been written somewhere durable.
+    /// Read by the quit guard — the sheet's own state dies with the sheet.
+    var sharesSaved = false
     var offerMountAfterCreate = false
 
     // Mount
     var mountPath: String?
     var mountInfo: VolumeInspectInfo?
     var mountInspecting = false
+    /// Why the auth block could not be read; the credential picker then
+    /// stands in for it.
+    var mountInspectError: CoreError?
     var mountPoint = ""
     private var mountPointChosenByUser = false
     var mountCredential: MountCredential = .password
@@ -54,6 +59,7 @@ final class VolumesModel {
     var mountShares: [String] = ["", ""]
     var mountProgress: CoreProgress?
     var mountRunning = false
+    var mountCancelling = false
     var mountError: CoreError?
     var mountStatus: String?
     var mountedNote: String?
@@ -62,6 +68,10 @@ final class VolumesModel {
     // Mounted list
     var mounted: [MountedVolume] = []
     var listLoaded = false
+    /// Consecutive `volume_list` failures. The list is a poll, so one miss is
+    /// noise; a run of them means what is on screen is fiction.
+    private var listFailures = 0
+    var listIsStale: Bool { listFailures >= 2 }
     var unmountCandidate: MountedVolume?
     var unmounting: Set<String> = []
     var unmountError: CoreError?
@@ -76,7 +86,17 @@ final class VolumesModel {
 
     // MARK: FUSE
 
-    var mountingAvailable: Bool { fuse?.ok ?? false }
+    enum MountSupport: Equatable { case unknown, missing, ready }
+
+    /// `fuse == nil` is "not checked yet", not "not installed" — sending the
+    /// user to Homebrew because a check is still in flight, or because the
+    /// helper is down, wastes their time on the wrong problem.
+    var mountSupport: MountSupport {
+        guard let fuse else { return .unknown }
+        return fuse.ok ? .ready : .missing
+    }
+
+    var mountingAvailable: Bool { mountSupport == .ready }
 
     func checkFuse(userInitiated: Bool = false) async {
         fuseChecking = true
@@ -117,6 +137,7 @@ final class VolumesModel {
     }
 
     var createValidationMessage: String? {
+        if mountRunning { return "Wait for the volume that is opening to finish." }
         let name = createName.trimmingCharacters(in: .whitespacesAndNewlines)
         if name.isEmpty { return "Give the volume a name." }
         if name.contains("/") { return "The name can't contain a slash." }
@@ -145,6 +166,7 @@ final class VolumesModel {
             ? .password(createPassword)
             : .splitKey(k: createThreshold, n: createTotal)
         createRunning = true
+        createCancelling = false
         createProgress = nil
         createError = nil
         createStatus = nil
@@ -159,10 +181,12 @@ final class VolumesModel {
                 finishCreate(result)
             } catch let error as CoreError {
                 createRunning = false
+                createCancelling = false
                 createProgress = nil
                 if error.isCancellation { createStatus = error.message } else { createError = error }
             } catch {
                 createRunning = false
+                createCancelling = false
                 createProgress = nil
                 createError = CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)")
             }
@@ -171,6 +195,7 @@ final class VolumesModel {
 
     private func finishCreate(_ result: VolumeCreateResult) {
         createRunning = false
+        createCancelling = false
         createProgress = nil
         createResult = result
         createPassword = ""
@@ -179,7 +204,7 @@ final class VolumesModel {
             sharesToShow = SharesPresentation(
                 shares: result.shares,
                 context: ShareFiles.Context(stem: Format.stem(result.path),
-                                            protectedName: Format.fileName(result.path), k: k, n: n))
+                                            protectedName: Format.fileName(result.path), k: k, n: n, kind: .qcvVolume))
         } else {
             offerMountAfterCreate = true
         }
@@ -190,14 +215,32 @@ final class VolumesModel {
     }
 
     func cancelCreate() {
+        guard createRunning else { return }
+        createCancelling = true
         createTask?.cancel()
+    }
+
+    /// Second chance at the shares of a volume that has already been created
+    /// — without it, one click on "Discard shares" seals the volume forever.
+    func showSharesAgain() {
+        guard let result = createResult, !result.shares.isEmpty,
+              let k = result.threshold, let n = result.total else { return }
+        sharesToShow = SharesPresentation(
+            shares: result.shares,
+            context: ShareFiles.Context(stem: Format.stem(result.path),
+                                        protectedName: Format.fileName(result.path),
+                                        k: k, n: n, kind: .qcvVolume))
+    }
+
+    var canShowSharesAgain: Bool {
+        guard let result = createResult else { return false }
+        return !result.shares.isEmpty && result.threshold != nil && result.total != nil
     }
 
     func mountCreatedVolume() {
         guard let result = createResult else { return }
         prepareMount(path: result.path)
         mountCredential = result.mode == "shamir" ? .shares : .password
-        activeJob = .mount
     }
 
     // MARK: Mount
@@ -215,29 +258,50 @@ final class VolumesModel {
         url.pathExtension.lowercased() == "qcv"
     }
 
-    func prepareMount(path: String) {
-        guard !mountRunning else { return }
+    /// Select `path` for mounting. Returns false — with the reason in
+    /// `mountStatus` — while a mount is running.
+    @discardableResult
+    func prepareMount(path: String) -> Bool {
+        guard !mountRunning else {
+            mountStatus = EncryptModel.busyMessage(for: path)
+            return false
+        }
         mountPath = path
         mountError = nil
         mountStatus = nil
         mountedNote = nil
         if !mountPointChosenByUser { mountPoint = Self.defaultMountPoint(for: path) }
-        activeJob = .mount
         mountInfo = nil
+        mountInspectError = nil
         mountInspecting = true
         // Read the auth block so the right credential entry appears without
-        // asking the user how the volume is protected.
+        // asking the user how the volume is protected. When that fails the
+        // reason is shown and the "Unlock with" picker takes over.
         Task { [core] in
             defer { if mountPath == path { mountInspecting = false } }
-            guard let info: VolumeInspectInfo = try? await core.perform(.volumeInspect(path: path)),
-                  mountPath == path else { return }
-            mountInfo = info
-            mountCredential = info.isSplitKey ? .shares : .password
-            let needed = info.threshold ?? 2
-            if info.isSplitKey, mountShares.count < needed {
-                mountShares = Array(repeating: "", count: needed)
+            do {
+                let info: VolumeInspectInfo = try await core.perform(.volumeInspect(path: path))
+                guard mountPath == path else { return }
+                mountInfo = info
+                mountCredential = info.isSplitKey ? .shares : .password
+                let needed = info.threshold ?? 2
+                if info.isSplitKey, mountShares.count < needed {
+                    mountShares = Array(repeating: "", count: needed)
+                }
+            } catch let error as CoreError {
+                guard mountPath == path else { return }
+                mountInspectError = Self.inspectFailure(error)
+            } catch {
+                guard mountPath == path else { return }
+                mountInspectError = Self.inspectFailure(
+                    CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)"))
             }
         }
+        return true
+    }
+
+    static func inspectFailure(_ error: CoreError) -> CoreError {
+        CoreError(code: error.code, message: "Couldn't read this volume: \(error.message)", detail: error.detail)
     }
 
     func chooseMountPoint() {
@@ -249,55 +313,60 @@ final class VolumesModel {
     }
 
     func loadMountSharesFromFiles() {
-        let urls = Panels.chooseFiles(types: [.plainText, .text, .item], message: "Choose one or more share files.")
+        let urls = Panels.chooseFiles(types: ShareFiles.fileTypes, message: "Choose one or more share files.")
         guard !urls.isEmpty else { return }
-        var loaded: [String] = []
-        for url in urls {
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            loaded.append(contentsOf: ShareFiles.parse(text))
-        }
+        let (loaded, problems) = ShareFiles.load(urls)
         guard !loaded.isEmpty else {
-            mountStatus = "No shares were found in \(urls.count == 1 ? "that file" : "those files")."
+            mountStatus = problems.first ?? "No shares were found in \(urls.count == 1 ? "that file" : "those files")."
             return
         }
-        var merged = mountShares.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        for share in loaded where !merged.contains(share) { merged.append(share) }
-        while merged.count < 2 { merged.append("") }
-        mountShares = merged
-        mountStatus = nil
-    }
-
-    private var trimmedMountShares: [String] {
-        mountShares.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        mountShares = ShareValidation.merge(loaded, into: mountShares,
+                                            threshold: mountInfo?.threshold ?? 2, total: mountInfo?.total)
+        mountStatus = problems.first
     }
 
     var mountValidationMessage: String? {
+        if createRunning { return "Wait for the volume being created to finish." }
         guard mountPath != nil else { return "Choose a volume file." }
         if mountPoint.trimmingCharacters(in: .whitespaces).isEmpty { return "Choose where to mount it." }
         switch mountCredential {
         case .password:
             if mountPassword.isEmpty { return "Enter the password." }
         case .shares:
-            let filled = trimmedMountShares
-            if filled.count < 2 { return "Enter at least 2 shares." }
-            var seen: [String: Int] = [:]
-            for (i, share) in filled.enumerated() {
-                if let first = seen[share] { return "Shares \(first + 1) and \(i + 1) are the same share." }
-                seen[share] = i
-            }
+            // The inspected threshold when the auth block was readable;
+            // otherwise any two or more and the helper says how many it needs.
+            return ShareValidation.message(shares: mountShares, threshold: mountInfo?.threshold)
         }
         return nil
     }
 
     var canMount: Bool { !mountRunning && mountValidationMessage == nil }
 
+    /// The form is complete *and* this Mac can mount: the toolbar button,
+    /// its ⌘↩ shortcut and the inline button all key off this one gate.
+    var canMountNow: Bool { canMount && mountingAvailable }
+
+    /// Why the mount action is unavailable, for the buttons' help text.
+    var mountBlockedMessage: String? {
+        if let message = mountValidationMessage { return message }
+        switch mountSupport {
+        case .ready: return nil
+        case .unknown:
+            return fuseError == nil
+                ? "Checking whether this Mac can open volumes as drives…"
+                : "Couldn't check whether this Mac can mount volumes — the helper isn't responding."
+        case .missing: return "Install disk mounting support first."
+        }
+    }
+
     func mount() {
-        guard canMount, let path = mountPath else { return }
+        guard canMountNow, let path = mountPath else { return }
         let credential: CoreRequest.Credential = mountCredential == .password
             ? .password(mountPassword)
-            : .shares(trimmedMountShares)
+            : .shares(ShareValidation.prepared(mountShares))
         let target = (mountPoint as NSString).expandingTildeInPath
         mountRunning = true
+        mountCancelling = false
         mountProgress = nil
         mountError = nil
         mountStatus = nil
@@ -312,33 +381,46 @@ final class VolumesModel {
                 finishMount(result, path: path)
             } catch let error as CoreError {
                 mountRunning = false
+                mountCancelling = false
                 mountProgress = nil
                 if error.isCancellation {
                     mountStatus = error.message
                 } else {
-                    mountError = friendlyMountError(error, path: path)
+                    mountError = Self.friendlyMountError(error, credential: mountCredential, path: path)
                 }
             } catch {
                 mountRunning = false
+                mountCancelling = false
                 mountProgress = nil
                 mountError = CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)")
             }
         }
     }
 
-    private func friendlyMountError(_ error: CoreError, path: String) -> CoreError {
+    /// Only `wrong_credentials`, `permission_denied` and a FUSE startup
+    /// failure are reworded; a `format` (damaged payload) or `invalid_input`
+    /// (unreadable share) error keeps the helper's message.
+    static func friendlyMountError(_ error: CoreError, credential: MountCredential, path: String) -> CoreError {
         switch error.code {
-        case .wrongCredentials where mountCredential == .password:
+        case .wrongCredentials where credential == .password:
             return CoreError(code: error.code, message: "The password is incorrect. Check Caps Lock and try again.",
                              detail: error.detail)
         case .wrongCredentials:
             return CoreError(code: error.code,
                              message: "These shares don't unlock this volume. Try swapping in a different share — QuantaCrypt can't tell which one is wrong.",
                              detail: error.detail)
-        case .io where error.detail.contains("PermissionError"):
+        case .permissionDenied:
             return CoreError(code: error.code,
                              message: "QuantaCrypt can't create the mount point. Choose a folder inside your home folder, such as ~/QuantaCrypt Volumes/\(Format.stem(path)).",
                              detail: error.detail)
+        case .io where error.message.contains("FUSE mount failed"):
+            // The helper interpolates the raw OSError here, so the two most
+            // common real failures arrive as "[Errno 1] Operation not
+            // permitted" with no cause and nowhere to go.
+            return CoreError(
+                code: error.code,
+                message: "Couldn't open the volume as a drive. Check that the folder it mounts at is empty and not already in use, and that macFUSE or FUSE-T is allowed in System Settings ▸ Privacy & Security.",
+                detail: error.detail.isEmpty ? error.message : "\(error.message)\n\(error.detail)")
         default:
             return error
         }
@@ -346,6 +428,7 @@ final class VolumesModel {
 
     private func finishMount(_ result: VolumeMountResult, path: String) {
         mountRunning = false
+        mountCancelling = false
         mountProgress = nil
         mountPassword = ""
         recents.add(path, kind: .mounted)
@@ -359,7 +442,13 @@ final class VolumesModel {
     }
 
     func cancelMount() {
+        guard mountRunning else { return }
+        mountCancelling = true
         mountTask?.cancel()
+        // The FUSE startup wait has no cancel check inside it, so a cancelled
+        // mount often succeeds anyway. Refresh straight away rather than
+        // leaving "Cancelled" standing next to a volume that did mount.
+        Task { await refreshMounted() }
     }
 
     // MARK: Mounted list
@@ -368,9 +457,12 @@ final class VolumesModel {
         do {
             let list: VolumeListResult = try await core.perform(.volumeList)
             mounted = list.volumes.sorted { $0.mountPoint < $1.mountPoint }
+            listFailures = 0
             listLoaded = true
         } catch {
-            // Polling: a transient failure just keeps the last list.
+            // Polling: one transient failure just keeps the last list, but a
+            // run of them means the rows on screen no longer describe reality.
+            listFailures += 1
             listLoaded = true
         }
     }

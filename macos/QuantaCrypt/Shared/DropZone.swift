@@ -16,8 +16,9 @@ struct DropZone: View {
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: systemImage)
-                .font(.system(size: 28))
+                .font(.largeTitle)
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(title)
                 .font(.headline)
             Text(subtitle)
@@ -26,6 +27,7 @@ struct DropZone: View {
                 .multilineTextAlignment(.center)
             Button(chooseTitle, action: onChoose)
                 .padding(.top, 4)
+                .accessibilityHint("You can also drag a file onto this area.")
         }
         .frame(maxWidth: .infinity)
         .padding(24)
@@ -42,7 +44,9 @@ struct DropZone: View {
             onDrop(url)
             return true
         } isTargeted: { isTargeted = $0 }
-        .accessibilityElement(children: .combine)
+        // `.contain`, never `.combine`: combining swallows the Choose button,
+        // which is the only control that starts the task on this screen.
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
     }
 }
@@ -53,6 +57,8 @@ struct PathRow: View {
     let detail: String?
     let systemImage: String
     let changeTitle: String
+    /// Distinct VoiceOver name — several rows on one screen all say "Change…".
+    var changeLabel: String? = nil
     let onChange: () -> Void
 
     var body: some View {
@@ -76,6 +82,7 @@ struct PathRow: View {
             }
             Spacer()
             Button(changeTitle, action: onChange)
+                .accessibilityLabel(changeLabel ?? changeTitle)
         }
     }
 }

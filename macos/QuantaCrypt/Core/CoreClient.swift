@@ -18,10 +18,22 @@ actor CoreClient {
     private var pending: [String: AsyncStream<CoreEvent>.Continuation] = [:]
     private var counter = 0
     private var shuttingDown = false
+    /// Set while `restart()` is stopping the old helper and launching the
+    /// new one; requests arriving meanwhile wait for it instead of hitting
+    /// the dying transport.
+    private var restarting: Task<Void, Never>?
     private let idPrefix: String
 
     /// Number of times the helper had to be (re)launched after an exit.
     private(set) var restartCount = 0
+
+    /// Called when the helper dies without being asked to. Lets the window
+    /// show the failure instead of leaving a stale "ready" indicator up.
+    private var unexpectedExitHandler: (@Sendable () -> Void)?
+
+    func onUnexpectedExit(_ handler: @escaping @Sendable () -> Void) {
+        unexpectedExitHandler = handler
+    }
 
     /// How long a cancelled request waits for the helper's own `cancelled`
     /// event before being failed locally.
@@ -57,6 +69,9 @@ actor CoreClient {
     func events(for request: CoreRequest) async throws -> (id: String, events: AsyncStream<CoreEvent>) {
         if shuttingDown && request.op != "shutdown" {
             throw CoreError(code: .helperUnavailable, message: "QuantaCrypt is quitting.", detail: "")
+        }
+        if let restarting, request.op != "shutdown" {
+            await restarting.value
         }
         counter += 1
         let id = "\(idPrefix)-\(counter)"
@@ -138,7 +153,7 @@ actor CoreClient {
     /// Ask the helper to stop request `id`. Best effort: a request that has
     /// already finished simply reports `cancelled: false`.
     func cancel(id: String) async {
-        guard pending[id] != nil, !shuttingDown else { return }
+        guard pending[id] != nil, !shuttingDown, restarting == nil else { return }
         do {
             // Fire and forget: a hung helper would never answer, and the
             // caller is already waiting on the original request's stream.
@@ -154,29 +169,60 @@ actor CoreClient {
         _ = try await ensureTransport()
     }
 
-    /// Graceful stop: `shutdown` (the helper unmounts every volume), EOF,
-    /// then escalate if it hangs. Safe to call twice.
-    func shutdown() async {
+    /// What the helper reported when it stopped.
+    struct ShutdownOutcome: Sendable, Equatable {
+        /// Mount points the helper could not unmount (files still open).
+        var unmountFailed: [String] = []
+    }
+
+    /// How long `shutdown` waits for the helper's `done`. The helper cancels
+    /// in-flight work and unmounts every volume *before* answering, so this
+    /// has to cover that work; the EOF grace only starts once it arrives.
+    static let shutdownTimeout: Duration = .seconds(30)
+
+    /// Graceful stop: `shutdown` (the helper cancels work and unmounts every
+    /// volume, then answers), EOF, then escalate if it hangs. Safe to call
+    /// twice.
+    @discardableResult
+    func shutdown() async -> ShutdownOutcome {
         shuttingDown = true
-        guard let transport else { return }
+        guard let transport else { return ShutdownOutcome() }
         let gen = generation
+        var outcome = ShutdownOutcome()
         do {
-            try await withTimeout(.seconds(15)) {
-                _ = try await self.perform(.shutdown)
+            let result = try await withTimeout(Self.shutdownTimeout) {
+                try await self.perform(.shutdown)
+            }
+            if case .array(let failed)? = result["unmount_failed"] {
+                outcome.unmountFailed = failed.compactMap(\.stringValue)
             }
         } catch {
             Logger.client.warning("shutdown request failed: \(error.localizedDescription, privacy: .public)")
         }
         await transport.terminate(timeout: .seconds(10))
         if generation == gen { transportEnded(generation: gen) }
+        return outcome
     }
 
     /// Stop the current helper (if any) and launch a fresh one, e.g. after the
     /// helper path changed in Settings. Pending requests fail with `.helperExited`.
     func restart() async {
+        // A second caller joins the restart in progress rather than
+        // stopping the helper the first one is about to launch.
+        if let restarting {
+            await restarting.value
+            return
+        }
+        let task = Task { await performRestart() }
+        restarting = task
+        await task.value
+        restarting = nil
+    }
+
+    private func performRestart() async {
         if let transport {
             let gen = generation
-            try? await withTimeout(.seconds(5)) {
+            try? await withTimeout(Self.shutdownTimeout) {
                 _ = try await self.perform(.shutdown)
             }
             await transport.terminate(timeout: .seconds(5))
@@ -233,9 +279,11 @@ actor CoreClient {
         guard gen == generation, transport != nil else { return }
         transport = nil
         readTask = nil
-        if !shuttingDown {
+        // A stop we asked for (quit or restart) is not a crash.
+        if !shuttingDown && restarting == nil {
             restartCount += 1
             Logger.client.error("helper exited with \(self.pending.count, privacy: .public) request(s) pending")
+            unexpectedExitHandler?()
         }
         let waiting = pending
         pending.removeAll()

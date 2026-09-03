@@ -27,12 +27,26 @@ targets:
       - path: QuantaCrypt
         excludes:
           - "Info.plist"
+          - "Resources/*.icns"
+      # App + document icons rendered by `scripts/build.py --native` from
+      # src/quantacrypt/assets/*.png (generated, gitignored; optional so a
+      # plain `xcodegen generate` still works without them).
+      - path: QuantaCrypt/Resources/icon.icns
+        buildPhase: resources
+        optional: true
+      - path: QuantaCrypt/Resources/doc_icon.icns
+        buildPhase: resources
+        optional: true
+      - path: QuantaCrypt/Resources/vol_icon.icns
+        buildPhase: resources
+        optional: true
     info:
       path: QuantaCrypt/Info.plist
       properties:
         CFBundleName: QuantaCrypt
         CFBundleDisplayName: QuantaCrypt
         CFBundleShortVersionString: "1.3.0"
+        CFBundleIconFile: icon
         CFBundleVersion: "1"
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         LSApplicationCategoryType: public.app-category.utilities
@@ -42,11 +56,13 @@ targets:
         NSSupportsSuddenTermination: false
         CFBundleDocumentTypes:
           - CFBundleTypeName: QuantaCrypt Encrypted File
+            CFBundleTypeIconFile: doc_icon
             CFBundleTypeRole: Viewer
             LSHandlerRank: Owner
             LSItemContentTypes:
               - com.alexboccard.quantacrypt.qcx
           - CFBundleTypeName: QuantaCrypt Encrypted Volume
+            CFBundleTypeIconFile: vol_icon
             CFBundleTypeRole: Viewer
             LSHandlerRank: Owner
             LSItemContentTypes:
