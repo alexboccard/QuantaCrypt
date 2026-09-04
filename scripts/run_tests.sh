@@ -83,17 +83,20 @@ done < <(
     -m gui --collect-only 2>/dev/null \
     | grep -oE '^tests/[a-z_]+\.py' | sort -u
 )
-if [ "${#GUI_FILES[@]:-0}" -eq 0 ]; then
+if [ "${#GUI_FILES[@]}" -eq 0 ]; then
   echo "no GUI tests collected — is the 'gui' marker still applied in conftest?" >&2
   fail=1
 fi
 for f in "${GUI_FILES[@]}"; do
   printf '%-40s ' "$f"
   tag=$(basename "$f" .py)
-  if out=$(run_pytest "$tag" "$f" "${BASE[@]}" -m gui 2>&1 | tail -1); then
-    echo "$out"
+  if raw=$(run_pytest "$tag" "$f" "${BASE[@]}" -m gui 2>&1); then
+    echo "$raw" | tail -1
   else
-    echo "$out"
+    echo "$raw" | tail -1
+    # Name them. A summary line saying "5 failed" is not actionable from a
+    # CI log, which is exactly how 14 failures arrived unidentified.
+    echo "$raw" | grep -E "^FAILED |^ERROR " | sed 's/^/    /'
     fail=1
   fi
 done

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import struct
+import sys
 import tempfile
 
 import pytest
@@ -1654,13 +1655,13 @@ class TestMountVolumeStartup:
                 raise RuntimeError("simulated FUSE startup failure")
         fake_fuse_module.FUSE = _FailingFuse
 
-        import builtins
-        original_import = builtins.__import__
-        def mock_import(name, *args, **kwargs):
-            if name == "fuse":
-                return fake_fuse_module
-            return original_import(name, *args, **kwargs)
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        # Install it in sys.modules rather than hijacking builtins.__import__.
+        # The import hook intercepted EVERY import in the process while the
+        # test ran, and it did not reliably win on Linux — CI reported "DID
+        # NOT RAISE" because the real FUSE was reached and mounted. Placing
+        # the module directly is deterministic on every platform, and
+        # monkeypatch restores the previous entry.
+        monkeypatch.setitem(sys.modules, "fuse", fake_fuse_module)
 
         path, key = self._make_key_and_path(tmp_dir, "zombie.qcv")
         mp = os.path.join(tmp_dir, "zmount")
