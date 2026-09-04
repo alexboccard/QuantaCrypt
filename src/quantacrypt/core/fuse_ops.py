@@ -1173,11 +1173,20 @@ def mount_volume(
             t = threading.Thread(target=_run, daemon=True)
             t.start()
 
-            # A live FUSE() blocks serving requests; the thread staying
-            # alive past this window means the mount is up.  If the thread
-            # has already exited, FUSE() raised synchronously — propagate.
-            ready.wait(timeout=_FUSE_STARTUP_TIMEOUT)
-            if not t.is_alive():
+            # A live FUSE() blocks serving requests, so `ready` — set in the
+            # worker's finally — is the authoritative signal: if it fires
+            # inside the startup window, FUSE() returned or raised and the
+            # mount is NOT up.
+            #
+            # This used to test `t.is_alive()` instead, which is a race: the
+            # worker sets `ready` and then still has to unwind before it
+            # stops being alive, so the main thread could observe a live
+            # thread for an already-failed mount and register it. macOS
+            # happened to lose that scheduling race and Linux won it, which
+            # is why two mount tests passed locally and failed on CI with
+            # "DID NOT RAISE".
+            failed_fast = ready.wait(timeout=_FUSE_STARTUP_TIMEOUT)
+            if failed_fast:
                 if startup_error:
                     raise RuntimeError(
                         f"FUSE mount failed: {startup_error[0]}"

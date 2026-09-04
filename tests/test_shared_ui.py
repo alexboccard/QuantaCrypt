@@ -1059,8 +1059,16 @@ def menus(monkeypatch):
 
 
 def _font(spec):
-    """Tk normalises a font tuple to a space-joined string in cget()."""
-    return " ".join(str(part) for part in spec)
+    """Tk's normalised form of a font tuple, as cget() returns it.
+
+    A family containing a space comes back brace-quoted ("{DejaVu Sans} 13"),
+    which macOS never shows because its family is ".AppleSystemUIFont" — so
+    four of these assertions passed locally and failed on Linux CI.
+    """
+    family, rest = str(spec[0]), [str(p) for p in spec[1:]]
+    if " " in family:
+        family = "{" + family + "}"
+    return " ".join([family] + rest)
 
 
 def _menu_labels(menu):
@@ -1109,15 +1117,24 @@ class TestBindShortcut:
         tk_root.update()
         assert calls == ["w"]
 
-    def test_also_control_false_leaves_control_free(self, tk_root):
+    def test_also_control_false_binds_only_the_platform_modifier(self, tk_root):
+        """The contract is "only MOD", not "not Control".
+
+        Where MOD *is* Control — every platform but macOS — the two are the
+        same binding, so asserting Ctrl stays free was a macOS-only claim and
+        failed on Linux CI.
+        """
         e = tk.Entry(tk_root)
         e.pack()
         calls = []
         bind_shortcut(e, "q", lambda: calls.append("q"), also_control=False)
         _focus(tk_root, e)
-        e.event_generate("<Control-q>", when="now")
-        tk_root.update()
-        assert calls == [], "Ctrl-Q must stay available to the app"
+
+        if shared.MOD != "Control":
+            e.event_generate("<Control-q>", when="now")
+            tk_root.update()
+            assert calls == [], "Ctrl-Q must stay free when it is not the modifier"
+
         e.event_generate(f"<{shared.MOD}-q>", when="now")
         tk_root.update()
         assert calls == ["q"]

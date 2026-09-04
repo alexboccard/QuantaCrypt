@@ -21,7 +21,10 @@ import struct
 import sys
 import threading
 import time
-import tomllib
+try:                       # tomllib is 3.11+; the matrix includes 3.10
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import types
 import zlib
 from types import SimpleNamespace

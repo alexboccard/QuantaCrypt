@@ -22,6 +22,8 @@ import types
 
 import pytest
 
+from quantacrypt.ui.shared import MOD as _MOD
+
 import tkinter as tk
 
 from quantacrypt.core import crypto as cc
@@ -769,7 +771,7 @@ class TestKeyboardShortcuts:
         src.write_bytes(b"data")
         monkeypatch.setattr(real_fd, "askopenfilename", lambda **kw: str(src))
         app = mkapp()
-        _press(app, "<Command-o>")
+        _press(app, f"<{_MOD}-o>")
         assert app._path == str(src)
         assert app._out.get().endswith("picked.qcx")
 
@@ -781,7 +783,7 @@ class TestKeyboardShortcuts:
         app = mkapp()
         app._src_type.set("batch")
         app.update()
-        _press(app, "<Command-o>")
+        _press(app, f"<{_MOD}-o>")
         assert app._batch_paths == [str(a), str(b)]
 
     def test_command_o_while_busy_explains_instead_of_opening(self, mkapp, monkeypatch):
@@ -790,7 +792,7 @@ class TestKeyboardShortcuts:
         app = mkapp()
         monkeypatch.setattr(app._file_card, "_pick", lambda: opened.append(1))
         app._busy = True
-        _press(app, "<Command-o>")
+        _press(app, f"<{_MOD}-o>")
         assert opened == []
         assert app._err.cget("text") == "Busy — please wait for encryption to finish"
 
@@ -802,14 +804,14 @@ class TestKeyboardShortcuts:
         src = tmp_path / "in.bin"
         src.write_bytes(b"payload" * 8)
         _fill_single(app, src, tmp_path / "out.qcx")
-        _press(app, "<Command-Return>")
+        _press(app, f"<{_MOD}-Return>")
         assert _pump_until(app, lambda: bool(started), 10)
         assert started[0]["path"] == str(src)
 
     def test_command_return_while_busy_says_so(self, mkapp):
         app = mkapp()
         app._busy = True
-        _press(app, "<Command-Return>")
+        _press(app, f"<{_MOD}-Return>")
         assert app._err.cget("text") == "Busy — please wait for encryption to finish"
 
 

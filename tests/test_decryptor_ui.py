@@ -20,6 +20,8 @@ import zipfile
 
 import pytest
 
+from quantacrypt.ui.shared import MOD as _MOD
+
 from quantacrypt.core import crypto as cc
 from quantacrypt.core import package as corepkg
 from quantacrypt.core.errors import CorruptPayload
@@ -830,8 +832,20 @@ class TestWordEntry:
 
         monkeypatch.setattr(tk.Toplevel, "wm_geometry", _record)
 
+        # Anchor the window somewhere known first. Comparing two absolute y
+        # values collapses when the window happens to sit at the top of the
+        # screen — which it does under a bare window manager, so this passed
+        # on macOS and failed on Linux CI. Asserting against the entry's own
+        # position states the actual contract and does not care where the
+        # window manager put things.
+        top = cell.winfo_toplevel()
+        top.wm_geometry("+200+200")
+        top.update_idletasks()
+        entry_top = cell.winfo_rooty()
+
         cell._v.set("aban")
         below = int(placed[-1].split("+")[2])
+        assert below >= entry_top, "with room underneath the list hangs below the entry"
         cell._close()
 
         monkeypatch.setattr(tk.Misc, "winfo_screenheight", lambda self: 1)
@@ -3944,7 +3958,7 @@ class TestShortcutsAndScrolling:
         out = tmp_path / "kout"; out.mkdir()
         app._out.delete(0, "end"); app._out.insert(0, str(out))
         app._pw.insert(0, PW)
-        _press(app, "<Command-Return>")
+        _press(app, f"<{_MOD}-Return>")
         assert _pump_until(app, lambda: not app._busy)
         assert (out / "data.bin").exists()
 
@@ -3954,7 +3968,7 @@ class TestShortcutsAndScrolling:
         picked = []
         monkeypatch.setattr(dec.filedialog, "askopenfilename",
                             lambda **kw: picked.append(1) or "")
-        _press(app, "<Command-o>")
+        _press(app, f"<{_MOD}-o>")
         _press(app, "<Control-o>")
         assert len(picked) == 2, "both Cmd-O and Ctrl-O must reach the file card"
 
@@ -3962,10 +3976,10 @@ class TestShortcutsAndScrolling:
         app, _qcx = loaded_app
         app._busy = True
         try:
-            _press(app, "<Command-Return>")
+            _press(app, f"<{_MOD}-Return>")
             assert app._err.cget("text").startswith("Busy")
             app._set_status("")
-            _press(app, "<Command-o>")
+            _press(app, f"<{_MOD}-o>")
             assert app._err.cget("text").startswith("Busy")
         finally:
             app._busy = False
