@@ -451,6 +451,32 @@ def _parse_args():
     return p.parse_args()
 
 
+#: Mach-O magics, 32/64-bit and fat, both byte orders.
+_MACHO_MAGIC = (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+                b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+                b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+
+
+def _iter_macho(root):
+    """Every Mach-O file under `root`, symlinks excluded.
+
+    Symlinks are skipped because a framework's Versions/Current/… aliases
+    would otherwise be signed twice under two names, and codesign follows the
+    link anyway.
+    """
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            path = os.path.join(dirpath, fn)
+            if os.path.islink(path):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    if f.read(4) in _MACHO_MAGIC:
+                        yield path
+            except OSError:
+                continue
+
+
 def _codesign_app_bundle(app_path, name=None):
     """Ad-hoc sign every binary inside the .app bundle, inside-out.
 
@@ -464,8 +490,6 @@ def _codesign_app_bundle(app_path, name=None):
     Order matters: sign nested binaries first, then the main executable,
     then the outer .app — otherwise the outer signature invalidates.
     """
-    import glob
-
     # TODO: Replace ad-hoc signing with Developer ID certificate for notarization.
     #   1. Read identity from CODESIGN_IDENTITY env var (fall back to "-" for ad-hoc)
     #   2. Add "--options runtime" flag (hardened runtime, required for notarization)
@@ -477,43 +501,68 @@ def _codesign_app_bundle(app_path, name=None):
     #   5. CI keychain setup: create temp keychain, import .p12, codesign, then clean up
     identity = os.environ.get("CODESIGN_IDENTITY", "-")
 
-    # 1. Sign all embedded .so, .dylib, and framework binaries
     sign_cmd = ["codesign", "--force", "--sign", identity]
     if identity != "-":
         sign_cmd += ["--options", "runtime"]
 
-    patterns = ["**/*.so", "**/*.dylib",
-                "**/*.bundle/Contents/MacOS/*",
-                "**/*.framework/Versions/*/Python",
-                "**/*.framework/Versions/*/*/*"]
-    signed = set()
-    for pat in patterns:
-        for path in glob.glob(os.path.join(app_path, pat), recursive=True):
-            if path in signed or not os.path.isfile(path):
-                continue
-            subprocess.run(
-                sign_cmd + [path],
-                capture_output=True, text=True,
-            )
-            signed.add(path)
+    # Every step below used to swallow its result: steps 1 and 2 never looked
+    # at the return code and step 3 printed "(non-fatal)" and returned, so a
+    # build that signed nothing still produced a DMG, uploaded it as a release
+    # asset and exited 0.  An .app with absent or inconsistent signatures
+    # opens as "damaged and can't be opened" rather than showing the expected
+    # unidentified-developer prompt — the exact failure this signing exists to
+    # prevent — so a signing error has to stop the build.
+    failures = []
 
-    # 2. Sign the main executable
+    def _sign(target):
+        r = subprocess.run(sign_cmd + [target], capture_output=True, text=True)
+        if r.returncode != 0:
+            failures.append(
+                (target, r.stderr.strip() or f"codesign exited {r.returncode}")
+            )
+
+    # 1. Sign every Mach-O in the bundle, identified by magic rather than by
+    #    name.  The glob list this replaces (**/*.so, **/*.dylib,
+    #    **/*.framework/Versions/*/*/* …) matched by shape, which cut both
+    #    ways: measured on dist/qc-core.app it hit 179 paths of which only 59
+    #    were code — it was signing Info.plist files and Python.framework's
+    #    own _CodeSignature/CodeResources, i.e. writing to the very resources
+    #    that framework's signature seals — while any binary whose layout had
+    #    no matching pattern would have gone unsigned, and one unsigned nested
+    #    binary is what makes the finished .app "damaged" on another machine.
     main_exe = os.path.join(app_path, "Contents", "MacOS", name or NAME)
+    targets = [p for p in _iter_macho(app_path) if p != main_exe]
+    # Deepest first, so a nested bundle's contents are signed before the
+    # bundle that seals them.
+    targets.sort(key=lambda p: p.count(os.sep), reverse=True)
+    for path in targets:
+        _sign(path)
+
+    # 2. Sign the main executable, after everything it ships with and before
+    #    the outer bundle that seals the lot.
     if os.path.isfile(main_exe):
-        subprocess.run(
-            sign_cmd + [main_exe],
-            capture_output=True, text=True,
-        )
+        _sign(main_exe)
 
     # 3. Sign the outer .app bundle
-    result = subprocess.run(
-        sign_cmd + [app_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print(f"[+] Code signing succeeded ({identity})")
-    else:
-        print(f"[!] Code signing failed (non-fatal): {result.stderr.strip()}")
+    _sign(app_path)
+
+    if failures:
+        print(f"[!] Code signing failed for {len(failures)} target(s):")
+        for target, err in failures:
+            print(f"    {target}: {err}")
+        sys.exit(1)
+
+    # 4. Verify rather than trust the exit codes: every target can sign
+    #    cleanly and the bundle still fail as a whole — a stale resource seal
+    #    in an embedded framework, a nested bundle signed in the wrong order.
+    #    This is the check Gatekeeper makes, and the native build has always
+    #    made it (_build_native); the Tk build did not.
+    v = subprocess.run(["codesign", "--verify", "--deep", "--strict", app_path],
+                       capture_output=True, text=True)
+    if v.returncode != 0:
+        print(f"[!] Signature verification failed: {v.stderr.strip()}")
+        sys.exit(1)
+    print(f"[+] Code signing succeeded and verified ({identity})")
 
 
 def _post_build(app_path, doc_icon_tmp, arch_label, *,

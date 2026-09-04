@@ -71,7 +71,13 @@ struct VolumesView: View {
             Button("Unmount now", role: .destructive) { model.unmount(volume) }
             Button("Keep mounted", role: .cancel) {}
         } message: { volume in
-            Text("\(volume.name)'s records don't match what QuantaCrypt last wrote — it may have been altered. Unmounting now keeps it untouched.")
+            // "Unmounting now keeps it untouched" was an unconditional promise
+            // about a conditional guarantee: the container is safe only until
+            // something writes, and macOS puts .DS_Store and Spotlight
+            // metadata on a fresh mount within seconds — the first save then
+            // truncates the suspicious tail for good. This matches the Tk
+            // wording, which tells the user to keep a copy first.
+            Text("\(volume.name)'s records don't match what QuantaCrypt last wrote — it may have been altered or swapped for an older copy. It was mounted using the last state that checks out.\n\nIf you didn't expect this, unmount now and keep a copy of the .qcv file before writing anything: macOS writes to a new drive within seconds, and the first write destroys the records that raised this.")
         }
     }
 
@@ -226,7 +232,9 @@ struct VolumesView: View {
                 HStack(spacing: 8) {
                     ProgressView(value: Double(strength.level.rawValue), total: 4)
                         .tint(strength.level >= .good ? .green : (strength.level == .fair ? .orange : .red))
-                        .frame(width: 120)
+                        // Not a fixed width: at accessibility text sizes the
+                        // label beside it needs the room more than the meter.
+                        .frame(minWidth: 80, idealWidth: 120)
                     Text(strength.advice ?? strength.level.label)
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -292,6 +300,10 @@ struct VolumesView: View {
                 }
                 if let error = model.mountInspectError {
                     ErrorPanel(error: error)
+                    // Without this the only way back from a failed or timed-out
+                    // inspect is to pick the same file again.
+                    Button("Try again", action: model.retryInspect)
+                        .disabled(model.mountInspecting)
                 }
                 // The auth block says how the volume is protected; the picker
                 // is only a fallback when it could not be read.

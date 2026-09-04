@@ -23,7 +23,7 @@ from quantacrypt.ui.shared import (
     styled_entry, bind_context_menu, fmt_size, rule, section_label,
     FlatButton, SegmentedControl, StagedProgressBar,
     PasswordStrengthBar, FileCard, WizardSteps, ClipboardTimer,
-    notify,
+    copy_secret, notify,
 )
 
 # Friendly stage names + relative weights.  The list shown to the user is
@@ -196,11 +196,11 @@ class ShareCard(tk.Frame):
 
     def _copy(self):
         try:
-            self.clipboard_clear()
-            self.clipboard_append(self._current())
+            # copy() marks the share concealed so clipboard managers skip it,
+            # and arms the 60-second auto-clear countdown.
+            self._clip_timer.copy(self, self._current())
             self._copy_btn.set_text(f"{ICON['ok']} Copied")
             self.after(1500, lambda: self._copy_btn.set_text("Copy") if self.winfo_exists() else None)
-            self._clip_timer.start()  # 60-second auto-clear countdown
         except Exception:
             self._copy_btn.set_text(f"{ICON['warn']} Failed")
             self.after(2000, lambda: self._copy_btn.set_text("Copy") if self.winfo_exists() else None)
@@ -1005,8 +1005,13 @@ class EncryptorApp(tk.Toplevel):
     def _validate_secret(self):
         """Shared secret checks for single and batch validation."""
         if self._mode.get() == "single":
-            if not self._pw1v.get(): return "Password cannot be empty"
-            if self._pw1v.get() != self._pw2v.get(): return "Passwords don't match"
+            pw = self._pw1v.get()
+            if not pw: return "Password cannot be empty"
+            # Match the core's floor here so the weak-password dialog cannot
+            # offer "Use it anyway" on a password the core will then refuse.
+            if len(pw) < cc.MIN_PASSWORD_LENGTH:
+                return f"Use at least {cc.MIN_PASSWORD_LENGTH} characters"
+            if pw != self._pw2v.get(): return "Passwords don't match"
             return None
         # An emptied Spinbox makes IntVar.get() raise; say so instead of
         # letting the Encrypt button turn into a silent no-op.
@@ -1112,6 +1117,28 @@ class EncryptorApp(tk.Toplevel):
             return f"Output directory is not writable: {out_dir}"
         return EncryptorApp._validate_secret(self)
 
+    def _confirm_weak_password(self) -> bool:
+        """Warn if the password is rated Weak (zxcvbn score 0 or 1).
+
+        The strength bar already scored this text on a worker thread — reuse
+        it rather than running zxcvbn again on the main thread. Returns False
+        if the user chose to pick another password.
+
+        Shared by the single-file and batch paths: this used to live after
+        _start()'s batch early-return, so encrypting forty files at once was
+        the highest-blast-radius operation in the app and the only one with
+        no warning at all.
+        """
+        if self._mode.get() != "single":
+            return True
+        if self._strength.score_for(self._pw1v.get()) >= 2:
+            return True
+        return confirm(self, "Weak password",
+                       "Your password is rated Weak and could be guessed relatively "
+                       "easily. A longer password mixing words, numbers and symbols "
+                       "is safer.\n\nContinue with this password anyway?",
+                       yes="Use it anyway", no="Choose another", danger=True)
+
     def _start(self):
         if self._busy: return
         # Starting a new encryption clears the results area — including any
@@ -1129,18 +1156,8 @@ class EncryptorApp(tk.Toplevel):
             self.after(50, lambda: self._cv.yview_moveto(1.0))  # Scroll after layout reflow
             return
         out=self._out.get().strip()
-        # Warn if password is rated Weak (zxcvbn score 0 or 1).  The strength
-        # bar already scored this text on a worker thread — reuse it rather
-        # than running zxcvbn again on the main thread.
-        if self._mode.get() == "single":
-            pw = self._pw1v.get()
-            if self._strength.score_for(pw) < 2:
-                if not confirm(self, "Weak password",
-                               "Your password is rated Weak and could be guessed relatively "
-                               "easily. A longer password mixing words, numbers and symbols "
-                               "is safer.\n\nContinue with this password anyway?",
-                               yes="Use it anyway", no="Choose another", danger=True):
-                    return
+        if not self._confirm_weak_password():
+            return
         # K=N means every shareholder must participate — unusual and worth confirming.
         if self._mode.get() == "shamir":
             k, n = self._k.get(), self._n.get()
@@ -1228,6 +1245,8 @@ class EncryptorApp(tk.Toplevel):
         if err:
             self._set_error(err)
             self.after(50, lambda: self._cv.yview_moveto(1.0))
+            return
+        if not self._confirm_weak_password():
             return
         out_dir = self._batch_out_var.get().strip()
         # Unique per-input output names (collision-suffixed), then warn
@@ -1654,12 +1673,16 @@ class EncryptorApp(tk.Toplevel):
     def _copy_all_shares(self, shares):
         """Copy all share strings to the clipboard as one share per line."""
         try:
-            self.clipboard_clear()
-            self.clipboard_append("\n".join(shares))
+            text = "\n".join(shares)
+            # A full threshold's worth of key material in one action — the
+            # concealed marker matters most here.
+            if hasattr(self, "_copy_all_timer"):
+                self._copy_all_timer.copy(self, text)
+            else:
+                copy_secret(self, text)
             self._copy_all_btn.set_text(f"{ICON['ok']} Copied")
             self.after(1500, lambda: self._copy_all_btn.set_text("Copy all")
                        if self._copy_all_btn.winfo_exists() else None)
-            if hasattr(self, "_copy_all_timer"): self._copy_all_timer.start()
         except Exception:
             self._copy_all_btn.set_text(f"{ICON['warn']} Failed")
             self.after(2000, lambda: self._copy_all_btn.set_text("Copy all")

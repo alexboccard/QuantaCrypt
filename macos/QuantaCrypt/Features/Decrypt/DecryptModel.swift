@@ -28,7 +28,7 @@ final class DecryptModel {
     var inspectError: CoreError?
 
     var password = ""
-    var shares: [String] = []
+    var shares: [ShareEntry] = []
     var outputDir: String = Paths.defaultOutputFolder ?? Paths.homeDirectory
     private var outputChosenByUser = false
 
@@ -100,7 +100,7 @@ final class DecryptModel {
                 self.info = info
                 let needed = info.threshold ?? 2
                 if info.isSplitKey, shares.count < needed {
-                    shares = Array(repeating: "", count: needed)
+                    shares = (0..<needed).map { _ in ShareEntry() }
                 } else if !info.isSplitKey {
                     shares = []
                 }
@@ -143,7 +143,7 @@ final class DecryptModel {
         guard filePath != nil else { return "Choose an encrypted file." }
         guard let info else { return inspectError == nil ? "Reading the file…" : "This file can't be read." }
         if info.isSplitKey {
-            return ShareValidation.message(shares: shares, threshold: info.threshold)
+            return ShareValidation.message(entries: shares, threshold: info.threshold)
         }
         if password.isEmpty { return "Enter the password." }
         return nil
@@ -208,6 +208,11 @@ final class DecryptModel {
         progress = nil
         self.result = result
         password = ""
+        // Shares are key material — k points on the polynomial that rebuilds
+        // the master key. The password next to them has always been cleared
+        // here; leaving the shares live in an @Observable model, rendered in
+        // plain TextFields, outlasts the operation they were typed for.
+        shares = shares.map { _ in ShareEntry() }
         recents.add(path, kind: .decrypted)
     }
 

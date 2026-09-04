@@ -21,6 +21,17 @@ struct HelperLaunch: Sendable, Equatable {
     let arguments: [String]
     /// Which resolution rule produced this launch, for the status line.
     let origin: String
+    /// The code hash this binary had when it was resolved, for a helper
+    /// outside the app bundle. Nil inside the bundle, whose payload the app's
+    /// own signature already covers.
+    let approvedCDHash: Data?
+
+    init(executable: URL, arguments: [String], origin: String, approvedCDHash: Data? = nil) {
+        self.executable = executable
+        self.arguments = arguments
+        self.origin = origin
+        self.approvedCDHash = approvedCDHash
+    }
 
     var displayPath: String { (executable.path as NSString).abbreviatingWithTildeInPath }
 }
@@ -45,6 +56,8 @@ actor ProcessTransport: CoreTransport {
         // A write to a pipe whose reader died raises SIGPIPE, which would kill
         // the app instead of surfacing an error.
         signal(SIGPIPE, SIG_IGN)
+
+        try verifyStillTheApprovedBinary()
 
         let process = Process()
         process.executableURL = launch.executable
@@ -89,6 +102,26 @@ actor ProcessTransport: CoreTransport {
                 continuation.finish(throwing: error)
             }
             continuation.onTermination = { _ in try? outHandle.close() }
+        }
+    }
+
+    /// Re-measure an out-of-bundle helper immediately before `exec`.
+    ///
+    /// `HelperLocator.resolve()` runs once per launch and the approval it
+    /// consults is per session, so between the check and `Process.run()` the
+    /// file can be replaced by anything — and everything the user types is
+    /// about to be written to whatever gets exec'd. `Process` takes a path,
+    /// not a descriptor, so this narrows the window rather than closing it;
+    /// closing it needs `fexecve`, which `Process` does not expose.
+    private func verifyStillTheApprovedBinary() throws {
+        guard let expected = launch.approvedCDHash else { return }
+        let now = HelperLocator.signatureStatus(of: launch.executable)
+        guard now.cdHash == expected else {
+            Logger.client.error("helper at \(self.launch.executable.path, privacy: .public) changed after it was approved")
+            throw CoreError(
+                code: .helperUnavailable,
+                message: "The helper at \(launch.displayPath) changed since you approved it, so QuantaCrypt did not run it. Approve it again in Settings if you made the change.",
+                detail: "code hash no longer matches the approved one")
         }
     }
 

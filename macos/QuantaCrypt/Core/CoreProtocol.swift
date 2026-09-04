@@ -277,6 +277,15 @@ struct VolumeInspectInfo: Decodable, Sendable, Equatable {
     let mode: String
     let threshold: Int?
     let total: Int?
+    /// Optional so an older helper still decodes. It was published as always
+    /// null for the shell's whole life because nothing here consumed it and
+    /// nothing there populated it — decoding it is what keeps that honest.
+    let formatVersion: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case path, size, mode, threshold, total
+        case formatVersion = "format_version"
+    }
 
     var isSplitKey: Bool { mode == "shamir" }
 

@@ -5,6 +5,9 @@ struct SettingsView: View {
     @AppStorage(HelperLocator.overrideDefaultsKey) private var helperPath = ""
     @AppStorage("defaultOutputFolder") private var outputFolder = ""
     @State private var clearedRecent = false
+    /// Bumped when the user approves a helper. Approvals live in a static
+    /// store, so nothing else would tell this view to re-resolve.
+    @State private var approvals = 0
 
     var body: some View {
         Form {
@@ -28,6 +31,22 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                         .lineLimit(2)
                         .truncationMode(.middle)
+                }
+                // Everything typed into QuantaCrypt — passwords, shares — is
+                // written to this binary's stdin. When it is not the bundled
+                // one, that has to be stated where the user cannot miss it;
+                // the grey caption that used to sit here read as reassurance.
+                if let refusal = resolution.refusal {
+                    WarningStrip(text: refusal.reason)
+                    if refusal.approvable {
+                        Button("Use \(Format.fileName(refusal.path)) anyway") {
+                            HelperLocator.approve(refusal.path)
+                            approvals += 1
+                            state.restartHelper()
+                        }
+                    }
+                } else if let launch = resolution.launch, launch.origin != "bundle" {
+                    WarningStrip(text: "QuantaCrypt is using a helper from outside its own app bundle (\(launch.origin)). Everything you type — passwords and shares — is sent to it. Clear the path above to go back to the bundled helper.")
                 }
                 Button("Restart helper") { state.restartHelper() }
                 Text("Leave the path empty to use the helper bundled with QuantaCrypt. Restart the helper after changing it.")
@@ -74,8 +93,13 @@ struct SettingsView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
+    private var resolution: HelperLocator.Resolution {
+        _ = approvals
+        return HelperLocator.resolve(override: helperPath)
+    }
+
     private var resolvedDescription: String {
-        let resolution = HelperLocator.resolve(override: helperPath)
+        let resolution = self.resolution
         if let launch = resolution.launch {
             let args = launch.arguments.isEmpty ? "" : " " + launch.arguments.joined(separator: " ")
             return "\(launch.displayPath)\(args) (\(launch.origin))"

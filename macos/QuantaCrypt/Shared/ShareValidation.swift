@@ -1,5 +1,20 @@
 import Foundation
 
+/// One share field, with an identity of its own.
+///
+/// The rows used to be a bare `[String]` rendered with
+/// `ForEach(shares.indices, id: \.self)` and `$shares[index]` — the classic
+/// SwiftUI out-of-bounds shape, because the array shrinks under the view
+/// (`ShareValidation.merge` drops blanks, "Remove last share" pops one) and a
+/// row body evaluated against the previous index set traps. A `UUID` per row
+/// means the diff is over identities, not positions.
+struct ShareEntry: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    var text: String
+
+    init(text: String = "") { self.text = text }
+}
+
 /// Client-side mirror of the core's `normalize_shares`: trims, drops blanks,
 /// checks each share is *shaped* like a QCSHARE- code or a 50-word phrase,
 /// and de-duplicates by decoded identity where that can be done locally.
@@ -37,10 +52,33 @@ enum ShareValidation {
     static func merge(_ loaded: [String], into shares: [String], threshold: Int?, total: Int?) -> [String] {
         var merged = prepared(shares)
         for share in loaded where !merged.contains(share) { merged.append(share) }
-        let needed = threshold ?? merged.count
+        // Never hand back fewer rows than the user is looking at. `prepared`
+        // drops blanks, so loading one file into four empty-ish fields used to
+        // return three rows — a field vanishing under the user's cursor, and
+        // the shrink SwiftUI's index-based diffing crashed on.
+        let needed = max(threshold ?? merged.count, shares.count)
         while merged.count < needed { merged.append("") }
         if let total, merged.count > total { merged = Array(merged.prefix(total)) }
         return merged
+    }
+
+    /// The same merge over identified rows: a row whose text survives keeps
+    /// its identity, so what the user is typing into does not jump.
+    static func merge(_ loaded: [String], into entries: [ShareEntry], threshold: Int?, total: Int?) -> [ShareEntry] {
+        let merged = merge(loaded, into: entries.map(\.text), threshold: threshold, total: total)
+        var reusable = entries
+        return merged.map { text in
+            if let index = reusable.firstIndex(where: { $0.text == text }) {
+                return reusable.remove(at: index)
+            }
+            return ShareEntry(text: text)
+        }
+    }
+
+    static func prepared(_ entries: [ShareEntry]) -> [String] { prepared(entries.map(\.text)) }
+
+    static func message(entries: [ShareEntry], threshold: Int?) -> String? {
+        message(shares: entries.map(\.text), threshold: threshold)
     }
 
     /// Why `share` cannot be a share, or nil when it looks like one.

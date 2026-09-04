@@ -235,6 +235,61 @@ final class CoreClientTests: XCTestCase {
         XCTAssertTrue(oldTerminated)
     }
 
+    // MARK: withTimeout bounds the clock, not just the error (F-018)
+
+    func testWithTimeoutReturnsOnTheDeadlineEvenWhenTheBodyIgnoresCancellation() async {
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            _ = try await withTimeout(.milliseconds(100)) { await uncancellable(after: 3) }
+            XCTFail("expected the deadline to fire")
+        } catch is TimeoutError {
+        } catch {
+            XCTFail("wrong error \(error)")
+        }
+        // The task-group version waited for the abandoned body and returned
+        // three seconds late; this is the guarantee its callers document.
+        XCTAssertLessThan(start.duration(to: clock.now), .seconds(1))
+    }
+
+    func testWithTimeoutStillReturnsTheValueAndPropagatesErrors() async throws {
+        let value = try await withTimeout(.seconds(5)) { 42 }
+        XCTAssertEqual(value, 42)
+        do {
+            _ = try await withTimeout(.seconds(5)) { () -> Int in
+                throw CoreError(code: .io, message: "boom", detail: "")
+            }
+            XCTFail("expected the body's own error")
+        } catch let error as CoreError {
+            XCTAssertEqual(error.code, .io)
+        }
+    }
+
+    func testAWedgedHelperIsNotGivenTheFullEofGraceOnTopOfTheTimeout() async throws {
+        let holder = Holder()
+        let client = CoreClient(transportFactory: { holder.make() }, cancelGrace: .milliseconds(50),
+                                shutdownTimeout: .milliseconds(100))
+        try await client.start()
+        let transport = await waitForTransport(holder)
+        // No answer to `shutdown`, ever.
+        _ = await client.shutdown()
+        let waited = await transport.terminateTimeout
+        XCTAssertEqual(waited, .seconds(1), "a helper that ignored shutdown has already had its chance")
+    }
+
+    func testAHelperThatAnsweredShutdownKeepsTheFullEofGrace() async throws {
+        let (client, holder) = makeClient()
+        try await client.start()
+        let transport = await waitForTransport(holder)
+        let shutdownTask = Task { await client.shutdown() }
+        await transport.waitForRequests(1)
+        let req = await transport.request(0)
+        await transport.emit(["id": req.id!, "event": "done", "result": [:]])
+        _ = await shutdownTask.value
+        let waited = await transport.terminateTimeout
+        XCTAssertEqual(waited, .seconds(10))
+    }
+
     func testTransportFactoryFailureSurfacesAsCoreError() async {
         let client = CoreClient {
             throw CoreError(code: .helperUnavailable, message: "missing", detail: "searched")
@@ -263,4 +318,14 @@ private final class ProgressSink: @unchecked Sendable {
     private var items: [CoreProgress] = []
     func append(_ p: CoreProgress) { lock.lock(); items.append(p); lock.unlock() }
     var labels: [String] { lock.lock(); defer { lock.unlock() }; return items.map(\.label) }
+}
+
+/// A body that cannot be cancelled — the shape `CoreClient.perform` takes while
+/// it waits out `cancelGrace` for the helper's own `cancelled` event.
+private func uncancellable(after seconds: Double) async -> Int {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+            continuation.resume(returning: 1)
+        }
+    }
 }

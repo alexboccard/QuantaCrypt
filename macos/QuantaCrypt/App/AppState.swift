@@ -65,14 +65,29 @@ final class AppState {
         }
     }
 
+    static let versionTimeout: Duration = .seconds(20)
+    static let versionTimedOut = CoreError(
+        code: .helperUnavailable,
+        message: "The encryption helper didn't answer. Try again — if it keeps happening, set its location in Settings or reinstall QuantaCrypt.",
+        detail: "version handshake timed out after 20s")
+
     func refreshHelperStatus() async {
         helperStatus = .starting
+        let core = self.core
         do {
-            let info: VersionInfo = try await core.perform(.version)
+            // This is the first thing the app does, and the status item only
+            // offers "Try again" once the status is `.failed` — so a helper
+            // that launches and never answers used to leave the window on
+            // "Starting…" forever, with no way out.
+            let info: VersionInfo = try await withTimeout(Self.versionTimeout) {
+                try await core.perform(.version)
+            }
             helperStatus = .ready(info)
             Logger.client.info("helper ready: qc-core \(info.version, privacy: .public)")
         } catch let error as CoreError {
             helperStatus = .failed(error)
+        } catch is TimeoutError {
+            helperStatus = .failed(Self.versionTimedOut)
         } catch {
             helperStatus = .failed(CoreError(code: .helperUnavailable, message: error.localizedDescription, detail: ""))
         }

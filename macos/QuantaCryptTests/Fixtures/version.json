@@ -1,0 +1,10 @@
+{
+  "event": "done",
+  "id": "v",
+  "result": {
+    "format_version": 1,
+    "platform": "fixture",
+    "python": "0.0.0",
+    "version": "0.0.0-fixture"
+  }
+}

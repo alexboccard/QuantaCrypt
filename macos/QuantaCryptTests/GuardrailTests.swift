@@ -80,7 +80,7 @@ final class GuardrailTests: XCTestCase {
         let state = AppState(core: CoreClient(transportFactory: { FakeTransport() }),
                              recents: RecentStore(defaults: Self.scratchDefaults()))
         let decrypt = state.decrypt
-        decrypt.shares = ["QCSHARE-one", "QCSHARE-two"]
+        decrypt.shares = [ShareEntry(text: "QCSHARE-one"), ShareEntry(text: "QCSHARE-two")]
         decrypt.password = "hunter2"
         XCTAssertTrue(decrypt.load(path: "/tmp/other.qcx"))
         XCTAssertEqual(decrypt.shares, [], "one file's shares must not stand in for another's")

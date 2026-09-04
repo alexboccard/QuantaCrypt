@@ -28,8 +28,14 @@ dependencies = [
     # 44.0 covers both.
     "cryptography>=44.0",
     "argon2-cffi>=23.1",
-    "kyber-py>=0.8",
-    "shamirs>=1.0",
+    # Pinned to the major the code binds to, not the oldest that resolves.
+    # kyber_encaps unpacks `Kyber768.encaps(pk)` as (shared_secret, ct); a
+    # resolver landing on an older major with the opposite order would write
+    # the shared secret into public metadata as kyber_kem_ct and produce a
+    # file that looks entirely normal. CI is immune (--require-hashes), but
+    # `pip install -e ".[dev]"` resolves fresh.
+    "kyber-py>=1.0,<2",
+    "shamirs>=4.0,<5",
     "mnemonic>=0.21",
 ]
 
@@ -50,7 +56,23 @@ dev = [
     "pytest>=8.3.4",
     "pip-audit>=2.7",
     "pytest-cov>=4.0",
+    # -n auto is the only lever left once the KDF cost is out of the way:
+    # the suite is ~2,200 mostly-independent tests, each in its own tmp_path.
+    # Passed on the command line, never in addopts, so a single-test run
+    # stays serial and debuggable.
+    "pytest-xdist>=3.6",
+    # Thread method, not SIGALRM: this suite installs and tests its own
+    # SIGTERM/SIGINT handlers, and the signal-based timeout would fight them.
+    "pytest-timeout>=2.3",
+    # Shuffles test order to surface order-dependence and shared-global-state
+    # leaks — the root cause of "passes alone, fails in the suite". Reproduce
+    # a bad order from the seed it prints: -p randomly --randomly-seed=<n>.
+    "pytest-randomly>=3.15",
     "pygments>=2.15",
+    # The lockfile check in CI resolves with the same uv as `uv lock` does
+    # locally, and comes from the hash-pinned lock like every other tool
+    # rather than whatever `pip install uv` serves that day.
+    "uv>=0.5",
     # volumes (fusepy) must be in dev so CI's `pip install .[dev]` has it:
     # the release build imports it into the bundle, and the test suite
     # asserts the fuse.Operations subclass contract.
@@ -73,10 +95,19 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "real_argon2: run with the shipped Argon2id parameters instead of the cheap test ones",
+    "gui: drives real Tk widgets — must run serially (the window server is shared state)",
+    "needs_real_window: needs a focusable window, so test-window hiding is suspended for it",
+]
 addopts = "--cov=quantacrypt.core --cov-report=term-missing --cov-report=html:htmlcov"
 
 [tool.coverage.run]
-source = ["src/quantacrypt/core"]
+# The whole package, not core/ alone: scoping the measurement to core/ meant
+# the aggregate could read 95% while ui/volume_manager.py sat at 11% and
+# __main__.py at 0%, because unmeasured files simply do not appear in the
+# report.  scripts/check_coverage.py enforces the floor per file.
+source = ["src/quantacrypt"]
 
 [tool.coverage.report]
 exclude_lines = [

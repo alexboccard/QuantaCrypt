@@ -1,11 +1,20 @@
+import AppKit
 import XCTest
 @testable import QuantaCrypt
 
 final class ShareFilesTests: XCTestCase {
+    /// A structurally real code: base64 of the JSON `crypto.encode_share`
+    /// emits. `ShareFiles.parse` drops anything that does not decode, so a
+    /// made-up `QCSHARE-AAAA` is no longer a stand-in for a share.
+    static func code(_ index: Int) -> String {
+        "QCSHARE-" + Data(#"{"index": \#(index), "value": 4242\#(index), "modulus": 6789, "threshold": 2}"#.utf8)
+            .base64EncodedString()
+    }
+
     private let shares = [
-        Share(index: 1, code: "QCSHARE-AAAA", mnemonic: Array(repeating: "apple", count: 50).joined(separator: " ")),
-        Share(index: 2, code: "QCSHARE-BBBB", mnemonic: nil),
-        Share(index: 3, code: "QCSHARE-CCCC", mnemonic: nil),
+        Share(index: 1, code: ShareFilesTests.code(1), mnemonic: Array(repeating: "apple", count: 50).joined(separator: " ")),
+        Share(index: 2, code: ShareFilesTests.code(2), mnemonic: nil),
+        Share(index: 3, code: ShareFilesTests.code(3), mnemonic: nil),
     ]
     private let context = ShareFiles.Context(stem: "report.pdf", protectedName: "report.pdf.qcx", k: 2, n: 3, kind: .qcxFile)
     private let volumeContext = ShareFiles.Context(stem: "Vault", protectedName: "Vault.qcv", k: 2, n: 3, kind: .qcvVolume)
@@ -29,11 +38,11 @@ final class ShareFilesTests: XCTestCase {
             XCTAssertEqual(perms, 0o600)
         }
         let text = try String(contentsOf: outcome.files[0], encoding: .utf8)
-        XCTAssertTrue(text.contains("QCSHARE-AAAA"))
+        XCTAssertTrue(text.contains(Self.code(1)))
         XCTAssertTrue(text.contains("Any 2 of 3 shares"))
         XCTAssertTrue(text.contains("Encrypted file:"))
         XCTAssertTrue(text.contains("choose Decrypt"))
-        XCTAssertEqual(ShareFiles.parse(text), ["QCSHARE-AAAA"])
+        XCTAssertEqual(ShareFiles.parse(text), [Self.code(1)])
     }
 
     func testIndividualFilesNeverOverwriteAnEarlierRun() throws {
@@ -46,13 +55,13 @@ final class ShareFilesTests: XCTestCase {
         // Only one of the three names is taken: the whole second run must move.
         try FileManager.default.removeItem(at: first.files[0])
         try FileManager.default.removeItem(at: first.files[2])
-        let newShares = shares.map { Share(index: $0.index, code: "QCSHARE-NEW\($0.index)", mnemonic: nil) }
+        let newShares = shares.map { Share(index: $0.index, code: Self.code($0.index + 10), mnemonic: nil) }
         let second = try ShareFiles.writeIndividual(newShares, context: context, into: dir)
         XCTAssertEqual(second.renamedStem, "report.pdf_2")
         XCTAssertEqual(second.files.map(\.lastPathComponent),
                        ["report.pdf_2.share-1-of-3.txt", "report.pdf_2.share-2-of-3.txt", "report.pdf_2.share-3-of-3.txt"])
         XCTAssertEqual(try String(contentsOf: first.files[1], encoding: .utf8), firstText, "earlier run untouched")
-        XCTAssertTrue(try String(contentsOf: second.files[0], encoding: .utf8).contains("QCSHARE-NEW1"))
+        XCTAssertTrue(try String(contentsOf: second.files[0], encoding: .utf8).contains(Self.code(11)))
         // No stray file from the aborted first attempt of the second run.
         XCTAssertFalse(FileManager.default.fileExists(atPath: first.files[0].path))
 
@@ -71,7 +80,7 @@ final class ShareFilesTests: XCTestCase {
         let perms = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int
         XCTAssertEqual(perms, 0o600)
         let text = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertEqual(ShareFiles.parse(text), ["QCSHARE-AAAA", "QCSHARE-BBBB", "QCSHARE-CCCC"])
+        XCTAssertEqual(ShareFiles.parse(text), [Self.code(1), Self.code(2), Self.code(3)])
     }
 
     func testCombinedFileNeverOverwrites() throws {
@@ -99,13 +108,13 @@ final class ShareFilesTests: XCTestCase {
         XCTAssertTrue(text.contains("Click Mount volume"))
         XCTAssertFalse(text.contains("choose Decrypt"))
         XCTAssertFalse(text.contains("Click Decrypt file"))
-        XCTAssertEqual(ShareFiles.parse(text), ["QCSHARE-AAAA"])
+        XCTAssertEqual(ShareFiles.parse(text), [Self.code(1)])
 
         let combined = ShareFiles.combinedText(shares, context: volumeContext)
         XCTAssertTrue(combined.contains("Volume:    Vault.qcv"))
         XCTAssertTrue(combined.contains("Volumes"))
         XCTAssertFalse(combined.contains("Decrypt"))
-        XCTAssertEqual(ShareFiles.parse(combined), ["QCSHARE-AAAA", "QCSHARE-BBBB", "QCSHARE-CCCC"])
+        XCTAssertEqual(ShareFiles.parse(combined), [Self.code(1), Self.code(2), Self.code(3)])
     }
 
     func testSavedNoteMentionsRename() {
@@ -124,6 +133,181 @@ final class ShareFilesTests: XCTestCase {
         let parsed = ShareFiles.parse(text)
         XCTAssertEqual(parsed.count, 1)
         XCTAssertEqual(parsed.first?.split(separator: " ").count, 50)
+    }
+
+    // MARK: Wrapped, capitalised and mixed files (F-007)
+
+    /// 50 words wrapped at 7 per line, under a header line that is itself made
+    /// of plain words. The old parser flushed the moment the buffer reached
+    /// 50 and appended only on an exact 50, so the header's words pushed the
+    /// count past it and the whole phrase was discarded with no message.
+    func testWrappedMnemonicUnderAWordyHeaderParses() {
+        let words = Array(repeating: "apple", count: 50)
+        let wrapped = stride(from: 0, to: 50, by: 7).map {
+            words[$0..<min($0 + 7, 50)].joined(separator: " ")
+        }.joined(separator: "\n")
+        let text = "keep this file secret\n" + wrapped + "\n"
+        let parsed = ShareFiles.parse(text)
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.split(separator: " ").count, 50)
+        XCTAssertEqual(parsed.first, words.joined(separator: " "))
+    }
+
+    /// Retyped from paper with a capital at the start of the sentence. The
+    /// core lower-cases before testing each word; this used to reject the line
+    /// outright.
+    func testCapitalisedMnemonicParses() {
+        var words = Array(repeating: "apple", count: 50)
+        words[0] = "Apple"
+        let text = "Share 1 of 3\n" + words.joined(separator: " ") + "\n"
+        let parsed = ShareFiles.parse(text)
+        XCTAssertEqual(parsed, [Array(repeating: "apple", count: 50).joined(separator: " ")])
+    }
+
+    /// Codes and phrases are no longer mutually exclusive: a file holding two
+    /// generated shares plus a third one retyped as words yields all three.
+    /// The two mnemonics that came with the codes are not repeated — nothing
+    /// here can decode a phrase, so an unpaired-code count stands in for the
+    /// core's decode-and-de-duplicate.
+    func testCodesAndAnExtraPhraseAreBothReturned() {
+        let phrase = Array(repeating: "apple", count: 50).joined(separator: " ")
+        let other = Array(repeating: "cabin", count: 50).joined(separator: " ")
+        let text = """
+        QuantaCrypt Key Shares
+
+        Share 1 — QCSHARE- code:
+        \(Self.code(1))
+
+        Share 1 — 50-word mnemonic:
+        \(phrase)
+
+        Share 2 — QCSHARE- code:
+        \(Self.code(2))
+
+        Share 2 — 50-word mnemonic:
+        \(phrase)
+
+        Share 3 (typed from the paper backup):
+        \(other)
+        """
+        XCTAssertEqual(ShareFiles.parse(text), [Self.code(1), Self.code(2), other])
+    }
+
+    // MARK: Wrapped codes must not eat the mnemonic (F-001)
+
+    /// A combined file mailed through something that hard-wraps long lines.
+    /// Each code is cut in two; only the first half still starts with
+    /// `QCSHARE-`. The mnemonic printed under each code is intact and is the
+    /// whole reason it is printed — so it, not the fragment, is what loads.
+    func testAWrappedCodeIsDroppedAndItsMnemonicSurvives() {
+        let first = Array(repeating: "apple", count: 50).joined(separator: " ")
+        let second = Array(repeating: "cabin", count: 50).joined(separator: " ")
+        func wrapped(_ index: Int) -> String {
+            let code = Self.code(index)
+            let cut = code.index(code.startIndex, offsetBy: 28)
+            return String(code[..<cut]) + "\n" + String(code[cut...])
+        }
+        let text = """
+        QuantaCrypt Key Shares
+
+        Share 1 — QCSHARE- code:
+        \(wrapped(1))
+
+        Share 1 — 50-word mnemonic:
+        \(first)
+
+        Share 2 — QCSHARE- code:
+        \(wrapped(2))
+
+        Share 2 — 50-word mnemonic:
+        \(second)
+        """
+        let result = ShareFiles.parsed(text)
+        XCTAssertEqual(result.shares, [first, second],
+                       "the fragment is not a share, and it must not consume the phrase below it")
+        XCTAssertEqual(result.damagedCodes, 2)
+    }
+
+    /// The same file with the codes intact: the mnemonics are still the
+    /// paired copies and are still dropped, so the pairing counter has not
+    /// simply been switched off.
+    func testIntactCodesStillPairWithTheirMnemonics() {
+        let phrase = Array(repeating: "apple", count: 50).joined(separator: " ")
+        let text = """
+        Share 1 — QCSHARE- code:
+        \(Self.code(1))
+
+        Share 1 — 50-word mnemonic:
+        \(phrase)
+        """
+        XCTAssertEqual(ShareFiles.parsed(text), ShareFiles.Parsed(shares: [Self.code(1)], damagedCodes: 0))
+    }
+
+    func testLoadNamesTheFileWhoseCodeIsDamaged() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let phrase = Array(repeating: "apple", count: 50).joined(separator: " ")
+        let url = dir.appending(path: "share-1.txt")
+        try Data("QCSHARE-truncated\n\n\(phrase)\n".utf8).write(to: url)
+
+        let (loaded, problems) = ShareFiles.load([url])
+        XCTAssertEqual(loaded, [phrase], "a recoverable file must still load")
+        XCTAssertEqual(problems.count, 1)
+        let problem = try XCTUnwrap(problems.first)
+        XCTAssertTrue(problem.contains("share-1.txt"))
+        XCTAssertTrue(problem.contains("cut short or wrapped"))
+        XCTAssertTrue(problem.contains("One usable share was loaded"))
+    }
+
+    func testAFileOfNothingButDamagedCodesSaysSo() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appending(path: "broken.txt")
+        try Data("QCSHARE-one\nQCSHARE-two\n".utf8).write(to: url)
+
+        let (loaded, problems) = ShareFiles.load([url])
+        XCTAssertEqual(loaded, [], "an undecodable fragment must not fill a share field")
+        XCTAssertEqual(problems.first, "broken.txt holds 2 QCSHARE- codes that are cut short or wrapped. "
+                       + "Nothing in it could be used — copy the code again as one unbroken line.")
+    }
+
+    // MARK: Pasteboard (F-017)
+
+    @MainActor
+    func testCopiedSecretsAreMarkedConcealed() throws {
+        // A private pasteboard: the test must not clobber what the user copied.
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuantaCryptTests-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        Clipboard.copy("QCSHARE-SECRET", to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .string), "QCSHARE-SECRET")
+        let item = try XCTUnwrap(pasteboard.pasteboardItems?.first)
+        XCTAssertTrue(item.types.contains(Clipboard.concealedType),
+                      "clipboard managers keep everything that isn't marked concealed")
+
+        // Non-secret copies stay ordinary, so managers can still record them.
+        Clipboard.copy(VolumesModel.brewCommand, expiring: false, to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .string), VolumesModel.brewCommand)
+        XCTAssertFalse(pasteboard.pasteboardItems?.first?.types.contains(Clipboard.concealedType) ?? true)
+    }
+
+    /// ⌘C on a selectable `Text` goes through AppKit, not through
+    /// `Clipboard.copy`: plain `public.utf8-plain-text`, no `ConcealedType`
+    /// marker, no 60-second clear — and the sheet's own body text promises
+    /// the user otherwise. A SwiftUI modifier is not observable from a unit
+    /// test, so this reads the source: the invariant is one line long and one
+    /// line is all it takes to put back.
+    func testTheSharesSheetDoesNotOfferSystemCopyOnASecret() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "QuantaCrypt/Shared/SharesSheet.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+        XCTAssertFalse(text.contains(".textSelection("), """
+            SharesSheet renders the share code and its mnemonic. Selectable text there is \
+            copied by AppKit without the concealed-pasteboard marker or the clear timer, so \
+            the share lands in whatever clipboard-history database is running and stays there. \
+            The per-share Copy buttons go through Clipboard.copy; use those.
+            """)
     }
 
     func testPasswordStrengthOrdering() {

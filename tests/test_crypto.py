@@ -313,7 +313,7 @@ class TestMnemonic:
 # 5. High-level encrypt/decrypt (streaming)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_qcx(tmp_path, data, password="pw", filename="test.bin", n=None, k=None):
+def _make_qcx(tmp_path, data, password="pw-testpad", filename="test.bin", n=None, k=None):
     """Write a .qcx and return (path, meta, shares, final_key)."""
     import json, base64 as _b64
     src = tmp_path / "src.bin"; src.write_bytes(data)

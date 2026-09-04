@@ -235,7 +235,17 @@ enum ShareFiles {
         var problems: [String] = []
         for url in urls {
             do {
-                for share in parse(try read(url)) where !shares.contains(share) { shares.append(share) }
+                let result = parsed(try read(url))
+                for share in result.shares where !shares.contains(share) { shares.append(share) }
+                // A damaged code is the normal shape of a wrapped or truncated
+                // paste, and it is dropped rather than handed back as a share.
+                // Say so: the user who pasted it into an email is the only one
+                // who can go and fetch an intact copy.
+                if result.damagedCodes > 0 {
+                    problems.append(damagedCodeMessage(name: url.lastPathComponent,
+                                                       count: result.damagedCodes,
+                                                       recovered: result.shares.count))
+                }
             } catch let error as LoadError {
                 problems.append(error.message)
             } catch {
@@ -245,41 +255,109 @@ enum ShareFiles {
         return (shares, problems)
     }
 
+    static func damagedCodeMessage(name: String, count: Int, recovered: Int) -> String {
+        let codes = count == 1 ? "a QCSHARE- code that is cut short or wrapped"
+                               : "\(count) QCSHARE- codes that are cut short or wrapped"
+        let tail = switch recovered {
+        case 0: "Nothing in it could be used — copy the code again as one unbroken line."
+        case 1: "One usable share was loaded from the rest of the file."
+        default: "\(recovered) usable shares were loaded from the rest of the file."
+        }
+        return "\(name) holds \(codes). \(tail)"
+    }
+
+    /// Number of BIP-39 words in one share's mnemonic; the core's
+    /// `MNEMONIC_WORDS_PER_SHARE`.
+    static let phraseWordCount = 50
+
     /// Extract every share (code or 50-word phrase) from a text file's
-    /// contents. Codes win when present; phrases are the fallback so a file
-    /// containing only the mnemonic still loads.
-    static func parse(_ contents: String) -> [String] {
+    /// contents.
+    ///
+    /// Codes are taken as written. Phrases are gathered from runs of plain
+    /// words, sliding the window like `package.extract_share_codes` does, so a
+    /// mnemonic re-wrapped at 7, 8 or 12 words per line still loads — the old
+    /// exact-50 test threw those away silently, and this is the paper-backup
+    /// recovery path. Case is not evidence either: a word is lower-cased
+    /// before it is tested, as the core does.
+    ///
+    /// One deliberate divergence from the core: a phrase is dropped when a
+    /// code earlier in the file has not yet been paired with one. Every file
+    /// QuantaCrypt writes carries each share as a code *and* its mnemonic, and
+    /// unlike the core — which owns the wordlist, converts phrases to codes
+    /// and de-duplicates — nothing here can tell that the two name the same
+    /// share. Emitting both would fill two fields with one share and push a
+    /// real one past `total`. Extra phrases beyond the codes are unpaired, so
+    /// they are returned: a file mixing codes with a retyped phrase works.
+    ///
+    /// Only a code that *decodes* counts, though. A share code is one ~496
+    /// character line and every transport that wraps — mail, chat, a diff, an
+    /// editor with wrap-on-save — cuts it in two; the fragment still starts
+    /// with `QCSHARE-`. Trusting the prefix alone made the fragment stand in
+    /// for the share and swallow the intact mnemonic printed underneath it,
+    /// which is the one form of the share a damaged file is meant to survive
+    /// on. The core skips whatever `decode_share` refuses for the same
+    /// reason; `codeIdentity` is that check, minus the modulus.
+    static func parse(_ contents: String) -> [String] { parsed(contents).shares }
+
+    /// What one file yielded: the usable shares, and how many `QCSHARE-`
+    /// lines had to be thrown away so the caller can say so.
+    struct Parsed: Equatable, Sendable {
+        var shares: [String] = []
+        var damagedCodes = 0
+    }
+
+    static func parsed(_ contents: String) -> Parsed {
         let lines = contents.components(separatedBy: .newlines).map {
             $0.trimmingCharacters(in: .whitespaces)
         }
-        let codes = lines.filter { $0.uppercased().hasPrefix("QCSHARE-") }
-        if !codes.isEmpty { return codes }
-
-        // Mnemonic: 50 lowercase words, possibly wrapped across lines.
+        var codes: [String] = []
         var phrases: [String] = []
         var buffer: [String] = []
+        var damagedCodes = 0
+        /// Codes seen so far minus phrases already attributed to one.
+        var unpairedCodes = 0
+
         func flush() {
-            if buffer.count == 50 { phrases.append(buffer.joined(separator: " ")) }
-            buffer.removeAll()
+            defer { buffer.removeAll() }
+            guard buffer.count == phraseWordCount else { return }
+            if unpairedCodes > 0 {
+                unpairedCodes -= 1
+                return
+            }
+            phrases.append(buffer.joined(separator: " "))
         }
+
         for line in lines {
-            let words = line.split(separator: " ").map(String.init)
+            if line.uppercased().hasPrefix("QCSHARE-") {
+                flush()
+                guard ShareValidation.codeIdentity(line) != nil else {
+                    damagedCodes += 1
+                    continue
+                }
+                codes.append(line)
+                unpairedCodes += 1
+                continue
+            }
+            let words = line.split(separator: " ").map { String($0).lowercased() }
             let isWordLine = !words.isEmpty && words.allSatisfy { w in
                 w.count >= 3 && w.unicodeScalars.allSatisfy { CharacterSet.lowercaseLetters.contains($0) }
             }
             if isWordLine {
                 buffer.append(contentsOf: words)
-                if buffer.count >= 50 { flush() }
+                // Slide rather than drop: a wrapped mnemonic overshoots 50
+                // mid-line, and the last 50 words are the share.
+                if buffer.count > phraseWordCount { buffer.removeFirst(buffer.count - phraseWordCount) }
             } else {
                 flush()
             }
         }
         flush()
-        if phrases.isEmpty {
-            let all = contents.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-            if all.count == 50 { phrases.append(all.joined(separator: " ")) }
+
+        if codes.isEmpty && phrases.isEmpty {
+            let all = contents.split(whereSeparator: { $0.isWhitespace }).map { String($0).lowercased() }
+            if all.count == phraseWordCount { phrases.append(all.joined(separator: " ")) }
         }
-        return phrases
+        return Parsed(shares: codes + phrases, damagedCodes: damagedCodes)
     }
 
     // MARK: Exclusive creation

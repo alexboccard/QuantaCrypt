@@ -261,16 +261,16 @@ def test_password_round_trip_with_progress(h, src_file, out_dir, tmp_path):
 
 def test_wrong_password_and_verify_only(h, src_file, tmp_path):
     out = str(tmp_path / "n.qcx")
-    h.send("encrypt", {"source": src_file, "output": out, "mode": "single", "password": "pw"}, rid="e")
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "single", "password": "pw-testpad"}, rid="e")
     h.result("e")
-    h.send("decrypt", {"path": out, "output_dir": str(tmp_path), "password": "nope"}, rid="bad")
+    h.send("decrypt", {"path": out, "output_dir": str(tmp_path), "password": "nope-testpad"}, rid="bad")
     err = h.error("bad")
     assert err["code"] == "wrong_credentials"
     assert "incorrect" in err["message"]
     assert not [f for f in os.listdir(tmp_path) if f.startswith(".qc-decrypt-")]
-    h.send("decrypt", {"path": out, "password": "pw", "verify_only": True}, rid="v")
+    h.send("decrypt", {"path": out, "password": "pw-testpad", "verify_only": True}, rid="v")
     assert h.result("v") == {"verified": True, "mode": "single"}
-    h.send("decrypt", {"path": out, "password": "nope", "verify_only": True}, rid="v2")
+    h.send("decrypt", {"path": out, "password": "nope-testpad", "verify_only": True}, rid="v2")
     assert h.error("v2")["code"] == "wrong_credentials"
 
 
@@ -311,27 +311,29 @@ def test_folder_round_trip_and_guards(h, tmp_path, out_dir):
     (folder / "a.txt").write_text("alpha")
     (folder / "sub" / "b.txt").write_text("beta")
     out = str(tmp_path / "docs.qcx")
-    h.send("encrypt", {"source": str(folder), "output": out, "mode": "password", "password": "p"}, rid="e")
+    h.send("encrypt", {"source": str(folder), "output": out, "mode": "password", "password": "p-testpad"}, rid="e")
     res = h.result("e")
     assert res["filename"] == "docs.zip"
     assert not [f for f in os.listdir(tmp_path) if "qc-staging" in f]
     assert any(e["stage"] == "compress" for e in h.events("e") if e["event"] == "progress")
 
-    h.send("decrypt", {"path": out, "output_dir": out_dir, "password": "p"}, rid="d")
+    h.send("decrypt", {"path": out, "output_dir": out_dir, "password": "p-testpad"}, rid="d")
     zpath = h.result("d")["output"]
     import zipfile
     with zipfile.ZipFile(zpath) as zf:
-        assert sorted(zf.namelist()) == ["docs/a.txt", "docs/sub/b.txt"]
+        # Directory entries are written so empty folders survive the trip.
+        assert sorted(zf.namelist()) == [
+            "docs/", "docs/a.txt", "docs/sub/", "docs/sub/b.txt"]
 
     # output inside the source folder is refused
     h.send("encrypt", {"source": str(folder), "output": str(folder / "x.qcx"),
-                       "mode": "password", "password": "p"}, rid="bad")
+                       "mode": "password", "password": "p-testpad"}, rid="bad")
     assert "inside" in h.error("bad")["message"]
 
 
 def test_encrypt_param_validation_and_missing_source(h, src_file, tmp_path):
     out = str(tmp_path / "x.qcx")
-    h.send("encrypt", {"source": src_file, "output": out, "mode": "weird", "password": "p"}, rid="m")
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "weird", "password": "p-testpad"}, rid="m")
     assert "Unknown mode" in h.error("m")["message"]
     h.send("encrypt", {"source": src_file, "output": out, "mode": "password"}, rid="np")
     assert h.error("np")["code"] == "invalid_request"  # client omitted a required param
@@ -342,7 +344,7 @@ def test_encrypt_param_validation_and_missing_source(h, src_file, tmp_path):
     h.send("encrypt", {"source": src_file, "output": out, "mode": "password", "password": ["x"]}, rid="pt")
     assert h.error("pt")["code"] == "invalid_request"
     h.send("encrypt", {"source": str(tmp_path / "missing"), "output": out,
-                       "mode": "password", "password": "p"}, rid="nf")
+                       "mode": "password", "password": "p-testpad"}, rid="nf")
     assert h.error("nf")["code"] == "not_found"
     assert not os.path.exists(out) and not os.path.exists(out + ".tmp")
 
@@ -351,7 +353,7 @@ def test_encrypt_cancel_leaves_no_tmp(h, tmp_path):
     big = tmp_path / "big.bin"
     big.write_bytes(secrets.token_bytes(6 * 1024 * 1024))
     out = str(tmp_path / "big.qcx")
-    h.send("encrypt", {"source": str(big), "output": out, "mode": "password", "password": "p"}, rid="e")
+    h.send("encrypt", {"source": str(big), "output": out, "mode": "password", "password": "p-testpad"}, rid="e")
     h.send("cancel", {"target": "e"}, rid="c")
     ev = h.final("e")
     assert ev["event"] == "error" and ev["code"] == "cancelled"
@@ -362,13 +364,13 @@ def test_embed_binary_and_decrypt_to_bad_dir(h, src_file, tmp_path):
     fake_bin = tmp_path / "decryptor.bin"
     fake_bin.write_bytes(b"#!/bin/sh\necho hi\n" + secrets.token_bytes(2048))
     out = str(tmp_path / "e.qcx")
-    h.send("encrypt", {"source": src_file, "output": out, "mode": "password", "password": "p",
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "password", "password": "p-testpad",
                        "embed_binary": str(fake_bin)}, rid="e")
     h.result("e")
     assert os.stat(out).st_mode & 0o100
     h.send("inspect", {"path": out}, rid="i")
     assert h.result("i")["embedded"] is True
-    h.send("decrypt", {"path": out, "output_dir": str(tmp_path / "nope"), "password": "p"}, rid="d")
+    h.send("decrypt", {"path": out, "output_dir": str(tmp_path / "nope"), "password": "p-testpad"}, rid="d")
     err = h.error("d")
     assert err["code"] == "invalid_input" and "doesn't exist" in err["message"]
 
@@ -389,19 +391,19 @@ def test_safe_output_name_and_batch_paths(tmp_path):
 
 def test_derive_final_key_requires_password(src_file, tmp_path):
     out = str(tmp_path / "k.qcx")
-    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad")
     meta = pkg.load_pkg(out)["meta"]
     with pytest.raises(ValueError, match="password"):
         pkg.derive_final_key(meta)
     with pytest.raises(cc.CancelledOperation):
-        pkg.derive_final_key(meta, password="p", cancel_check=lambda: True)
+        pkg.derive_final_key(meta, password="p-testpad", cancel_check=lambda: True)
 
 
 def test_verify_first_chunk_detects_corruption(src_file, tmp_path):
     out = str(tmp_path / "c.qcx")
-    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad")
     meta = pkg.load_pkg(out)["meta"]
-    key, _ = pkg.derive_final_key(meta, password="p")
+    key, _ = pkg.derive_final_key(meta, password="p-testpad")
     pkg.verify_first_chunk(out, meta, key)
     # Corrupt the sequence number of chunk 0
     with open(out, "r+b") as f:
@@ -460,9 +462,13 @@ def test_zip_folder_cancel_and_stats(tmp_path):
 
 # ── Volumes (FUSE mocked) ───────────────────────────────────────────────────
 
+_SIDECAR = "/tmp/vault.qcv.suspect-20260904T101500Z"
+
+
 class _FakeVol:
     def __init__(self, suspicious=False, boom=False):
         self.journal_suspicious = suspicious
+        self.suspect_sidecar = _SIDECAR if suspicious else None
         self._boom = boom
 
     def stat(self):
@@ -490,10 +496,10 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     monkeypatch.setattr(fo, "unmount_volume", lambda mp: mounted.pop(mp))
 
     vpath = str(tmp_path / "vault")  # extension appended
-    h.send("volume_create", {"path": vpath, "mode": "password", "password": "pw"}, rid="c")
+    h.send("volume_create", {"path": vpath, "mode": "password", "password": "pw-testpad"}, rid="c")
     res = h.result("c")
     assert res["path"].endswith("vault.qcv") and os.path.exists(res["path"])
-    h.send("volume_create", {"path": res["path"], "mode": "password", "password": "pw"}, rid="c2")
+    h.send("volume_create", {"path": res["path"], "mode": "password", "password": "pw-testpad"}, rid="c2")
     c2 = h.error("c2")
     assert c2["code"] == "already_exists" and "already exists" in c2["message"]
     h.send("volume_create", {"path": str(tmp_path / "s.qcv"), "mode": "shamir", "k": 3, "n": 2}, rid="c3")
@@ -512,18 +518,22 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     assert h.error("vi3")["code"] == "not_found"
 
     mp = str(tmp_path / "mnt")
-    h.send("volume_mount", {"path": res["path"], "mount_point": mp, "password": "pw"}, rid="m")
+    h.send("volume_mount", {"path": res["path"], "mount_point": mp, "password": "pw-testpad"}, rid="m")
     mres = h.result("m")
-    assert mres == {"mount_point": mp, "volume_path": res["path"], "journal_suspicious": False}
+    assert mres == {"mount_point": mp, "volume_path": res["path"],
+                    "journal_suspicious": False, "suspect_sidecar": None}
     stages = [e["stage"] for e in h.events("m") if e["event"] == "progress"]
     assert stages[0] == "read" and "kdf" in stages and stages[-1] == "mount"
 
-    h.send("volume_mount", {"path": res["path"], "mount_point": mp + "2", "password": "wrong"}, rid="mw")
+    h.send("volume_mount", {"path": res["path"], "mount_point": mp + "2", "password": "wrong-testpad"}, rid="mw")
     assert h.error("mw")["code"] == "wrong_credentials"
 
     sh = [s["mnemonic"] for s in sres["shares"][:2]]
     h.send("volume_mount", {"path": sres["path"], "mount_point": mp + "sus", "shares": sh}, rid="ms")
     assert h.result("ms")["journal_suspicious"] is True
+    # The preserved tail has to be named, or the user deletes an unexplained
+    # file sitting next to their vault.
+    assert h.result("ms")["suspect_sidecar"] == _SIDECAR
     h.send("volume_mount", {"path": sres["path"], "mount_point": mp + "3",
                             "shares": [sres["shares"][0]["code"]]}, rid="mf")
     assert "Need 2" in h.error("mf")["message"]
@@ -669,7 +679,7 @@ def test_sigterm_stops_helper_cleanly(tmp_path):
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     proc.stdin.write(json.dumps({"id": "e", "op": "encrypt", "params": {
-        "source": str(big), "output": out, "mode": "password", "password": "p"}}) + "\n")
+        "source": str(big), "output": out, "mode": "password", "password": "p-testpad"}}) + "\n")
     proc.stdin.flush()
     # Deterministic: wait for the first progress event, which proves the
     # handler is installed and the encrypt is in flight, then signal.
@@ -694,11 +704,11 @@ def test_verify_only_on_empty_payload(h, tmp_path):
     empty = tmp_path / "empty.bin"
     empty.write_bytes(b"")
     out = str(tmp_path / "empty.qcx")
-    h.send("encrypt", {"source": str(empty), "output": out, "mode": "password", "password": "p"}, rid="e")
+    h.send("encrypt", {"source": str(empty), "output": out, "mode": "password", "password": "p-testpad"}, rid="e")
     h.result("e")
-    h.send("decrypt", {"path": out, "password": "p", "verify_only": True}, rid="v")
+    h.send("decrypt", {"path": out, "password": "p-testpad", "verify_only": True}, rid="v")
     assert h.result("v") == {"verified": True, "mode": "single"}
-    h.send("decrypt", {"path": out, "password": "wrong", "verify_only": True}, rid="w")
+    h.send("decrypt", {"path": out, "password": "wrong-testpad", "verify_only": True}, rid="w")
     assert h.error("w")["code"] == "wrong_credentials"
 
 
@@ -711,7 +721,7 @@ def test_volume_create_cancel_removes_partial_file(h, tmp_path, monkeypatch):
         raise cc.CancelledOperation("Volume creation cancelled")
 
     monkeypatch.setattr(vol, "create_volume_single", fake_create)
-    h.send("volume_create", {"path": path, "mode": "password", "password": "pw"}, rid="c")
+    h.send("volume_create", {"path": path, "mode": "password", "password": "pw-testpad"}, rid="c")
     assert h.error("c")["code"] == "cancelled"
     assert not os.path.exists(path)
 
@@ -719,7 +729,7 @@ def test_volume_create_cancel_removes_partial_file(h, tmp_path, monkeypatch):
 def test_create_volume_polls_cancel(tmp_path):
     from quantacrypt.core import volume as vol
     with pytest.raises(cc.CancelledOperation):
-        vol.create_volume_single(str(tmp_path / "x.qcv"), "pw", cancel_check=lambda: True)
+        vol.create_volume_single(str(tmp_path / "x.qcv"), "pw-testpad", cancel_check=lambda: True)
     assert not os.path.exists(tmp_path / "x.qcv")
     with pytest.raises(cc.CancelledOperation):
         vol.create_volume_shamir(str(tmp_path / "y.qcv"), 3, 2, cancel_check=lambda: True)
@@ -758,11 +768,11 @@ def test_request_stop_unblocks_run_and_cancels_workers():
 
 
 def test_optional_param_types_and_unknown_volume_mode(h, tmp_path, src_file):
-    h.send("decrypt", {"path": src_file, "output_dir": 3, "password": "x"}, rid="od")
+    h.send("decrypt", {"path": src_file, "output_dir": 3, "password": "x-testpad"}, rid="od")
     assert h.error("od")["code"] == "invalid_request"
     h.send("decrypt", {"path": src_file, "output_dir": str(tmp_path), "shares": "not-a-list"}, rid="sl")
     assert h.error("sl")["code"] == "invalid_request"
-    h.send("volume_create", {"path": str(tmp_path / "v.qcv"), "mode": "weird", "password": "p"}, rid="vm")
+    h.send("volume_create", {"path": str(tmp_path / "v.qcv"), "mode": "weird", "password": "p-testpad"}, rid="vm")
     assert h.error("vm")["code"] == "invalid_request"
     h.send("volume_create", {"path": str(tmp_path / "v2.qcv"), "mode": "password"}, rid="np")
     assert h.error("np")["code"] == "invalid_request"
@@ -772,12 +782,12 @@ def test_package_validation_and_cleanup(tmp_path, src_file):
     from quantacrypt.core.errors import InvalidRequest
     out = str(tmp_path / "o.qcx")
     with pytest.raises(InvalidRequest):
-        pkg.encrypt_to_qcx(src_file, out, mode="nope", password="p")
+        pkg.encrypt_to_qcx(src_file, out, mode="nope", password="p-testpad")
     with pytest.raises(InvalidRequest):
         pkg.encrypt_to_qcx(src_file, out, mode="shamir", k=1, n=1)
     # Failure after the tmp file exists removes it (embed source unreadable)
     with pytest.raises(FileNotFoundError):
-        pkg.encrypt_to_qcx(src_file, out, mode="password", password="p",
+        pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad",
                            embed_binary=str(tmp_path / "missing.bin"))
     assert not os.path.exists(out + ".tmp") and not os.path.exists(out)
     # chmod failure on the embed path is tolerated
@@ -786,7 +796,7 @@ def test_package_validation_and_cleanup(tmp_path, src_file):
     real_chmod = os.chmod
     pmod.os.chmod = lambda *a, **k: (_ for _ in ()).throw(OSError("ro"))
     try:
-        res = pkg.encrypt_to_qcx(src_file, out, mode="password", password="p",
+        res = pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad",
                                  embed_binary=str(fake_bin))
     finally:
         pmod.os.chmod = real_chmod
@@ -796,7 +806,7 @@ def test_package_validation_and_cleanup(tmp_path, src_file):
     with open(out, "r+b") as f:
         f.truncate(os.path.getsize(out) - 200)
     with pytest.raises(Exception):
-        pkg.decrypt_qcx(out, str(tmp_path), password="p")
+        pkg.decrypt_qcx(out, str(tmp_path), password="p-testpad")
     assert not [f for f in os.listdir(tmp_path) if f.startswith(".qc-decrypt-")]
 
 
@@ -807,20 +817,97 @@ def test_folder_stats_tolerates_vanishing_files(tmp_path, monkeypatch):
     assert pkg.folder_stats(str(d)) == (1, 0)
 
 
+def test_zip_folder_cancels_between_files(tmp_path):
+    """The per-directory check only fires between directories; a folder of
+    many files has to stay cancellable inside one."""
+    d = tmp_path / "f"
+    d.mkdir()
+    for i in range(3):
+        (d / f"{i}.txt").write_text("x")
+    calls = []
+
+    def cancel():
+        calls.append(1)
+        return len(calls) > 1      # let the directory entry through first
+
+    with pytest.raises(cc.CancelledOperation):
+        pkg.zip_folder(str(d), str(tmp_path / "z.zip"), cancel_check=cancel)
+
+
+def test_zip_folder_does_not_follow_symlinks(tmp_path):
+    """A .qcx is made to be handed to someone else, so a convenience link
+    inside the folder must not ship the target's bytes."""
+    secret = tmp_path / "id_ed25519"
+    secret.write_bytes(b"PRIVATE-KEY-BYTES")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "also-secret").write_bytes(b"OTHER-SECRET-BYTES")
+
+    d = tmp_path / "proj"
+    d.mkdir()
+    (d / "code.py").write_text("print()")
+    os.symlink(secret, d / "key-link")
+    os.symlink(other, d / "dir-link")
+
+    dst = tmp_path / "proj.zip"
+    skipped = pkg.zip_folder(str(d), str(dst))
+    assert sorted(skipped) == ["dir-link", "key-link"]
+
+    blob = dst.read_bytes()
+    assert b"PRIVATE-KEY-BYTES" not in blob
+    assert b"OTHER-SECRET-BYTES" not in blob
+    import zipfile
+    with zipfile.ZipFile(dst) as zf:
+        assert zf.namelist() == ["proj/", "proj/code.py"]
+
+
+def test_zip_folder_keeps_empty_directories(tmp_path):
+    d = tmp_path / "proj"
+    (d / "empty").mkdir(parents=True)
+    (d / "full").mkdir()
+    (d / "full" / "a.txt").write_text("x")
+    dst = tmp_path / "proj.zip"
+    assert pkg.zip_folder(str(d), str(dst)) == []
+    import zipfile
+    with zipfile.ZipFile(dst) as zf:
+        assert sorted(zf.namelist()) == [
+            "proj/", "proj/empty/", "proj/full/", "proj/full/a.txt"]
+
+
+def test_encrypt_reports_the_symlinks_it_left_out(tmp_path):
+    secret = tmp_path / "creds"
+    secret.write_bytes(b"PRIVATE-KEY-BYTES")
+    d = tmp_path / "proj"
+    d.mkdir()
+    (d / "a.txt").write_text("x")
+    os.symlink(secret, d / "creds-link")
+    msgs = []
+    res = pkg.encrypt_to_qcx(str(d), str(tmp_path / "proj.qcx"), mode="password",
+                             password="pw-testpad", progress=msgs.append)
+    assert res["skipped_symlinks"] == ["creds-link"]
+    assert any("Skipped 1 symlink" in m for m in msgs)
+    # A plain file has nothing to report.
+    plain = tmp_path / "f.txt"
+    plain.write_bytes(b"data")
+    res2 = pkg.encrypt_to_qcx(str(plain), str(tmp_path / "f.qcx"),
+                              mode="password", password="pw-testpad")
+    assert res2["skipped_symlinks"] == []
+
+
 def test_zip_folder_skips_its_own_archive(tmp_path):
     d = tmp_path / "f"; d.mkdir(); (d / "a").write_bytes(b"12")
     dst = d / "inner.zip"   # archive inside the tree being zipped
     pkg.zip_folder(str(d), str(dst), progress_cb=lambda m: None)
     import zipfile
     with zipfile.ZipFile(dst) as zf:
-        assert zf.namelist() == ["f/a"]
+        assert zf.namelist() == ["f/", "f/a"]
 
 
 def test_verify_first_chunk_truncated_length_field(src_file, tmp_path):
     out = str(tmp_path / "t.qcx")
-    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad")
     meta = pkg.load_pkg(out)["meta"]
-    key, _ = pkg.derive_final_key(meta, password="p")
+    key, _ = pkg.derive_final_key(meta, password="p-testpad")
     with open(out, "r+b") as f:
         f.truncate(meta.get("payload_offset", 0) + 6)
     with pytest.raises(ValueError, match="truncated"):
@@ -849,20 +936,20 @@ def test_extract_share_codes_tolerates_headers_and_prose(src_file, tmp_path):
 
 def test_corrupt_payload_is_not_a_wrong_password(h, src_file, tmp_path, out_dir):
     out = str(tmp_path / "c.qcx")
-    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p")
+    pkg.encrypt_to_qcx(src_file, out, mode="password", password="p-testpad")
     meta = pkg.load_pkg(out)["meta"]
     off = meta.get("payload_offset", 0) + 8 + 5  # inside chunk 0's ciphertext
     with open(out, "r+b") as f:
         f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 0xFF]))
-    h.send("decrypt", {"path": out, "password": "p", "verify_only": True}, rid="v")
+    h.send("decrypt", {"path": out, "password": "p-testpad", "verify_only": True}, rid="v")
     err = h.error("v")
     assert err["code"] == "format" and "damaged" in err["message"]
-    h.send("decrypt", {"path": out, "output_dir": out_dir, "password": "p"}, rid="d")
+    h.send("decrypt", {"path": out, "output_dir": out_dir, "password": "p-testpad"}, rid="d")
     err = h.error("d")
     assert err["code"] == "format" and "damaged" in err["message"]
     assert not [f for f in os.listdir(out_dir) if f.startswith(".qc-decrypt-")]
     # A genuinely wrong password is still reported as such
-    h.send("decrypt", {"path": out, "password": "nope", "verify_only": True}, rid="w")
+    h.send("decrypt", {"path": out, "password": "nope-testpad", "verify_only": True}, rid="w")
     assert h.error("w")["code"] == "wrong_credentials"
 
 
@@ -898,7 +985,7 @@ def test_encrypt_failure_leaves_no_temp(src_file, tmp_path, monkeypatch):
     monkeypatch.setattr(pmod.cc, "encrypt_single_streaming",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError):
-        pkg.encrypt_to_qcx(src_file, str(tmp_path / "x.qcx"), mode="password", password="p")
+        pkg.encrypt_to_qcx(src_file, str(tmp_path / "x.qcx"), mode="password", password="p-testpad")
     assert not [f for f in os.listdir(tmp_path) if ".qc-enc-" in f]
 
 
@@ -909,3 +996,372 @@ def test_run_request_always_emits_a_terminal_event(h):
     h.svc.ops["bad"] = bad
     h.send("bad", rid="b")
     assert h.final("b")["event"] == "error"
+
+
+# ── F-022: fixtures that cross the helper↔Swift boundary ─────────────────────
+
+FIXTURES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "macos", "QuantaCryptTests", "Fixtures",
+)
+
+
+def _dump_fixture(name, done_event):
+    """Write one real `done` line for the Swift decoders to consume.
+
+    The protocol was verified twice, in isolation, on both sides: Swift
+    decoded JSON literals a human typed, Python asserted on dicts it had
+    just built. Nothing fed real helper output into a Swift decoder, which
+    is how `volume_inspect`'s always-null `format_version` survived. These
+    fixtures are the shared artefact — a rename on this side now breaks the
+    Swift build.
+    """
+    os.makedirs(FIXTURES_DIR, exist_ok=True)
+    path = os.path.join(FIXTURES_DIR, f"{name}.json")
+    body = json.dumps(_pin_environment(name, _scrub(done_event)),
+                      indent=2, sort_keys=True) + "\n"
+
+    # Verify by default, regenerate only on request. Rewriting these on every
+    # run made protocol drift invisible (the diff was always dirty, so nobody
+    # would notice a real change) and churned the working tree.
+    if os.environ.get("QC_REGEN_FIXTURES"):
+        with open(path, "w") as f:
+            f.write(body)
+        return path
+
+    if not os.path.exists(path):
+        pytest.fail(
+            f"missing fixture {path} — regenerate with QC_REGEN_FIXTURES=1 "
+            f"pytest tests/test_service.py::test_dump_protocol_fixtures_for_swift "
+            f"and COMMIT the directory. It is the shared artefact: uncommitted, "
+            f"a CI checkout has nothing for either side to check against, and "
+            f"FixtureDecodingTests.swift skips on an empty directory."
+        )
+    current = open(path).read()
+    if current != body:
+        import difflib
+        delta = "".join(difflib.unified_diff(
+            current.splitlines(keepends=True), body.splitlines(keepends=True),
+            fromfile=f"committed/{name}.json", tofile=f"produced/{name}.json"))
+        pytest.fail(
+            f"{name}.json no longer matches what the helper produces — either "
+            f"the qc-core protocol changed, or a field is not reproducible "
+            f"and needs handling in _scrub()/_ENV_PINNED. Check that "
+            f"macos/QuantaCrypt/Core/CoreProtocol.swift still decodes it, then "
+            f"regenerate with QC_REGEN_FIXTURES=1.\n\n{delta}"
+        )
+    return path
+
+
+#: Fields whose value describes the machine that ran the suite rather than
+#: the protocol, as dotted paths into ``result``.
+#:
+#: Without this the comparison above is not a boundary check at all: the
+#: fixtures are generated on a macOS laptop and verified on ubuntu across
+#: three Python versions, so `platform`, `python`, the released `version`
+#: and every `fuse_check` field differ on CI for reasons that have nothing
+#: to do with `qc-core`. A check that is red on every CI run and green
+#: locally gets disarmed within a week, which is how a protocol boundary
+#: ends up unguarded. The Swift decoders read the key set and the JSON
+#: type, neither of which pinning the value touches.
+_ENV_PINNED = {
+    "version": {
+        "version": "0.0.0-fixture",
+        "platform": "fixture",
+        "python": "0.0.0",
+    },
+    "fuse_check": {
+        "ok": True,
+        "fusepy.ok": True,
+        "fusepy.detail": "fixture",
+        "fuse_backend.ok": True,
+        "fuse_backend.detail": "fixture",
+    },
+}
+
+
+def _pin_environment(name, event):
+    """Replace the environment-dependent leaves of *event* with constants.
+
+    A pinned path that has gone missing is real drift and fails here rather
+    than being silently reinstated — the pin must never be able to forge a
+    field the helper stopped emitting.
+    """
+    pins = _ENV_PINNED.get(name)
+    if not pins:
+        return event
+    result = json.loads(json.dumps(event.get("result")))
+    for dotted, constant in pins.items():
+        node, *rest = dotted.split(".")
+        target, key = result, node
+        for step in rest:
+            if not isinstance(target.get(key), dict):
+                target = None
+                break
+            target, key = target[key], step
+        if target is None or key not in target:
+            pytest.fail(
+                f"{name}.json: the helper stopped emitting result.{dotted}, "
+                f"which this test pins as environment-dependent. If the field "
+                f"was renamed or dropped, update CoreProtocol.swift and "
+                f"_ENV_PINNED together."
+            )
+        target[key] = constant
+    return {**event, "result": result}
+
+
+#: A structurally-valid stand-in. Real share codes and mnemonics are key
+#: material — even for a throwaway test volume, they do not belong in a
+#: committed file in a public repository.
+_FAKE_MNEMONIC = " ".join(["abandon"] * 50)
+
+
+def _scrub(value, key=None):
+    """Make a fixture deterministic and free of secrets.
+
+    Three things vary run to run: absolute tmp paths, timestamps, and the
+    Shamir shares (random by design). The Swift decoders care about the
+    shape, not these values, so they are normalised.
+    """
+    if isinstance(value, dict):
+        return {k: _scrub(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if key in ("timestamp", "mtime", "created_at") and isinstance(value, (int, float)):
+        return 1700000000
+    if key == "code" and isinstance(value, str) and value.startswith("QCSHARE-"):
+        return "QCSHARE-" + "A" * 64
+    if key == "mnemonic" and isinstance(value, str):
+        return _FAKE_MNEMONIC
+    if isinstance(value, str) and value.startswith("/"):
+        return "/fixture/" + os.path.basename(value)
+    return value
+
+
+def test_dump_protocol_fixtures_for_swift(tmp_path, src_file, out_dir, monkeypatch):
+    """Regenerate the committed fixtures from real service output.
+
+    Not a mock: every event here is produced by the actual Service. If this
+    test's output differs from what is committed, the protocol changed and
+    the Swift side needs to change with it.
+    """
+    h = Harness()
+    produced = set()
+
+    def dump(name, event):
+        produced.add(os.path.basename(_dump_fixture(name, event)))
+
+    h.send("version", rid="v")
+    dump("version", h.final("v"))
+
+    h.send("fuse_check", rid="fc")
+    dump("fuse_check", h.final("fc"))
+
+    out = str(tmp_path / "f.qcx")
+    h.send("encrypt", {"source": src_file, "output": out, "mode": "password",
+                       "password": "correct horse"}, rid="e")
+    dump("encrypt", h.final("e"))
+
+    h.send("inspect", {"path": out}, rid="i")
+    dump("inspect", h.final("i"))
+
+    h.send("decrypt", {"path": out, "output_dir": out_dir,
+                       "password": "correct horse"}, rid="d")
+    dump("decrypt", h.final("d"))
+
+    h.send("decrypt", {"path": out, "password": "correct horse",
+                       "verify_only": True}, rid="vo")
+    dump("verify", h.final("vo"))
+
+    sh_out = str(tmp_path / "s.qcx")
+    h.send("encrypt", {"source": src_file, "output": sh_out, "mode": "shamir",
+                       "k": 2, "n": 3}, rid="es")
+    dump("encrypt_shamir", h.final("es"))
+
+    vpath = str(tmp_path / "v.qcv")
+    h.send("volume_create", {"path": vpath, "mode": "password",
+                             "password": "correct horse"}, rid="vc")
+    dump("volume_create", h.final("vc"))
+
+    h.send("volume_inspect", {"path": vpath}, rid="vi")
+    dump("volume_inspect", h.final("vi"))
+
+    h.send("volume_list", {}, rid="vl")
+    dump("volume_list", h.final("vl"))
+
+    h.send("ping", rid="p")
+    dump("ping", h.final("p"))
+
+    h.send("cancel", {"target": "ghost"}, rid="cn")
+    dump("cancel", h.final("cn"))
+
+    # volume_mount/unmount/shutdown need a FUSE backend that no CI runner
+    # has, and mounting a real filesystem from a unit test is not viable.
+    # Only mount_volume itself is faked: the three result dicts below are
+    # assembled by the real ops, and that is the half the Swift decoders
+    # read. Hand-writing these three instead is precisely the practice this
+    # whole file exists to replace.
+    import quantacrypt.core.fuse_ops as fo
+    mounted = {}
+
+    def fake_mount(vpath_, key, mp):
+        mounted[mp] = {"volume_path": vpath_, "volume": _FakeVol()}
+        return _FakeFuse(mounted[mp]["volume"])
+
+    monkeypatch.setattr(fo, "mount_volume", fake_mount)
+    monkeypatch.setattr(fo, "get_mounted_volumes", lambda: dict(mounted))
+    monkeypatch.setattr(fo, "unmount_volume", lambda mp: mounted.pop(mp))
+
+    mount_point = str(tmp_path / "mnt")
+    h.send("volume_mount", {"path": vpath, "mount_point": mount_point,
+                            "password": "correct horse"}, rid="vm")
+    dump("volume_mount", h.final("vm"))
+
+    h.send("volume_unmount", {"mount_point": mount_point}, rid="vu")
+    dump("volume_unmount", h.final("vu"))
+
+    h.send("shutdown", rid="sd")
+    dump("shutdown", h.final("sd"))
+
+    # An op that is renamed or dropped leaves its old fixture behind, where
+    # the Swift side happily keeps decoding it forever. The committed set has
+    # to be exactly what this test produces, in both directions.
+    on_disk = {f for f in os.listdir(FIXTURES_DIR) if f.endswith(".json")}
+    assert on_disk == produced, (
+        f"the committed fixtures drifted from what this test produces — "
+        f"orphaned: {sorted(on_disk - produced)} (delete them, or add the op "
+        f"back above), missing: {sorted(produced - on_disk)}"
+    )
+
+
+# ── F-006: the boundary check has to be able to go red ──────────────────────
+
+_MAC_VERSION_EVENT = {
+    "event": "done", "id": "v",
+    "result": {"version": "1.3.0", "format_version": 1,
+               "platform": "darwin", "python": "3.14.0"},
+}
+_LINUX_VERSION_EVENT = {
+    "event": "done", "id": "v",
+    "result": {"version": "1.4.0", "format_version": 1,
+               "platform": "linux", "python": "3.10.14"},
+}
+
+
+@pytest.fixture
+def scratch_fixtures(tmp_path, monkeypatch):
+    """Point the dumper at a throwaway directory.
+
+    These tests exercise _dump_fixture's own failure modes, which means
+    deliberately writing mismatching fixtures — never into the committed set.
+    """
+    monkeypatch.setattr(sys.modules[__name__], "FIXTURES_DIR", str(tmp_path))
+    # An ambient QC_REGEN_FIXTURES (the developer regenerating the committed
+    # set) would turn every comparison below into a silent rewrite.
+    monkeypatch.delenv("QC_REGEN_FIXTURES", raising=False)
+    return tmp_path
+
+
+def _seed(name, event, monkeypatch):
+    """Write the committed-side baseline, and hand back its bytes."""
+    monkeypatch.setenv("QC_REGEN_FIXTURES", "1")
+    path = _dump_fixture(name, event)
+    monkeypatch.delenv("QC_REGEN_FIXTURES")
+    return open(path).read()
+
+
+def test_a_renamed_result_key_fails_the_check(scratch_fixtures, monkeypatch):
+    """The reason this file dumps fixtures at all: a key that Python renames
+    and Swift still decodes reaches the user as a `protocol_error` mid-op.
+    Nothing catches that unless the comparison genuinely fails."""
+    _seed("version", _MAC_VERSION_EVENT, monkeypatch)
+    _dump_fixture("version", _MAC_VERSION_EVENT)   # unchanged: no failure
+
+    renamed = {"event": "done", "id": "v", "result": {
+        "version": "1.3.0", "formatVersion": 1,     # was format_version
+        "platform": "darwin", "python": "3.14.0"}}
+    with pytest.raises(pytest.fail.Exception, match="no longer matches"):
+        _dump_fixture("version", renamed)
+
+
+def test_a_fixture_that_was_never_committed_fails_the_check(scratch_fixtures):
+    """A missing file must be a failure, not a silent pass — the Swift side
+    skips on an empty directory, so this is the only side that can notice."""
+    with pytest.raises(pytest.fail.Exception, match="missing fixture"):
+        _dump_fixture("version", _MAC_VERSION_EVENT)
+
+
+def test_the_check_survives_a_different_machine(scratch_fixtures, monkeypatch):
+    """Generated on macOS/3.14, verified on ubuntu/3.10 in CI. If the host
+    leaks into the fixture the check is red on every CI run for a reason no
+    one can fix, and it gets deleted."""
+    baseline = _seed("version", _MAC_VERSION_EVENT, monkeypatch)
+    assert '"platform": "fixture"' in baseline and '"python": "0.0.0"' in baseline
+    assert open(_dump_fixture("version", _LINUX_VERSION_EVENT)).read() == baseline
+
+    mac_fuse = {"event": "done", "id": "fc", "result": {
+        "ok": True,
+        "fusepy": {"ok": True, "detail": "fusepy is installed"},
+        "fuse_backend": {"ok": True, "detail": "macFUSE detected"}}}
+    linux_fuse = {"event": "done", "id": "fc", "result": {
+        "ok": False,
+        "fusepy": {"ok": False, "detail": "fusepy is not installed"},
+        "fuse_backend": {"ok": False, "detail": "libfuse not found"}}}
+    baseline = _seed("fuse_check", mac_fuse, monkeypatch)
+    assert "macFUSE" not in baseline
+    assert open(_dump_fixture("fuse_check", linux_fuse)).read() == baseline
+
+
+def test_pinning_cannot_paper_over_a_dropped_field(scratch_fixtures, monkeypatch):
+    """The pins exist to hide the host, not to hide drift: a pinned field the
+    helper stopped emitting must still fail."""
+    _seed("version", _MAC_VERSION_EVENT, monkeypatch)
+    dropped = {"event": "done", "id": "v",
+               "result": {"version": "1.3.0", "format_version": 1,
+                          "python": "3.14.0"}}          # platform is gone
+    with pytest.raises(pytest.fail.Exception, match="stopped emitting"):
+        _dump_fixture("version", dropped)
+
+    renested = {"event": "done", "id": "fc", "result": {
+        "ok": True, "fusepy": True,                      # was a dict
+        "fuse_backend": {"ok": True, "detail": "macFUSE detected"}}}
+    with pytest.raises(pytest.fail.Exception, match="stopped emitting"):
+        _dump_fixture("fuse_check", renested)
+
+
+def test_pinning_leaves_unpinned_siblings_alone(scratch_fixtures, monkeypatch):
+    """Pinning is per-leaf, so a new field next to a pinned one still shows
+    up in the diff instead of being erased by a whole-subtree overwrite."""
+    _seed("fuse_check", {"event": "done", "id": "fc", "result": {
+        "ok": True,
+        "fusepy": {"ok": True, "detail": "fusepy is installed"},
+        "fuse_backend": {"ok": True, "detail": "macFUSE detected"}}}, monkeypatch)
+    grew = {"event": "done", "id": "fc", "result": {
+        "ok": True,
+        "fusepy": {"ok": True, "detail": "fusepy is installed",
+                   "version": "3.0.1"},                 # new key
+        "fuse_backend": {"ok": True, "detail": "macFUSE detected"}}}
+    with pytest.raises(pytest.fail.Exception, match="no longer matches"):
+        _dump_fixture("fuse_check", grew)
+
+
+def test_pinning_does_not_mutate_the_caller_event(scratch_fixtures, monkeypatch):
+    """_pin_environment runs on live service output that the calling test
+    still asserts on afterwards."""
+    event = json.loads(json.dumps(_MAC_VERSION_EVENT))
+    _seed("version", event, monkeypatch)
+    assert event["result"]["platform"] == "darwin"
+    assert event["result"]["python"] == "3.14.0"
+
+
+def test_volume_inspect_reports_a_real_format_version(tmp_path, h):
+    """F-004: the field was documented, decoded by no one, and structurally
+    always null because read_header() returns "version", not
+    "format_version"."""
+    from quantacrypt.core import volume as vol
+    vpath = str(tmp_path / "fv.qcv")
+    vol.create_volume_single(vpath, "correct horse")
+    h.send("volume_inspect", {"path": vpath}, rid="fv")
+    res = h.result("fv")
+    assert isinstance(res["format_version"], int)
+    assert res["format_version"] == vol.VOLUME_FORMAT_VERSION

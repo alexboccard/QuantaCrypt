@@ -9,6 +9,8 @@ actor FakeTransport: CoreTransport {
     private var continuation: AsyncThrowingStream<String, any Error>.Continuation?
     private(set) var started = false
     private(set) var terminated = false
+    /// How long the client was willing to wait for EOF before escalating.
+    private(set) var terminateTimeout: Duration?
     private(set) var inputClosed = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -32,6 +34,7 @@ actor FakeTransport: CoreTransport {
 
     func terminate(timeout: Duration) async {
         terminated = true
+        terminateTimeout = timeout
         continuation?.finish()
     }
 

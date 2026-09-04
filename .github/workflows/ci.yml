@@ -18,7 +18,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The GUI pass is serial by necessity (one process per file), so the job
+    # is minutes rather than seconds; 30 left no headroom.
+    timeout-minutes: 45
     strategy:
       matrix:
         python-version: ["3.10", "3.12", "3.13"]
@@ -29,11 +31,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # fusepy imports only when a libfuse backend is loadable (it raises
-      # OSError, not ImportError, without one) — install libfuse2 so the
-      # FUSE contract tests run on CI instead of skipping.
-      - name: Install libfuse
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
+      # libfuse2: fusepy imports only when a backend is loadable (it raises
+      # OSError, not ImportError, without one), so the FUSE contract tests
+      # would otherwise skip.
+      # xvfb + tk: the GUI suite drives real Tk widgets. Without a display
+      # every one of those tests skips, which is worse than useless — review
+      # run 12 found ~116 of them silently skipping on every CI run, having
+      # replaced source-text assertions that at least executed.
+      - name: Install libfuse, Tk and a virtual display
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse2 xvfb python3-tk
 
       # Hash-pinned lock (uv.lock → requirements-lock.txt, all extras) so a
       # release is what was reviewed, not what PyPI serves that day.
@@ -46,11 +54,48 @@ jobs:
       - name: Audit dependencies for known advisories
         run: pip-audit -r requirements-lock.txt --strict --disable-pip
 
-      # --cov-fail-under=95 explicitly, rather than trusting pytest-cov to
-      # pick fail_under up from pyproject.toml — the gate must not hinge on
-      # config-discovery behavior.
-      - name: Run tests with coverage gate
-        run: python -m pytest --tb=short -q --cov-fail-under=95
+      # Nothing checked this before, and it had already drifted: the lock
+      # recorded kyber-py>=0.8 / shamirs>=1.0 against a pyproject that says
+      # >=1.0,<2 / >=4.0,<5, and pytest-xdist, pytest-timeout and
+      # pytest-randomly were missing from it outright — so the hash-pinned
+      # install CI calls its "a release is what was reviewed" guarantee was
+      # neither. One matrix entry: the answer cannot vary by interpreter.
+      - name: Check the lockfile matches pyproject.toml
+        if: matrix.python-version == '3.13'
+        run: |
+          uv lock --check
+          uv export --frozen --no-emit-project --all-extras \
+            --format requirements.txt -o requirements-lock.txt
+          git diff --exit-code -- requirements-lock.txt
+
+      # scripts/run_tests.sh rather than a bare pytest: Tk is not xdist-safe
+      # (29 GUI failures under -n auto, all passing serially) and Tk state
+      # accumulates within an interpreter (14:24 for six GUI files in one
+      # process against 6:05 across per-file processes), so the run is split
+      # into a parallel non-GUI pass and a serial one-process-per-file GUI
+      # pass. One xvfb-run wraps the script so every child pytest inherits
+      # the same display.
+      - name: Run tests
+        run: PY="$(command -v python)" xvfb-run -a bash scripts/run_tests.sh --cov
+
+      # Per file, not in aggregate: coverage.py's fail_under is one number
+      # over the whole project, so a well-covered core/ hid
+      # ui/volume_manager.py at 11% and __main__.py at 0%. Run explicitly
+      # here as well as inside run_tests.sh — the gate must not hinge on a
+      # flag someone drops from the script.
+      - name: Coverage gate (95% per file)
+        run: python scripts/check_coverage.py --min 95
+
+      # Assert the GUI suite really ran: a display that silently fails to
+      # start would put us straight back to ~116 quiet skips.
+      - name: Assert the GUI tests were not skipped
+        run: |
+          xvfb-run -a python -m pytest tests/test_gui_logic.py -q -o addopts="" \
+            --no-header -p no:cacheprovider -p no:randomly -rs 2>&1 | tee /tmp/gui.txt
+          if grep -qi "needs real tkinter\|no usable display" /tmp/gui.txt; then
+            echo "::error::GUI tests skipped — the virtual display is not working"
+            exit 1
+          fi
 
   # The native shell: the qc-core helper (PyInstaller, no Tk) plus the
   # SwiftUI app generated from macos/project.yml.  Runs on every push so a

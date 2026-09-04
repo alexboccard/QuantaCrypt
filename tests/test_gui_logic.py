@@ -3,6 +3,7 @@ QuantaCrypt GUI Layer Logic Tests
 Tests for validation, file loading, and GUI helper functions.
 """
 import base64
+import gc as _gc
 import io
 import math
 import os
@@ -17,7 +18,105 @@ import types
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, _make_qcx, _decrypt_qcx, requires_tkinter
+from tests.conftest import (_widget_texts, MAGIC, make_pkg_bytes, load_pkg, _make_qcx,
+                            _decrypt_qcx, requires_tkinter, HAS_TKINTER)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tk harness
+#
+# The UI is excluded from the coverage gate, so these tests are the only thing
+# standing behind ~7k lines of Tk.  They drive real widgets and assert on what
+# the widgets end up showing — never on the text of the methods that built them
+# (a source-text assertion passes a rewrite under a new name and fails a
+# comment edit).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _collect_tk_garbage_on_the_main_thread():
+    """Free discarded Tk interpreters here, on the thread that made them.
+
+    Tcl aborts the process — ``Tcl_AsyncDelete: async handler deleted by the
+    wrong thread``, SIGABRT, the whole run gone — if a Tk interpreter object is
+    finalised on a thread other than the one that created it.  Production
+    hands us exactly that setup: ``PasswordStrengthBar`` (src/quantacrypt/ui/
+    shared.py:1002) keeps a scoring daemon thread alive for seconds after a
+    password field is touched, so a collection triggered by *that* thread's
+    allocations can pick up a Tk object an earlier test dropped.  Which test
+    is holding the garbage when the sweep lands depends purely on order.
+    Collecting on the main thread after every test keeps the window shut
+    instead of leaving it to luck.
+    """
+    yield
+    _gc.collect()
+
+
+def _pump_until(widget, predicate, timeout=3.0):
+    """Run the Tk event loop until ``predicate`` holds.  Needed for the
+    debounced ``after`` callbacks the wizards schedule."""
+    deadline = _time.monotonic() + timeout
+    while not predicate() and _time.monotonic() < deadline:
+        widget.update()
+        _time.sleep(0.01)
+    return predicate()
+
+
+def _take_keyboard_focus(widget):
+    """Give ``widget`` the *display's* keyboard focus, not just the toplevel's.
+
+    ``event_generate`` does not deliver a key event to the widget it is called
+    on: Tk routes every KeyPress through the display's focus window
+    (``TkFocusKeyEvent``) and drops it outright when no window of this
+    application holds that focus.  ``focus_set`` only records the focus
+    *inside* a toplevel — measured on a fresh root, ``root.focus_get()`` is
+    still ``None`` after it, and the synthesised key never reaches the
+    binding.
+
+    That made the key assertions below depend on whether some *earlier* test
+    in the process had already forced the application focus — production code
+    does exactly that in ``shared.confirm`` (``win.focus_force()``) and in
+    ``decryptor.WordEntry.focus_force`` — so the same test passed or failed on
+    test order alone.  Forcing the focus here makes each test establish the
+    state it asserts on instead of inheriting it, and the check keeps a
+    failure to acquire it loud rather than turning the assertions vacuous.
+    """
+    widget.winfo_toplevel().lift()
+    widget.focus_force()
+    widget.update()
+    assert widget.focus_get() is widget, (
+        "this test's own window never took the keyboard focus, so the key "
+        "events below would be dropped and the assertions would pass or fail "
+        "for the wrong reason")
+
+
+def _encryptor_app(tk_root, monkeypatch, find_dec=None):
+    """A real EncryptorApp, off-screen, with OS notifications suppressed.
+    ``find_dec`` stubs the embedded-decryptor probe so the optional PORTABLE
+    FILE section can be exercised in both states."""
+    import quantacrypt.ui.encryptor as enc_mod
+    monkeypatch.setattr(enc_mod, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(enc_mod.EncryptorApp, "_find_dec", lambda self: find_dec)
+    app = enc_mod.EncryptorApp(tk_root)
+    app.withdraw()
+    return app
+
+
+def _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample):
+    """A real DecryptorApp with a real .qcx loaded, off-screen, with the
+    recent-files store redirected into ``tmp_path`` and notifications muted."""
+    import shutil
+    import quantacrypt.ui.decryptor as dec_mod
+    from quantacrypt.ui.shared import RecentFiles
+    monkeypatch.setattr(RecentFiles, "_PATH", str(tmp_path / "recent.json"))
+    monkeypatch.setattr(dec_mod, "notify", lambda *a, **k: None)
+    src, meta = qcx_sample
+    qcx = tmp_path / "data.qcx"
+    shutil.copy(src, qcx)
+    app = dec_mod.DecryptorApp(tk_root, payload={"meta": meta}, qcx_path=str(qcx))
+    app.withdraw()
+    return app, qcx
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # A4: GUI-layer tests
@@ -80,7 +179,8 @@ class TestEncryptorValidate:
         with tempfile.NamedTemporaryFile(delete=False) as f:
             f.write(b"test"); path = f.name
         try:
-            obj = self._make_validator(path, "/tmp/out.qcx", pw1="abc", pw2="xyz")
+            obj = self._make_validator(path, "/tmp/out.qcx",
+                                       pw1="abcdefgh", pw2="xyzxyzxy")
             assert obj._validate() == "Passwords don't match"
         finally:
             os.unlink(path)
@@ -107,7 +207,8 @@ class TestEncryptorValidate:
         with tempfile.NamedTemporaryFile(delete=False) as f:
             f.write(b"test"); path = f.name
         try:
-            obj = self._make_validator(path, "/tmp/out.qcx", pw1="good", pw2="good")
+            obj = self._make_validator(path, "/tmp/out.qcx",
+                                       pw1="goodpassword", pw2="goodpassword")
             assert obj._validate() is None
         finally:
             os.unlink(path)
@@ -422,14 +523,44 @@ class TestSharesPendingGuard:
 
 @requires_tkinter
 class TestWizardStepDuringEncryption:
-    """Fix 8: set_step(4) during encryption, not set_step(3)."""
+    """Fix 8: starting an encryption moves the wizard to step 4 (Encrypt),
+    not step 3 (Output)."""
 
-    def test_start_sets_step_4(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._start)
-        assert "set_step(4)" in src, "_start should set wizard to step 4 (Encrypt)"
-        assert "set_step(3)" not in src, "_start should not set wizard to step 3 (Output)"
+    def test_start_advances_wizard_to_the_encrypt_step(self, tk_root, tmp_path, monkeypatch):
+        import threading
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            src = tmp_path / "in.bin"
+            src.write_bytes(b"payload" * 64)
+            app._path = str(src)
+            app._out.delete(0, "end")
+            app._out.insert(0, str(tmp_path / "out.qcx"))
+            app._pw1v.set("correct-horse-battery-9")
+            app._pw2v.set("correct-horse-battery-9")
+            # Stub the worker: what's under test is the UI transition _start
+            # makes, not a real encryption on a background thread.
+            dispatched = threading.Event()
+            monkeypatch.setattr(app, "_run", lambda p: dispatched.set())
+            monkeypatch.setattr(app, "_confirm_weak_password", lambda: True)
+            app._wiz.set_step(0)
+
+            app._start()
+
+            assert dispatched.wait(10), "_start should dispatch the encrypt worker"
+            assert app._wiz._active == 4
+            assert app.STEPS[4] == "Encrypt" and app.STEPS[3] == "Output"
+        finally:
+            app.destroy()
+
+    def test_start_does_not_advance_when_validation_fails(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._wiz.set_step(0)
+            app._path = None          # nothing selected → _validate returns an error
+            app._start()
+            assert app._wiz._active == 0
+        finally:
+            app.destroy()
 
 
 def _fail_stand_in(mode="single", k=2, n=3):
@@ -520,82 +651,171 @@ class TestDecryptorFail:
 class TestFileCardKeyboard:
     """Fix 4: FileCard is keyboard accessible."""
 
-    def test_filecard_has_takefocus(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.FileCard.__init__)
-        assert "takefocus" in src, "FileCard should set takefocus=True"
+    @staticmethod
+    def _card(tk_root):
+        """A focused FileCard whose picker is swapped for a recorder — the real
+        one opens a modal file dialog that would hang the run."""
+        from quantacrypt.ui.shared import FileCard
+        picks = []
+        fc = FileCard(tk_root, on_select=lambda p: None)
+        fc._pick = lambda: picks.append("pick")
+        fc.pack()
+        tk_root.update()
+        _take_keyboard_focus(fc)
+        return fc, picks
 
-    def test_filecard_has_return_binding(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.FileCard.__init__)
-        assert "<Return>" in src, "FileCard should bind <Return> to _pick"
+    def test_filecard_is_in_the_tab_order(self, tk_root):
+        from quantacrypt.ui.shared import FileCard
+        fc = FileCard(tk_root, on_select=lambda p: None)
+        assert str(fc.cget("takefocus")) in ("1", "True")
 
-    def test_filecard_has_space_binding(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.FileCard.__init__)
-        assert "<space>" in src, "FileCard should bind <space> to _pick"
+    def test_filecard_return_activates_the_picker(self, tk_root):
+        fc, picks = self._card(tk_root)
+        fc.event_generate("<Return>", when="now")
+        tk_root.update()
+        assert picks == ["pick"]
+
+    def test_filecard_space_activates_the_picker(self, tk_root):
+        fc, picks = self._card(tk_root)
+        fc.event_generate("<space>", when="now")
+        tk_root.update()
+        assert picks == ["pick"]
+
+    def test_disabled_filecard_ignores_clicks(self, tk_root):
+        fc, picks = self._card(tk_root)
+        fc.set_enabled(False)
+        fc.event_generate("<Button-1>", when="now")
+        tk_root.update()
+        assert picks == []
 
 
 @requires_tkinter
 class TestSegmentedControlKeyboard:
     """Fix 17: SegmentedControl keyboard navigation."""
 
+    @staticmethod
+    def _control(tk_root, value="a"):
+        import tkinter as tk
+        from quantacrypt.ui.shared import SegmentedControl
+        var = tk.StringVar(master=tk_root, value=value)
+        sc = SegmentedControl(tk_root, [("a", "A"), ("b", "B"), ("c", "C")], var)
+        sc.pack()
+        tk_root.update()
+        _take_keyboard_focus(sc)
+        return sc, var
+
     def test_segmented_control_has_step_method(self):
         from quantacrypt.ui import shared as shared_ui
         assert hasattr(shared_ui.SegmentedControl, "_step")
 
-    def test_step_wraps_around(self):
-        """_step should cycle through options with wraparound."""
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.SegmentedControl._step)
-        assert "%" in src, "_step should use modulo for wraparound"
+    def test_step_wraps_around(self, tk_root):
+        """Stepping off either end lands on the option at the other end."""
+        sc, var = self._control(tk_root)
+        seen = []
+        for _ in range(4):
+            sc._step(1)
+            seen.append(var.get())
+        assert seen == ["b", "c", "a", "b"]
+        var.set("a")
+        sc._step(-1)
+        assert var.get() == "c"
 
-    def test_segmented_control_has_keyboard_bindings(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.SegmentedControl.__init__)
-        assert "<Left>" in src, "SegmentedControl should bind <Left>"
-        assert "<Right>" in src, "SegmentedControl should bind <Right>"
-        assert "takefocus" in src, "SegmentedControl should be focusable"
+    def test_arrow_keys_change_the_selection(self, tk_root):
+        sc, var = self._control(tk_root)
+        sc.event_generate("<Right>", when="now")
+        tk_root.update()
+        assert var.get() == "b"
+        sc.event_generate("<Left>", when="now")
+        tk_root.update()
+        assert var.get() == "a"
+
+    def test_segmented_control_is_in_the_tab_order(self, tk_root):
+        sc, _var = self._control(tk_root)
+        assert str(sc.cget("takefocus")) in ("1", "True")
+
+    def test_disabled_control_ignores_arrow_keys(self, tk_root):
+        sc, var = self._control(tk_root)
+        sc.set_enabled(False)
+        sc.event_generate("<Right>", when="now")
+        tk_root.update()
+        assert var.get() == "a"
 
 
 @requires_tkinter
 class TestFlatButtonHoverOnEnable:
-    """Fix 22: FlatButton checks hover state when re-enabled."""
+    """Fix 22: FlatButton picks up the hover colour if the pointer is already
+    over it when it is re-enabled."""
 
-    def test_enable_checks_pointer_position(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.FlatButton.enable)
-        assert "winfo_pointerxy" in src, "enable(True) should check if mouse is already hovering"
+    @staticmethod
+    def _button(tk_root):
+        from quantacrypt.ui.shared import FlatButton
+        btn = FlatButton(tk_root, "Go", lambda: None, primary=True)
+        btn.pack()
+        tk_root.update()
+        return btn
+
+    def test_enable_applies_hover_when_the_pointer_is_over_the_button(self, tk_root):
+        btn = self._button(tk_root)
+        btn.enable(False)
+        # The real pointer can't be moved from a test, so stub the single
+        # query enable() makes about where it is.
+        btn.winfo_pointerxy = lambda: (btn.winfo_rootx() + 2, btn.winfo_rooty() + 2)
+        btn.enable(True)
+        assert btn.cget("bg") == btn._hov
+
+    def test_enable_keeps_the_rest_colour_when_the_pointer_is_elsewhere(self, tk_root):
+        btn = self._button(tk_root)
+        btn.enable(False)
+        btn.winfo_pointerxy = lambda: (btn.winfo_rootx() - 500, btn.winfo_rooty() - 500)
+        btn.enable(True)
+        assert btn.cget("bg") == btn._bg
 
 
 @requires_tkinter
 class TestOutputPathPreservation:
-    """Fix 13: _load_payload only sets suggested path if field is empty."""
+    """Fix 13: _load_payload only suggests an output path when the field is empty."""
 
-    def test_load_payload_preserves_typed_path(self):
-        import inspect
-        import quantacrypt.ui.decryptor as decryptor
-        src = inspect.getsource(decryptor.DecryptorApp._load_payload)
-        assert "self._out.get().strip()" in src, \
-            "_load_payload should check if output field is empty before overwriting"
+    def test_load_payload_preserves_a_typed_path(self, tk_root, tmp_path, monkeypatch,
+                                                 qcx_sample):
+        app, _qcx = _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample)
+        try:
+            typed = str(tmp_path / "somewhere-else")
+            app._out.delete(0, "end")
+            app._out.insert(0, typed)
+            app._load_payload()          # re-render for the same file
+            assert app._out.get() == typed
+        finally:
+            app.destroy()
+
+    def test_load_payload_suggests_a_dir_for_a_newly_opened_file(self, tk_root, tmp_path,
+                                                                 monkeypatch, qcx_sample):
+        app, qcx = _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample)
+        try:
+            app._out.delete(0, "end")
+            app._out.insert(0, str(tmp_path / "somewhere-else"))
+            app._load_payload(path=str(qcx))   # a newly opened file overrides
+            assert app._out.get() == os.path.dirname(os.path.abspath(str(qcx)))
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestFnameSanitization:
-    """Fix 15: fname from metadata is sanitized with os.path.basename."""
+    """Fix 15: the filename recovered from metadata is shown as a basename, so
+    a traversal-shaped name can't be rendered as a path."""
 
-    def test_done_applies_basename_to_fname(self):
-        import inspect
-        import quantacrypt.ui.decryptor as decryptor
-        src = inspect.getsource(decryptor.DecryptorApp._done)
-        assert "os.path.basename(fname)" in src, \
-            "_done should apply os.path.basename() to fname to prevent path traversal display"
+    def test_done_shows_only_the_basename_of_the_recovered_name(self, tk_root, tmp_path,
+                                                                monkeypatch, qcx_sample):
+        app, _qcx = _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample)
+        try:
+            out = tmp_path / "restored.bin"
+            out.write_bytes(b"z" * 10)
+            app._done(str(out), 10, fname="../../../etc/passwd", sz=10, ts=0)
+            shown = _widget_texts(app._results)
+            assert "passwd" in shown
+            assert not any(".." in text for text in shown)
+        finally:
+            app.destroy()
 
     def test_basename_strips_path_traversal(self):
         import os
@@ -611,24 +831,38 @@ class TestFnameSanitization:
 class TestMatchLblClearedOnDone:
     """Fix 20: _match_lbl cleared on successful encryption."""
 
-    def test_done_clears_match_label(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._done)
-        assert "_match_lbl" in src, "_done should clear the match label"
-        assert 'text=""' in src or "text='')" in src or 'config(text="")' in src
+    def test_done_clears_the_match_label_and_the_passwords(self, tk_root, tmp_path,
+                                                           monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            out = tmp_path / "out.qcx"
+            out.write_bytes(b"y" * 4096)
+            app._match_lbl.config(text="Passwords match")
+            app._pw1v.set("hunter2-testpad")
+            app._pw2v.set("hunter2-testpad")
+            app._done(str(out), [], embedded=False)
+            assert app._match_lbl.cget("text") == ""
+            assert app._pw1v.get() == "" and app._pw2v.get() == ""
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestWizardStepsLabelTruncation:
-    """Fix 21: WizardSteps truncates long step labels."""
+    """Fix 21: WizardSteps truncates step labels that don't fit their slot."""
 
-    def test_draw_truncates_labels(self):
-        import inspect
-        import quantacrypt.ui.shared as shared_ui
-        src = inspect.getsource(shared_ui.WizardSteps._draw)
-        assert "…" in src or "\\u2026" in src, \
-            "WizardSteps._draw should truncate long labels with ellipsis"
+    def test_draw_truncates_long_labels(self, tk_root):
+        from quantacrypt.ui.shared import WizardSteps
+        long_name = "Extraordinarily Long Step Name"
+        w = WizardSteps(tk_root, ["Source", long_name, "Out"])
+        w.pack()
+        tk_root.update()
+        drawn = [w.itemcget(i, "text") for i in w.find_all() if w.type(i) == "text"]
+        assert "Source" in drawn and "Out" in drawn          # short labels untouched
+        shortened = [t for t in drawn if t.startswith("Extraordina")]
+        assert shortened, f"long label missing from {drawn}"
+        assert shortened[0] != long_name
+        assert shortened[0].endswith("…") and len(shortened[0]) < len(long_name)
 
 
 @requires_tkinter
@@ -643,93 +877,191 @@ class TestFreezeThaw:
         from quantacrypt.ui import encryptor
         assert hasattr(encryptor.EncryptorApp, "_thaw")
 
-    def test_freeze_disables_password_fields(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._freeze)
-        assert "_pw1" in src and "_pw2" in src, "_freeze should disable both password fields"
+    def test_freeze_disables_password_fields_and_the_action_button(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            assert app._pw1.cget("state") == "normal"
+            app._freeze()
+            assert app._pw1.cget("state") == "disabled"
+            assert app._pw2.cget("state") == "disabled"
+            assert app._btn._enabled is False
+        finally:
+            app.destroy()
 
-    def test_thaw_re_enables_fields(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._thaw)
-        assert "_pw1" in src or "normal" in src, "_thaw should re-enable fields"
+    def test_thaw_re_enables_fields(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._freeze()
+            app._thaw()
+            assert app._pw1.cget("state") == "normal"
+            assert app._pw2.cget("state") == "normal"
+            assert app._btn._enabled is True
+        finally:
+            app.destroy()
+
+    def test_thaw_keeps_password_fields_disabled_in_shamir_mode(self, tk_root, monkeypatch):
+        """Shamir mode has no password, so thawing must not hand the fields back."""
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._mode.set("shamir")
+            tk_root.update()
+            app._freeze()
+            app._thaw()
+            assert app._pw1.cget("state") == "disabled"
+            assert app._btn._enabled is True
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestShamirKClamp:
-    """Fix 12: K is clamped to N in real time."""
+    """Fix 12: K is clamped to N, debounced so a half-typed number survives."""
 
     def test_clamp_k_method_exists(self):
         from quantacrypt.ui import encryptor
         assert hasattr(encryptor.EncryptorApp, "_clamp_k")
 
-    def test_clamp_k_logic(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        # _clamp_k was refactored to debounce via _do_clamp so that typing
-        # a two-digit number doesn't flash the minimum value after the first digit.
-        # The actual clamping (self._k.set) now lives in _do_clamp.
-        clamp_src = inspect.getsource(encryptor.EncryptorApp._clamp_k)
-        do_clamp_src = inspect.getsource(encryptor.EncryptorApp._do_clamp)
-        assert ("self._clamp_job" in clamp_src or "_do_clamp" in clamp_src), "_clamp_k should delegate to debounced _do_clamp"
-        assert "self._k.set" in do_clamp_src, "_do_clamp should update K when it exceeds N"
-        assert "self._n.get(" in do_clamp_src
+    def test_clamp_k_defers_the_clamp_then_applies_it(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._n.set(3)
+            app._k.set(9)
+            app._clamp_k()
+            # Debounced: the value still being typed must survive the keystroke…
+            assert app._k.get() == 9
+            assert app._clamp_job
+            assert _pump_until(app, lambda: not app._clamp_job), "clamp never ran"
+            # …and be pulled down to N once typing stops.
+            assert app._k.get() == 3
+            assert app._n.get() == 3
+        finally:
+            app.destroy()
+
+    def test_do_clamp_bounds_n_and_k(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._n.set(99)
+            app._k.set(1)
+            app._do_clamp()
+            assert (app._n.get(), app._k.get()) == (20, 2)
+            app._n.set(1)
+            app._k.set(1)
+            app._do_clamp()
+            assert (app._n.get(), app._k.get()) == (2, 2)
+        finally:
+            app.destroy()
+
+    def test_clamp_k_summary_reports_the_clamped_values(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._n.set(5)
+            app._k.set(9)
+            app._clamp_k()
+            assert app._shamir_summary.cget("text") == \
+                "Any 5 of 5 people can unlock the file"
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestDropHintConditional:
-    """Fix 9: Drop hint only mentions drag-and-drop if tkinterdnd2 is available."""
+    """Fix 9: the drop hint is only shown when a drop target was registered —
+    otherwise it promises something the build can't do."""
 
-    def test_launcher_has_conditional_drop_hint(self):
-        import inspect
+    @staticmethod
+    def _launcher(tk_root, tmp_path, monkeypatch, dnd):
         import quantacrypt.ui.launcher as launcher
-        src = inspect.getsource(launcher.LauncherApp._build)
-        assert "_DND_FILES" in src, \
-            "Launcher drop hint should be conditional on _DND_FILES being available"
+        import quantacrypt.ui.updater as updater
+        from quantacrypt.ui.shared import RecentFiles, RecentVolumes
+        monkeypatch.setattr(RecentFiles, "_PATH", str(tmp_path / "recent.json"))
+        monkeypatch.setattr(RecentVolumes, "_PATH", str(tmp_path / "volumes.json"))
+        monkeypatch.setattr(launcher, "_DND_FILES", dnd)
+        # src defect: LauncherApp.__init__ (src/quantacrypt/ui/launcher.py:50-51)
+        # unconditionally starts updater.check_for_update's daemon thread — a
+        # live GitHub request with no opt-out — and that thread outlives the
+        # test that built the window.  Any garbage collection that lands on it
+        # finalises a Tk interpreter off the main thread, and Tcl aborts the
+        # whole process ("Tcl_AsyncDelete: async handler deleted by the wrong
+        # thread", SIGABRT).  Measured: seeds that put this class before the
+        # remaining Tk tests killed the run outright (seed 1000003, 19 tests
+        # in).  Keeping that thread from starting is this test's own reset of
+        # state production leaks; it changes nothing the class asserts on.
+        monkeypatch.setattr(updater, "check_for_update", lambda *a, **k: None)
+        app = launcher.LauncherApp(tk_root)
+        app.withdraw()
+        return app
+
+    def test_no_drop_promise_without_tkinterdnd2(self, tk_root, tmp_path, monkeypatch):
+        app = self._launcher(tk_root, tmp_path, monkeypatch, None)
+        try:
+            assert app._hint.cget("text") == ""
+            assert not any("drop" in t.lower() or "drag" in t.lower()
+                           for t in _widget_texts(app))
+        finally:
+            app.destroy()
+
+    def test_drop_hint_shown_when_tkinterdnd2_is_present(self, tk_root, tmp_path, monkeypatch):
+        app = self._launcher(tk_root, tmp_path, monkeypatch, "DND_Files")
+        try:
+            assert "drop" in app._hint.cget("text").lower()
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestSelfExecutingSection:
-    """Fix 11: SELF-EXECUTING section hidden when no binary found."""
+    """Fix 11: the PORTABLE FILE section is hidden when no decryptor binary
+    exists to embed (frozen builds, and source checkouts without a build)."""
 
-    def test_build_checks_for_binary(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._build)
-        assert "_find_dec" in src or "frozen" in src, \
-            "_build should check for binary before showing SELF-EXECUTING section"
+    def test_section_hidden_without_a_binary(self, tk_root, monkeypatch):
+        app = _encryptor_app(tk_root, monkeypatch, find_dec=None)
+        try:
+            assert not hasattr(app, "_embed_chk")
+            assert not any("PORTABLE" in t for t in _widget_texts(app))
+        finally:
+            app.destroy()
 
-    def test_section_shown_conditionally(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._build)
-        # Should only show section inside an if block
-        lines = src.split("\n")
-        section_line = next((i for i, l in enumerate(lines) if "PORTABLE FILE" in l or "SELF-EXECUTING" in l), None)
-        assert section_line is not None
-        # The section should be inside an if block (preceded by an if statement)
-        preceding = "\n".join(lines[max(0,section_line-5):section_line])
-        assert "if " in preceding, "SELF-EXECUTING section should be inside an if block"
+    def test_section_shown_when_a_binary_is_found(self, tk_root, tmp_path, monkeypatch):
+        fake = tmp_path / "quantacrypt-decryptor"
+        fake.write_bytes(b"#!/bin/sh\nexit 0\n")
+        app = _encryptor_app(tk_root, monkeypatch, find_dec=str(fake))
+        try:
+            assert hasattr(app, "_embed_chk")
+            assert any("PORTABLE" in t for t in _widget_texts(app))
+        finally:
+            app.destroy()
 
 
 @requires_tkinter
 class TestSizeAnnotation:
-    """Fix 19: Success card annotates decryptor overhead in size label."""
+    """Fix 19: the success card splits decryptor overhead out of the total size."""
 
-    def test_done_annotates_embedded_size(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._done)
-        assert "dec_size" in src or "decryptor" in src.lower(), \
-            "_done should annotate decryptor size in the success card"
+    def test_done_splits_decryptor_and_payload_sizes(self, tk_root, tmp_path, monkeypatch):
+        from quantacrypt.ui.shared import fmt_size
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            out = tmp_path / "out.qcx"
+            out.write_bytes(b"y" * 5000)
+            app._done(str(out), [], embedded=True, dec_size=2000)
+            expected = (f"{fmt_size(5000)}  ({fmt_size(2000)} decryptor + "
+                        f"{fmt_size(3000)} data)")
+            assert expected in _widget_texts(app._results)
+        finally:
+            app.destroy()
 
-    def test_done_labels_payload_separately(self):
-        import inspect
-        import quantacrypt.ui.encryptor as encryptor
-        src = inspect.getsource(encryptor.EncryptorApp._done)
-        assert "payload_size" in src or "data)" in src, \
-            "_done should show payload vs decryptor sizes separately"
+    def test_done_shows_a_plain_size_when_nothing_is_embedded(self, tk_root, tmp_path,
+                                                              monkeypatch):
+        from quantacrypt.ui.shared import fmt_size
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            out = tmp_path / "out.qcx"
+            out.write_bytes(b"y" * 5000)
+            app._done(str(out), [], embedded=False)
+            texts = _widget_texts(app._results)
+            assert fmt_size(5000) in texts
+            assert not any("decryptor +" in t for t in texts)
+        finally:
+            app.destroy()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -781,7 +1113,7 @@ class TestStreamingConstants:
 class TestStreamingRoundTrip:
     """Full encrypt → decrypt round-trips with the streaming API."""
 
-    def _enc_dec(self, tmp_path, data, password="hunter2", filename="test.bin"):
+    def _enc_dec(self, tmp_path, data, password="hunter2-testpad", filename="test.bin"):
         src = tmp_path / "src.bin"
         enc = tmp_path / "src.qcx"
         out = tmp_path / "out.bin"
@@ -906,7 +1238,7 @@ class TestStreamingRoundTrip:
 class TestStreamingSecurity:
     """Security properties of the streaming format."""
 
-    def _make_encrypted(self, tmp_path, data=None, password="pw"):
+    def _make_encrypted(self, tmp_path, data=None, password="pw-testpad"):
         if data is None:
             data = os.urandom(cc.CHUNK_SIZE * 3)
         src = tmp_path / "src.bin"
@@ -920,7 +1252,7 @@ class TestStreamingSecurity:
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
         return enc, meta, data
 
-    def _get_final_key(self, meta, password="pw"):
+    def _get_final_key(self, meta, password="pw-testpad"):
         argon_key = cc.argon2id_derive(password.encode(), base64.b64decode(meta["argon_salt"]))
         sk        = cc.aes_gcm_decrypt(argon_key, base64.b64decode(meta["kyber_sk_enc_nonce"]),
                                        base64.b64decode(meta["kyber_sk_enc"]))
@@ -1333,6 +1665,7 @@ class TestBatchOutputPaths:
         assert [os.path.basename(o) for o in outs] == ["x.qcx", "y.qcx"]
 
 
+@requires_tkinter
 class TestSaveIndividualSharesDisarmsGuard:
     """R5 F-001 (run-4 regression): the single-file 'Save individual
     files' path must disarm the "__single__" guard token even though the
@@ -1378,6 +1711,7 @@ class TestSaveIndividualSharesDisarmsGuard:
         assert obj._shares_pending == {"/out/b.qcx"}
 
 
+@requires_tkinter
 class TestShamirKnSnapshot:
     """R6 F-001: k/n must be frozen at encryption start — spinbox drift
     after start must not leak into mnemonics or share files."""

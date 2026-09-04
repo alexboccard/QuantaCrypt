@@ -165,6 +165,7 @@ class VolumeManagerApp(tk.Toplevel):
         self._rows: dict[str, dict] = {}
         self._last_mounted_key: tuple | None = None
         self._refresh_job = None
+        self._focus_job = None
         self._status_job = None
         self._tickers: dict[str, dict] = {}
         self._empty_note = ""
@@ -189,7 +190,11 @@ class VolumeManagerApp(tk.Toplevel):
         self.bind("<Escape>", lambda e: self._close())
         bind_shortcut(self, "n", lambda: self._mode_var.set("create"))
         bind_shortcut(self, "m", lambda: self._mode_var.set("mount"))
-        self.after(50, self._focus_first)
+        # Tracked, not fire-and-forget: _cancel_jobs() cancels every other
+        # timer in this class, and an untracked one outlives the window it
+        # was scheduled from — it then moves the keyboard focus of whatever
+        # window exists 50 ms later.
+        self._focus_job = self.after(50, self._focus_first)
         self._schedule_refresh()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -246,13 +251,14 @@ class VolumeManagerApp(tk.Toplevel):
             return False
 
     def _cancel_jobs(self):
-        for job in (self._refresh_job, self._status_job):
+        for job in (self._refresh_job, self._status_job,
+                    getattr(self, "_focus_job", None)):
             if job is not None:
                 try:
                     self.after_cancel(job)
                 except Exception:
                     pass
-        self._refresh_job = self._status_job = None
+        self._refresh_job = self._status_job = self._focus_job = None
         for key in list(self._tickers):
             self._stop_ticker(key)
 
@@ -524,6 +530,13 @@ class VolumeManagerApp(tk.Toplevel):
             if not pw:
                 self._fail_create("Enter a password.", self._pw_entry)
                 return
+            # Same floor as the core, checked before the weak-password
+            # dialog: otherwise "Use it anyway" leads to a guaranteed failure.
+            if len(pw) < cc.MIN_PASSWORD_LENGTH:
+                self._fail_create(
+                    f"Use at least {cc.MIN_PASSWORD_LENGTH} characters.",
+                    self._pw_entry)
+                return
             if pw != pw2:
                 self._fail_create("The two passwords don't match.", self._pw2_entry)
                 return
@@ -753,15 +766,15 @@ class VolumeManagerApp(tk.Toplevel):
 
         def _copy(share: str, btn: FlatButton):
             try:
-                win.clipboard_clear()
-                win.clipboard_append(share)
+                # Marks the share concealed so clipboard managers skip it, and
+                # arms the countdown that wipes only this copy.
+                timer.copy(win, share)
             except tk.TclError:
                 btn.set_text(f"{ICON['err']} Failed")
                 return
             state["copied"] = True
             btn.set_text(f"{ICON['ok']} Copied")
             win.after(1500, lambda: btn.set_text("Copy") if btn.winfo_exists() else None)
-            timer.start()
 
         for i, share in enumerate(shares):
             inner = card(win, padx=SP["m"], pady=SP["s"])

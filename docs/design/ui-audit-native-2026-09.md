@@ -493,10 +493,10 @@ What changed, by finding:
 | M-08 | "Check it opens" on the encrypt result routes to Decrypt's `verify()`, which writes nothing. |
 | A-01, A-02 | `.combine` → `.contain` on DropZone and ProgressPanel, so the Choose and Cancel buttons exist for VoiceOver again. |
 | A-03 | Section shortcuts moved to ⇧⌘E / ⇧⌘D / ⇧⌘M; ⌘M goes back to Minimize. |
-| A-04, M-11 | Recent rows get a hover highlight, and File ▸ Open Recent carries the same list for keyboard users. |
+| A-04, M-11 | Recent rows get a hover highlight, and File ▸ Open Recent carries the same list plus "Show in Finder" / "Remove from Recent" submenus, so both secondary actions are keyboard-reachable. **Scope change:** A-04 asked for Recent rows to be keyboard-navigable *list* rows with selection; they were deliberately left as `.plain` buttons instead, because arrowing onto a row in a selection-driven list would open the file. The menu carries the keyboard path. |
 | A-05, M-12 | Outcomes post an `AccessibilityNotification.Announcement`. |
 | A-06, A-07 | The mount-point value and all five "Change…" buttons have distinct VoiceOver names. |
-| A-10, Q-15 | The two raw `.font(.system(size:))` values are gone; Settings uses `minWidth`. |
+| A-10, Q-15 | The two raw `.font(.system(size:))` values are gone and Settings uses `minWidth`. The two fixed 120 pt strength meters A-10 also named (`CredentialFields.swift`, `VolumesView.swift`) were **missed in the first pass** and are now `minWidth: 80, idealWidth: 120`. |
 
 Not done, and why:
 
@@ -521,4 +521,5 @@ Not done, and why:
 - `xcodegen generate` is required after adding a Swift file; the first run of
   `GuardrailTests` silently did not execute because the project had not been
   regenerated and the total stayed at 48.
-- Swift tests: 48 before, 62 after, 0 failures. No Python was touched.
+- Swift tests: 48 before, 62 after this audit, 79 after review run 11's
+  follow-up fixes. No Python was touched by the audit itself.

@@ -1,0 +1,12 @@
+{
+  "event": "done",
+  "id": "d",
+  "result": {
+    "filename": "notes.txt",
+    "original_size": 52000,
+    "output": "/fixture/notes.txt",
+    "renamed": false,
+    "size": 52000,
+    "timestamp": 1700000000
+  }
+}

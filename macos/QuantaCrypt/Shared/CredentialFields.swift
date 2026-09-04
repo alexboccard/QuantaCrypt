@@ -20,7 +20,10 @@ struct NewPasswordFields: View {
                     HStack(spacing: 8) {
                         ProgressView(value: Double(strength.level.rawValue), total: 4)
                             .tint(tint)
-                            .frame(width: 120)
+                            // Not a fixed width: at accessibility text sizes
+                            // the label beside it needs the room more than the
+                            // meter does.
+                            .frame(minWidth: 80, idealWidth: 120)
                         Text(strength.level.label)
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -87,7 +90,7 @@ struct SplitKeyFields: View {
 
 /// Share entry for unlocking: k text fields, load-from-files, add-another.
 struct ShareEntryFields: View {
-    @Binding var shares: [String]
+    @Binding var shares: [ShareEntry]
     let required: Int?
     let total: Int?
     let onLoadFiles: () -> Void
@@ -99,15 +102,19 @@ struct ShareEntryFields: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        ForEach(shares.indices, id: \.self) { index in
-            TextField("Share \(index + 1)", text: $shares[index], axis: .vertical)
+        // Identified rows, not `shares.indices`: the array shrinks under this
+        // view (blanks dropped by a file load, "Remove last share"), and an
+        // index-keyed row body re-evaluated against the old count traps on
+        // `$shares[index]`.
+        ForEach(Array($shares.enumerated()), id: \.element.id) { index, $entry in
+            TextField("Share \(index + 1)", text: $entry.text, axis: .vertical)
                 .lineLimit(1...4)
                 .font(.body.monospaced())
                 .autocorrectionDisabled()
         }
         HStack {
             Button("Load from files…", action: onLoadFiles)
-            Button("Add another share") { shares.append("") }
+            Button("Add another share") { shares.append(ShareEntry()) }
                 .disabled(total.map { shares.count >= $0 } ?? (shares.count >= 20))
             if shares.count > (required ?? 1) {
                 Button("Remove last share") { shares.removeLast() }

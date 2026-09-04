@@ -7,8 +7,13 @@ on:
 
   workflow_dispatch:   # allow manual runs for testing (no release created)
 
+# Least privilege: only `release` (gh release create) and `bump-version`
+# (git push) need write, and they say so per job.  The build jobs execute a
+# lot of code fetched at build time — Homebrew, PyInstaller, a python.org
+# installer, mutable tag-pinned actions — and a compromise in any of it
+# should fail the build, not rewrite the repository or publish a release.
 permissions:
-  contents: write      # needed to create GitHub Releases
+  contents: read
 
 env:
   # Universal2 Python from python.org — contains both arm64 and x86_64
@@ -34,8 +39,11 @@ jobs:
           pip install --require-hashes -r requirements-lock.txt
           pip install --no-deps .
 
+      # -p no:randomly: pytest-randomly is in the lock because the periodic
+      # shuffled run is the only thing that catches order-dependence, but a
+      # release gate has to be reproducible, not exploratory.
       - name: Run tests
-        run: python -m pytest --tb=short -q
+        run: python -m pytest --tb=short -q -p no:randomly
 
   build-arm64:
     name: Build (arm64)
@@ -45,17 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # sed exits 0 when nothing matches, so a reformatted version line used
+      # to ship a release labelled with the previous version — and the
+      # in-app update checker then shows every user a banner that installing
+      # cannot clear.  stamp_version.py fails on a missed target.
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          VER="${GITHUB_REF#refs/tags/v}"
-          echo "Stamping version: $VER"
-          # Update pyproject.toml (used by build.py for Info.plist)
-          sed -i '' "s/^version = .*/version = \"$VER\"/" pyproject.toml
-          # Update __init__.py fallback (shown in the app UI)
-          sed -i '' "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
-          grep 'version' pyproject.toml | head -1
-          grep '__version__' src/quantacrypt/__init__.py
+        run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -70,11 +74,17 @@ jobs:
       - name: Build .app and .dmg
         run: python scripts/build.py --arch arm64 --skip-tests
 
-      - name: Verify built binary is arm64
+      # Architecture *and* signature: an unsigned or half-signed .app opens
+      # as "damaged and can't be opened" rather than showing the expected
+      # unidentified-developer prompt, which is the exact failure the ad-hoc
+      # signing exists to prevent.  build.py already fails on a signing
+      # error; this is the independent check on the artefact we publish.
+      - name: Verify the built app is arm64 and signed
         run: |
           file dist/quantacrypt.app/Contents/MacOS/quantacrypt
           file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "arm64" || { echo "ERROR: binary is not arm64!"; exit 1; }
-          echo "✓ Binary verified as arm64"
+          codesign --verify --deep --strict dist/quantacrypt.app
+          echo "✓ Binary verified as arm64 and signed"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
@@ -93,11 +103,7 @@ jobs:
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          VER="${GITHUB_REF#refs/tags/v}"
-          echo "Stamping version: $VER"
-          sed -i '' "s/^version = .*/version = \"$VER\"/" pyproject.toml
-          sed -i '' "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
+        run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       - name: Install Rosetta 2
         run: sudo softwareupdate --install-rosetta --agree-to-license
@@ -144,11 +150,17 @@ jobs:
           ARCHFLAGS: "-arch x86_64"
           _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
 
-      - name: Verify built binary is x86_64
+      # Architecture *and* signature: an unsigned or half-signed .app opens
+      # as "damaged and can't be opened" rather than showing the expected
+      # unidentified-developer prompt, which is the exact failure the ad-hoc
+      # signing exists to prevent.  build.py already fails on a signing
+      # error; this is the independent check on the artefact we publish.
+      - name: Verify the built app is x86_64 and signed
         run: |
           file dist/quantacrypt.app/Contents/MacOS/quantacrypt
           file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "x86_64" || { echo "ERROR: binary is not x86_64!"; exit 1; }
-          echo "✓ Binary verified as x86_64"
+          codesign --verify --deep --strict dist/quantacrypt.app
+          echo "✓ Binary verified as x86_64 and signed"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
@@ -168,11 +180,7 @@ jobs:
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          VER="${GITHUB_REF#refs/tags/v}"
-          sed -i '' "s/^version = .*/version = \"$VER\"/" pyproject.toml
-          sed -i '' "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
-          sed -i '' "s/CFBundleShortVersionString: .*/CFBundleShortVersionString: \"$VER\"/" macos/project.yml
+        run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -210,6 +218,8 @@ jobs:
     needs: [build-arm64, build-x86_64, build-native]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # gh release create
 
     steps:
       - uses: actions/checkout@v6
@@ -227,10 +237,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Collect by glob rather than by hand: the previous list named
+          # artifacts/QuantaCrypt-arm64/QuantaCrypt-arm64.dmg, which was wrong
+          # in both segments (the native job uploads QuantaCrypt-native-arm64),
+          # so every tag failed here after a ~60-minute build and bump-version
+          # never ran. Asserting the count keeps a silently-missing artifact
+          # from publishing a partial release instead.
+          mapfile -t DMGS < <(find artifacts -name '*.dmg' | sort)
+          echo "Found ${#DMGS[@]} DMG(s):"
+          printf '  %s\n' "${DMGS[@]}"
+          if [ "${#DMGS[@]}" -ne 3 ]; then
+            echo "::error::expected 3 DMGs (arm64, x86_64, native), got ${#DMGS[@]}"
+            exit 1
+          fi
           gh release create "${{ steps.version.outputs.tag }}" \
-            artifacts/quantacrypt-arm64/quantacrypt-arm64.dmg \
-            artifacts/quantacrypt-x86_64/quantacrypt-x86_64.dmg \
-            artifacts/QuantaCrypt-arm64/QuantaCrypt-arm64.dmg \
+            "${DMGS[@]}" \
             --title "QuantaCrypt ${{ steps.version.outputs.tag }}" \
             --generate-notes
 
@@ -238,6 +259,8 @@ jobs:
     name: Commit released version back to repo
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # git push origin master
 
     steps:
       - uses: actions/checkout@v6
@@ -245,21 +268,37 @@ jobs:
           ref: master
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # Same structural stamp as the build jobs, so master cannot end up
+      # carrying a version the release never built.  It also reaches
+      # macos/project.yml, which the sed here never touched — the native
+      # app's CFBundleShortVersionString has been stamped in CI and then
+      # left at the old value in the repo on every release so far.
       - name: Update version files
+        run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
+
+      # uv.lock records the project's own version, so bumping pyproject.toml
+      # without relocking left the lock one release behind, every release.
+      # The lock is the "a release is what was reviewed" guarantee that CI
+      # installs from with --require-hashes; uv comes from that same lock so
+      # the resolver version is pinned too.
+      - name: Regenerate the dependency lock
         run: |
-          VER="${GITHUB_REF#refs/tags/v}"
-          echo "Bumping repo version to $VER"
-          sed -i "s/^version = .*/version = \"$VER\"/" pyproject.toml
-          sed -i "s/__version__ = \".*\"/__version__ = \"$VER\"/" src/quantacrypt/__init__.py
-          echo "pyproject.toml: $(grep '^version' pyproject.toml)"
-          echo "__init__.py:    $(grep '__version__' src/quantacrypt/__init__.py)"
+          pip install --require-hashes -r requirements-lock.txt
+          uv lock
+          uv export --frozen --no-emit-project --all-extras \
+            --format requirements.txt -o requirements-lock.txt
 
       - name: Commit and push
         run: |
           VER="${GITHUB_REF#refs/tags/v}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml src/quantacrypt/__init__.py
+          git add pyproject.toml src/quantacrypt/__init__.py macos/project.yml \
+                  uv.lock requirements-lock.txt
           git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
           git commit -m "chore: bump version to $VER [skip ci]"
           git push origin master

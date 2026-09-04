@@ -285,7 +285,8 @@ class QuantaCryptFUSE(_FuseOperations):
         then refused every copy into the mount — and journal dead space
         inflated the number after deletes.
         """
-        stats = self.volume.stat()
+        with self._lock:
+            stats = self.volume.stat()
         used = stats.get("total_plaintext_size", 0)
         bsize = 4096
         try:
@@ -294,6 +295,12 @@ class QuantaCryptFUSE(_FuseOperations):
             host_free = host.f_bavail * host.f_frsize
         except OSError:
             host_free = 1 << 40  # host unstat-able: claim 1 TB free
+        # NB: the write path's memory ceiling is deliberately NOT applied
+        # here. It bounds a single file, not the filesystem, and folding it
+        # into f_bavail made a volume on a 274 GB disk report 2 GB total and
+        # 2 GB free — a worse lie than the one it set out to fix, and a
+        # return of the very "full disk" symptom R8 F-001 removed. The bound
+        # is enforced in write(), where it actually applies, as EFBIG.
         total_blocks = (used + host_free) // bsize
         free_blocks = host_free // bsize
         return {
@@ -332,25 +339,29 @@ class QuantaCryptFUSE(_FuseOperations):
         # resolvable even if fds remain open on it.  The still-open fd can
         # access data via its fh (FUSE read/write), but a fresh getattr
         # against the name must fail.
+        # One acquisition for the whole read: the unlink set, the index
+        # lookup and the buffer size are all mutated by other FUSE workers,
+        # and a torn read across them reports a size for a file that is no
+        # longer there. _lock is an RLock, so nesting inside callers is free.
         with self._lock:
             if vpath in self._pending_unlink:
                 raise OSError(errno.ENOENT, "No such file or directory", path)
 
-        # Check as file first, then as directory
-        entry = self.volume.get_entry(vpath)
-        if entry is None:
-            entry = self.volume.get_entry(vpath + "/")
-        if entry is None:
-            raise OSError(errno.ENOENT, "No such file or directory", path)
+            # Check as file first, then as directory
+            entry = self.volume.get_entry(vpath)
+            if entry is None:
+                entry = self.volume.get_entry(vpath + "/")
+            if entry is None:
+                raise OSError(errno.ENOENT, "No such file or directory", path)
 
-        is_dir = entry.get("type") == "dir"
-        mode = entry.get("mode", 0o40755 if is_dir else 0o100644)
-        mtime = entry.get("mtime", int(time.time()))
+            is_dir = entry.get("type") == "dir"
+            mode = entry.get("mode", 0o40755 if is_dir else 0o100644)
+            mtime = entry.get("mtime", int(time.time()))
 
-        # If the file has been modified in a buffer, report buffer size
-        size = entry.get("size", 0)
-        if vpath in self._file_buffers:
-            size = len(self._file_buffers[vpath])
+            # If the file has been modified in a buffer, report buffer size
+            size = entry.get("size", 0)
+            if vpath in self._file_buffers:
+                size = len(self._file_buffers[vpath])
 
         return {
             "st_mode": mode,
@@ -374,8 +385,10 @@ class QuantaCryptFUSE(_FuseOperations):
         """
         vpath = self._vpath(path)
         entries = [".", ".."]
-        raw = self.volume.list_dir(vpath)
         with self._lock:
+            # Both reads under one acquisition: list_dir() walks dir_index,
+            # which other FUSE workers mutate.
+            raw = self.volume.list_dir(vpath)
             pending = set(self._pending_unlink)
         if pending:
             prefix = vpath if vpath.endswith("/") else vpath + "/"
@@ -538,6 +551,21 @@ class QuantaCryptFUSE(_FuseOperations):
 
             # Extend buffer if writing past end
             end = offset + len(data)
+            # The write path holds roughly 4x the file in RAM (buffer,
+            # bytes() snapshot, per-chunk ciphertext list, joined result), so
+            # a large enough file dies with a MemoryError mid-write and
+            # flush()'s journal append never happens. Refusing up front with
+            # EFBIG is a real error the user's tools understand, and unlike a
+            # statfs cap it does not misreport the size of the volume.
+            # The durable fix is chunk-granular writes (format v3, queued).
+            ceiling = _max_writable_bytes()
+            if end > ceiling:
+                raise OSError(
+                    errno.EFBIG,
+                    f"File would exceed this volume's {ceiling // (1 << 20)} MB "
+                    "single-file limit (the encrypt path buffers it in memory)",
+                    path,
+                )
             if end > len(buf):
                 buf.extend(b"\x00" * (end - len(buf)))
             buf[offset:end] = data
@@ -740,30 +768,27 @@ class QuantaCryptFUSE(_FuseOperations):
             self._persist_locked()
 
     def chmod(self, path: str, mode: int) -> int:
-        """Update mode in memory.  Not journaled — permissions inside the
-        volume are cosmetic (the mount is single-user), but returning the
-        fusepy default EROFS would break tools that chmod after saving."""
-        vpath = self._vpath(path)
-        entry = self.volume.get_entry(vpath)
-        if entry is None:
-            entry = self.volume.get_entry(vpath + "/")
-        if entry is None:
-            raise OSError(errno.ENOENT, "No such file or directory", path)
-        entry["mode"] = mode
+        """Update mode, journaled so it survives unmount."""
+        with self._lock:
+            if not self.volume.set_attrs(self._vpath(path), mode=mode):
+                raise OSError(errno.ENOENT, "No such file or directory", path)
         return 0
 
     def utimens(self, path: str, times: tuple | None = None) -> int:
-        """Update mtime in memory (same non-journaled rationale as chmod)."""
-        vpath = self._vpath(path)
-        entry = self.volume.get_entry(vpath)
-        if entry is None:
-            entry = self.volume.get_entry(vpath + "/")
-        if entry is None:
-            raise OSError(errno.ENOENT, "No such file or directory", path)
-        entry["mtime"] = int(times[1]) if times else int(time.time())
+        """Update mtime, journaled so it survives unmount.
+
+        This is what cp -p, rsync -t, unzip, tar -x and Finder issue after
+        writing a file, so dropping it silently re-stamped every copied file
+        with its copy time and broke incremental sync.
+        """
+        mtime = int(times[1]) if times else int(time.time())
+        with self._lock:
+            if not self.volume.set_attrs(self._vpath(path), mtime=mtime):
+                raise OSError(errno.ENOENT, "No such file or directory", path)
         return 0
 
-    def save_all_dirty(self, apply_pending_unlink: bool = True) -> None:
+    def save_all_dirty(self, apply_pending_unlink: bool = True,
+                       lock_timeout: float | None = None) -> None:
         """Flush all dirty FUSE buffers to the volume, then persist the volume.
 
         Acquires the FUSE ops lock so this cannot race with an in-flight
@@ -788,7 +813,18 @@ class QuantaCryptFUSE(_FuseOperations):
         still-serving mount lets a later flush on the still-open fd write
         the deleted file straight back into the container.
         """
-        with self._lock:
+        if lock_timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=lock_timeout):
+            # Signal path only. Skipping this volume leaves it exactly as a
+            # SIGKILL would; hanging here would lose every other volume too.
+            logger.warning(
+                "Emergency save: could not acquire the lock for %s within "
+                "%.1fs — skipping (a filesystem operation is still running)",
+                self.volume.path, lock_timeout,
+            )
+            return
+        try:
             for vpath in list(self._dirty_files):
                 if vpath in self._pending_unlink:
                     continue
@@ -801,6 +837,8 @@ class QuantaCryptFUSE(_FuseOperations):
                 self.apply_pending_unlinks()
             elif self.volume.is_dirty:
                 self.volume.save()
+        finally:
+            self._lock.release()
 
     def apply_pending_unlinks(self) -> None:
         """Apply deferred unlinks whose fds will never see release().
@@ -912,6 +950,24 @@ def _reap_dead_mounts_locked() -> None:
 # unwritable mount point, busy target) the thread dies inside this window
 # and we propagate the exception instead of registering a zombie mount.
 _FUSE_STARTUP_TIMEOUT = 2.0
+# Bound on the external unmount tool. Held under _mount_lock, so an
+# unbounded call here blocks every other mount operation in the process.
+_UNMOUNT_TIMEOUT = 30.0
+
+#: How much of a file the write path holds in RAM at once, as a multiple of
+#: its size: the write buffer, the bytes() snapshot, the per-chunk ciphertext
+#: list, and the joined result.
+_WRITE_MEMORY_FACTOR = 4
+
+
+def _max_writable_bytes() -> int:
+    """Largest file the in-memory write path can be expected to handle."""
+    try:
+        total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 1 << 40      # unknown: do not constrain
+    # Half of physical memory, divided by the copies the write path makes.
+    return max(total_ram // 2 // _WRITE_MEMORY_FACTOR, 64 * 1024 * 1024)
 
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 
@@ -920,7 +976,7 @@ _signals_registered = False
 _shutdown_lock = threading.Lock()
 
 
-def _emergency_save_all() -> None:
+def _emergency_save_all(lock_timeout: float | None = None) -> None:
     """Save all dirty mounted volumes.
 
     Called by atexit and signal handlers to prevent data loss on
@@ -928,6 +984,10 @@ def _emergency_save_all() -> None:
     so that buffered writes not yet flushed are still persisted.
     Errors are logged but never raised so that the shutdown sequence
     is not interrupted.
+
+    ``lock_timeout`` bounds each volume's lock acquisition; the signal path
+    passes one so a FUSE worker holding the lock cannot hang the process.
+    atexit passes None, because there it is safe to wait.
     """
     for mp in list(_mounted_volumes):
         info = _mounted_volumes.get(mp)
@@ -937,7 +997,7 @@ def _emergency_save_all() -> None:
             fuse_obj = info.get("fuse")
             if fuse_obj is not None:
                 logger.info("Shutdown: saving dirty state for volume at %s", mp)
-                fuse_obj.save_all_dirty()
+                fuse_obj.save_all_dirty(lock_timeout=lock_timeout)
             else:
                 vc = info["volume"]
                 if vc.is_dirty:
@@ -946,9 +1006,29 @@ def _emergency_save_all() -> None:
             logger.exception("Shutdown: failed to save volume at %s", mp)
 
 
+#: How long the signal path waits for a volume's lock before giving up on
+#: that volume. Python runs signal handlers on the main thread between
+#: bytecodes, so an unbounded acquire here hangs the whole process when a
+#: FUSE worker is mid-write — the caller then escalates to SIGKILL and the
+#: buffer is lost, which is the exact outcome this handler exists to prevent.
+_SIGNAL_SAVE_TIMEOUT = 2.0
+
+
 def _signal_handler(signum: int, frame: Any) -> None:
-    """Handle SIGTERM / SIGINT by saving volumes then re-raising."""
-    _emergency_save_all()
+    """Handle SIGTERM / SIGINT by saving volumes then re-raising.
+
+    Bounded, not best-effort-forever: see _SIGNAL_SAVE_TIMEOUT. A volume
+    whose lock cannot be taken in time is skipped and logged rather than
+    hanging the process; its data is no worse off than under SIGKILL.
+
+    NOTE: qc-core never reaches this. `_ensure_shutdown_handlers` is only
+    ever called from a worker thread there, so `signal.signal` raises
+    ValueError and the signal half stays unlatched, leaving cli.py's own
+    handler (which sets a flag and lets the main loop unmount) in charge.
+    That is load-bearing — a future synchronous startup remount from the
+    helper's main thread would silently replace it with this one.
+    """
+    _emergency_save_all(lock_timeout=_SIGNAL_SAVE_TIMEOUT)
     # Re-raise with default handler so the process actually exits
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
@@ -1172,7 +1252,19 @@ def unmount_volume(mount_point: str) -> None:
             import shutil
             tool = "fusermount3" if shutil.which("fusermount3") else "fusermount"
             cmd = [tool, "-u", mount_point]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Bounded: this runs while _mount_lock is held, so a diskutil that
+        # never returns (wedged FUSE mount, busy filesystem) would pin the
+        # lock forever and block every later mount, unmount, list and the
+        # service's own shutdown loop. A timeout is treated as a failed
+        # unmount, which is exactly the branch below.
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=_UNMOUNT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Unmount of {mount_point} timed out after {_UNMOUNT_TIMEOUT}s — "
+                "the volume may be in use by another application"
+            ) from None
         if result.returncode != 0:
             # The volume is still mounted and serving — keep it tracked so
             # emergency save and a retry can reach it, and so the double-

@@ -39,9 +39,16 @@ actor CoreClient {
     /// event before being failed locally.
     private let cancelGrace: Duration
 
-    init(transportFactory: @escaping TransportFactory, cancelGrace: Duration = .seconds(5)) {
+    /// How long `shutdown` waits for the helper's `done`. The helper cancels
+    /// in-flight work and unmounts every volume *before* answering, so this
+    /// has to cover that work; the EOF grace only starts once it arrives.
+    private let shutdownTimeout: Duration
+
+    init(transportFactory: @escaping TransportFactory, cancelGrace: Duration = .seconds(5),
+         shutdownTimeout: Duration = .seconds(30)) {
         self.makeTransport = transportFactory
         self.cancelGrace = cancelGrace
+        self.shutdownTimeout = shutdownTimeout
         self.idPrefix = String(UInt32.random(in: 0...UInt32.max), radix: 36)
     }
 
@@ -175,11 +182,6 @@ actor CoreClient {
         var unmountFailed: [String] = []
     }
 
-    /// How long `shutdown` waits for the helper's `done`. The helper cancels
-    /// in-flight work and unmounts every volume *before* answering, so this
-    /// has to cover that work; the EOF grace only starts once it arrives.
-    static let shutdownTimeout: Duration = .seconds(30)
-
     /// Graceful stop: `shutdown` (the helper cancels work and unmounts every
     /// volume, then answers), EOF, then escalate if it hangs. Safe to call
     /// twice.
@@ -189,17 +191,23 @@ actor CoreClient {
         guard let transport else { return ShutdownOutcome() }
         let gen = generation
         var outcome = ShutdownOutcome()
+        var answered = false
         do {
-            let result = try await withTimeout(Self.shutdownTimeout) {
+            let result = try await withTimeout(shutdownTimeout) {
                 try await self.perform(.shutdown)
             }
+            answered = true
             if case .array(let failed)? = result["unmount_failed"] {
                 outcome.unmountFailed = failed.compactMap(\.stringValue)
             }
         } catch {
             Logger.client.warning("shutdown request failed: \(error.localizedDescription, privacy: .public)")
         }
-        await transport.terminate(timeout: .seconds(10))
+        // A helper that did not answer `shutdown` inside 30 s is wedged, and
+        // waiting the full EOF grace on top of that is what made quit read as
+        // a hang: go to SIGTERM sooner. The grace is for the helper that did
+        // answer and is finishing its last write.
+        await transport.terminate(timeout: answered ? .seconds(10) : .seconds(1))
         if generation == gen { transportEnded(generation: gen) }
         return outcome
     }
@@ -222,7 +230,7 @@ actor CoreClient {
     private func performRestart() async {
         if let transport {
             let gen = generation
-            try? await withTimeout(Self.shutdownTimeout) {
+            try? await withTimeout(shutdownTimeout) {
                 _ = try await self.perform(.shutdown)
             }
             await transport.terminate(timeout: .seconds(5))
@@ -327,18 +335,73 @@ actor CoreClient {
     }
 }
 
+/// First-wins hand-off between the work and the deadline.
+///
+/// Both racers call `settle`; the first one resumes the waiter and the loser
+/// is dropped. `attach` copes with a racer that settled before the
+/// continuation existed.
+private final class TimeoutGate<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, any Error>?
+    private var early: Result<T, any Error>?
+    private var settled = false
+
+    func attach(_ waiter: CheckedContinuation<T, any Error>) {
+        lock.lock()
+        if let early {
+            self.early = nil
+            lock.unlock()
+            waiter.resume(with: early)
+            return
+        }
+        continuation = waiter
+        lock.unlock()
+    }
+
+    func settle(_ result: Result<T, any Error>) {
+        lock.lock()
+        guard !settled else { return lock.unlock() }
+        settled = true
+        if let waiter = continuation {
+            continuation = nil
+            lock.unlock()
+            waiter.resume(with: result)
+        } else {
+            early = result
+            lock.unlock()
+        }
+    }
+}
+
 /// Run `body`, failing with `TimeoutError` if it takes longer than `limit`.
+///
+/// The deadline is wall-clock: at `limit` this returns, and the body is
+/// cancelled but left to drain on its own. Racing inside a
+/// `withThrowingTaskGroup` — the obvious shape, and the one this replaced —
+/// does not do that, because a throwing group cancels *and awaits* its
+/// remaining children before rethrowing. `CoreClient.perform` deliberately
+/// outlives its own cancellation by `cancelGrace` so that "cancelled" can
+/// keep meaning "nothing was written", so every deadline here overshot by
+/// five seconds and quit read as a hang.
 func withTimeout<T: Sendable>(_ limit: Duration,
                               _ body: @escaping @Sendable () async throws -> T) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask { try await body() }
-        group.addTask {
-            try await Task.sleep(for: limit)
-            throw TimeoutError()
-        }
-        guard let first = try await group.next() else { throw TimeoutError() }
-        group.cancelAll()
-        return first
+    let gate = TimeoutGate<T>()
+    let work = Task {
+        do { gate.settle(.success(try await body())) } catch { gate.settle(.failure(error)) }
+    }
+    // Unstructured, so the caller's own cancellation cannot stop the clock:
+    // a cancelled caller still has to be released within `limit`.
+    let deadline = Task {
+        try? await Task.sleep(for: limit)
+        guard !Task.isCancelled else { return }
+        gate.settle(.failure(TimeoutError()))
+        work.cancel()
+    }
+    defer { deadline.cancel() }
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { gate.attach($0) }
+    } onCancel: {
+        work.cancel()
     }
 }
 

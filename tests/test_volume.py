@@ -271,7 +271,7 @@ class TestCreateVolumeSingle:
 
     def test_wrong_password_fails(self, tmp_dir):
         path = os.path.join(tmp_dir, "test.qcv")
-        meta = vol.create_volume_single(path, "correct")
+        meta = vol.create_volume_single(path, "correct-testpad")
 
         with pytest.raises(Exception):
             vol.derive_volume_key_single("wrong", meta)
@@ -328,7 +328,7 @@ class TestVolumeContainer:
     def open_volume(self, tmp_dir):
         """Create and return an open VolumeContainer."""
         path = os.path.join(tmp_dir, "vol.qcv")
-        password = "testpw"
+        password = "testpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -347,7 +347,7 @@ class TestVolumeContainer:
         vc.save()
 
         # Reopen from disk
-        password = "testpw"
+        password = "testpw-testpad"
         meta = vc.metadata
         final_key = vol.derive_volume_key_single(password, meta)
         vc2 = vol.VolumeContainer(vc.path, final_key)
@@ -471,7 +471,7 @@ class TestVolumeContainer:
         vc.save()
 
         # Reopen
-        password = "testpw"
+        password = "testpw-testpad"
         final_key = vol.derive_volume_key_single(password, vc.metadata)
         vc2 = vol.VolumeContainer(vc.path, final_key)
         vc2.open()
@@ -510,9 +510,9 @@ class TestKeyDerivation:
     def test_single_key_deterministic(self, tmp_dir):
         """Same password + same metadata → same key."""
         path = os.path.join(tmp_dir, "det.qcv")
-        meta = vol.create_volume_single(path, "pw123")
-        k1 = vol.derive_volume_key_single("pw123", meta)
-        k2 = vol.derive_volume_key_single("pw123", meta)
+        meta = vol.create_volume_single(path, "pw123-testpad")
+        k1 = vol.derive_volume_key_single("pw123-testpad", meta)
+        k2 = vol.derive_volume_key_single("pw123-testpad", meta)
         assert k1 == k2
 
     def test_shamir_key_from_different_share_combos(self, tmp_dir):
@@ -543,7 +543,7 @@ class TestAuthParams:
     def test_read_auth_params_single(self, tmp_dir):
         """read_volume_auth_params returns auth params for password volumes."""
         path = os.path.join(tmp_dir, "auth.qcv")
-        vol.create_volume_single(path, "testpw")
+        vol.create_volume_single(path, "testpw-testpad")
         header, auth = vol.read_volume_auth_params(path)
         assert auth["mode"] == "single"
         assert "argon_salt" in auth
@@ -677,7 +677,7 @@ class TestQuantaCryptFUSE:
     def fuse_fs(self, tmp_dir):
         """Create a volume and return a QuantaCryptFUSE instance."""
         path = os.path.join(tmp_dir, "fuse.qcv")
-        password = "fusepw"
+        password = "fusepw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1026,7 +1026,7 @@ class TestFUSEEdgeCases:
     @pytest.fixture
     def fuse_fs(self, tmp_dir):
         path = os.path.join(tmp_dir, "edge.qcv")
-        password = "edgepw"
+        password = "edgepw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1388,7 +1388,7 @@ class TestContentHashVerification:
     @pytest.fixture
     def open_volume(self, tmp_dir):
         path = os.path.join(tmp_dir, "hash_vol.qcv")
-        password = "hashpw"
+        password = "hashpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1445,7 +1445,7 @@ class TestDoubleMountPrevention:
     def test_double_mount_raises(self, tmp_dir):
         """mount_volume raises if the same volume file is already mounted."""
         path = os.path.join(tmp_dir, "double.qcv")
-        password = "dblpw"
+        password = "dblpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1468,7 +1468,7 @@ class TestDoubleMountPrevention:
         """mount_volume allows mounting different volume files."""
         path1 = os.path.join(tmp_dir, "vol1.qcv")
         path2 = os.path.join(tmp_dir, "vol2.qcv")
-        password = "volpw"
+        password = "volpw-testpad"
         meta1 = vol.create_volume_single(path1, password)
         meta2 = vol.create_volume_single(path2, password)
         key1 = vol.derive_volume_key_single(password, meta1)
@@ -1519,7 +1519,7 @@ class TestUnmountVolume:
     def test_unmount_saves_dirty_volume(self, tmp_dir):
         """unmount_volume saves a dirty volume."""
         path = os.path.join(tmp_dir, "unmount.qcv")
-        password = "umpw"
+        password = "umpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1552,7 +1552,7 @@ class TestUnmountVolume:
     def test_unmount_clean_volume(self, tmp_dir):
         """unmount_volume works for clean (non-dirty) volumes."""
         path = os.path.join(tmp_dir, "clean_unmount.qcv")
-        password = "cleanpw"
+        password = "cleanpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1573,7 +1573,7 @@ class TestUnmountVolume:
     def test_unmount_save_failure_keeps_tracking(self, tmp_dir):
         """If save() fails during unmount, volume stays in tracking dict."""
         path = os.path.join(tmp_dir, "fail_save.qcv")
-        password = "failpw"
+        password = "failpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1603,15 +1603,31 @@ class TestUnmountVolume:
 class TestMountVolumeNoFuse:
     """Test mount_volume behavior when fusepy is unavailable."""
 
-    def test_mount_without_fusepy_raises(self, tmp_dir):
-        """mount_volume raises RuntimeError when fusepy is not installed."""
+    def test_mount_without_fusepy_raises(self, tmp_dir, monkeypatch):
+        """mount_volume raises RuntimeError when fusepy is not available.
+
+        The availability is simulated. Previously this test asserted the
+        raise without making FUSE unavailable, so it only passed on machines
+        with no backend installed. On a machine WITH macFUSE it attempted a
+        real mount — and libfuse's fuse_kern_mount() calls fork(), which
+        crashed the interpreter in Tcl's atfork handler ("Fatal Python
+        error: Illegal instruction"). The crash made the mount fail, which
+        raised, which made the test pass. It was green for the wrong reason.
+        """
+        import quantacrypt.core.fuse_ops as fo
+        monkeypatch.setattr(
+            fo, "check_fuse_available",
+            lambda: (False, "fusepy is not installed (simulated)"))
+
         path = os.path.join(tmp_dir, "nofuse.qcv")
-        password = "nfpw"
+        password = "nfpw-testpad"
         meta = vol.create_volume_single(path, password)
         key = vol.derive_volume_key_single(password, meta)
         mp = os.path.join(tmp_dir, "nfmnt")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="fusepy"):
             mount_volume(path, key, mp)
+        # And nothing was registered for a mount that never happened.
+        assert mp not in _mounted_volumes
 
 
 class TestMountVolumeStartup:
@@ -1698,7 +1714,7 @@ class TestCorruptVolumeOpen:
     def test_wrong_key_gives_helpful_error(self, tmp_dir):
         """Opening a volume with wrong key gives a clear error message."""
         path = os.path.join(tmp_dir, "wrongkey.qcv")
-        password = "correct"
+        password = "correct-testpad"
         meta = vol.create_volume_single(path, password)
         wrong_key = os.urandom(64)  # random key, not derived from password
         vc = vol.VolumeContainer(path, wrong_key)
@@ -1713,7 +1729,7 @@ class TestCorruptVolumeOpen:
         tolerated silently, but baseline truncation has no safe recovery.
         """
         path = os.path.join(tmp_dir, "trunc_data.qcv")
-        password = "truncpw"
+        password = "truncpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1767,7 +1783,7 @@ class TestCorruptVolumeOpen:
     def test_save_cleanup_on_error(self, tmp_dir):
         """save() cleans up .tmp file on write error."""
         path = os.path.join(tmp_dir, "cleanup.qcv")
-        password = "cleanpw"
+        password = "cleanpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1786,7 +1802,7 @@ class TestCorruptVolumeOpen:
         HMAC field would silently open with undetected tampered auth fields.
         """
         path = os.path.join(tmp_dir, "no_hmac.qcv")
-        password = "hmacpw"
+        password = "hmacpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1805,7 +1821,7 @@ class TestCorruptVolumeOpen:
     def test_open_rejects_tampered_hmac(self, tmp_dir):
         """Flipping the stored HMAC byte-for-byte causes open() to fail."""
         path = os.path.join(tmp_dir, "bad_hmac.qcv")
-        password = "hmacpw2"
+        password = "hmacpw2-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1821,7 +1837,7 @@ class TestCorruptVolumeOpen:
     def test_open_rejects_non_absolute_dir_entry(self, tmp_dir):
         """Directory index with a non-absolute path is rejected."""
         path = os.path.join(tmp_dir, "nonabs.qcv")
-        password = "pathpw"
+        password = "pathpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1849,7 +1865,7 @@ class TestCorruptVolumeOpen:
     def test_open_rejects_path_traversal_entry(self, tmp_dir):
         """Directory index containing a '..' segment is rejected."""
         path = os.path.join(tmp_dir, "traversal.qcv")
-        password = "pathpw"
+        password = "pathpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
 
@@ -1882,7 +1898,7 @@ class TestMutatingApiValidation:
 
     def _open(self, tmp_dir, name="val.qcv"):
         path = os.path.join(tmp_dir, name)
-        pw = "val"
+        pw = "val-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1916,7 +1932,7 @@ class TestReadFileBounds:
 
     def test_read_rejects_negative_chunk_count(self, tmp_dir):
         path = os.path.join(tmp_dir, "neg.qcv")
-        pw = "x"
+        pw = "x-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1928,7 +1944,7 @@ class TestReadFileBounds:
 
     def test_read_rejects_oversized_chunk_count(self, tmp_dir):
         path = os.path.join(tmp_dir, "over.qcv")
-        pw = "x"
+        pw = "x-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1940,7 +1956,7 @@ class TestReadFileBounds:
 
     def test_read_rejects_data_length_mismatch(self, tmp_dir):
         path = os.path.join(tmp_dir, "dlen.qcv")
-        pw = "x"
+        pw = "x-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -1957,7 +1973,7 @@ class TestLazyBlobLoad:
 
     def test_reopen_reads_from_disk(self, tmp_dir):
         path = os.path.join(tmp_dir, "lazy.qcv")
-        pw = "lazypw"
+        pw = "lazypw-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
 
@@ -1983,7 +1999,7 @@ class TestLazyBlobLoad:
         """After reopen, add one new file and save — unmodified blobs are
         copied straight from the old container without being held in RAM."""
         path = os.path.join(tmp_dir, "mixed.qcv")
-        pw = "mixpw"
+        pw = "mixpw-testpad"
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
 
@@ -2305,7 +2321,7 @@ class TestGracefulShutdown:
     def _make_mounted(self, tmp_dir, dirty=True):
         """Helper: create a volume and register it in _mounted_volumes."""
         path = os.path.join(tmp_dir, "shutdown.qcv")
-        password = "shutpw"
+        password = "shutpw-testpad"
         meta = vol.create_volume_single(path, password)
         final_key = vol.derive_volume_key_single(password, meta)
         vc = vol.VolumeContainer(path, final_key)
@@ -2370,7 +2386,7 @@ class TestGracefulShutdown:
 
         for i in range(3):
             path = os.path.join(tmp_dir, f"multi_{i}.qcv")
-            password = f"pw{i}"
+            password = f"pw{i}-testpad"
             meta = vol.create_volume_single(path, password)
             final_key = vol.derive_volume_key_single(password, meta)
             vc = vol.VolumeContainer(path, final_key)
@@ -2645,8 +2661,8 @@ class TestFUSEDurability:
 
     def _make(self, tmp_dir):
         path = os.path.join(tmp_dir, "durable.qcv")
-        meta = vol.create_volume_single(path, "durapw")
-        key = vol.derive_volume_key_single("durapw", meta)
+        meta = vol.create_volume_single(path, "durapw-testpad")
+        key = vol.derive_volume_key_single("durapw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, QuantaCryptFUSE(vc)
@@ -2709,8 +2725,8 @@ class TestFuseOperationsContract:
 
     def test_chmod_and_utimens(self, tmp_dir):
         path = os.path.join(tmp_dir, "attr.qcv")
-        meta = vol.create_volume_single(path, "attrpw")
-        key = vol.derive_volume_key_single("attrpw", meta)
+        meta = vol.create_volume_single(path, "attrpw-testpad")
+        key = vol.derive_volume_key_single("attrpw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         fs = QuantaCryptFUSE(vc)
@@ -2732,7 +2748,7 @@ class TestRenameReplaceAndErrno:
     errno-less exceptions make fusepy return garbage error values to the
     kernel (`e.errno > 0` on None → TypeError inside fusepy's wrapper)."""
 
-    def _open(self, tmp_dir, name="rr.qcv", pw="rr-pw"):
+    def _open(self, tmp_dir, name="rr.qcv", pw="rr-pw-testpad"):
         path = os.path.join(tmp_dir, name)
         meta = vol.create_volume_single(path, pw)
         final_key = vol.derive_volume_key_single(pw, meta)
@@ -2815,8 +2831,8 @@ class TestCoalescingReplaySimulation:
 
     def _open(self, tmp_dir, name):
         path = os.path.join(tmp_dir, name)
-        meta = vol.create_volume_single(path, "coal-pw")
-        key = vol.derive_volume_key_single("coal-pw", meta)
+        meta = vol.create_volume_single(path, "coal-pw-testpad")
+        key = vol.derive_volume_key_single("coal-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, vc
@@ -2870,8 +2886,8 @@ class TestDirectoryRename:
 
     def _open(self, tmp_dir, name):
         path = os.path.join(tmp_dir, name)
-        meta = vol.create_volume_single(path, "dir-pw")
-        key = vol.derive_volume_key_single("dir-pw", meta)
+        meta = vol.create_volume_single(path, "dir-pw-testpad")
+        key = vol.derive_volume_key_single("dir-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, vc
@@ -2977,8 +2993,8 @@ class TestRenameOntoPendingUnlink:
 
     def _fs(self, tmp_dir):
         path = os.path.join(tmp_dir, "rpul.qcv")
-        meta = vol.create_volume_single(path, "rpul-pw")
-        key = vol.derive_volume_key_single("rpul-pw", meta)
+        meta = vol.create_volume_single(path, "rpul-pw-testpad")
+        key = vol.derive_volume_key_single("rpul-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, QuantaCryptFUSE(vc)
@@ -3187,8 +3203,8 @@ class TestSelfRename:
 
     def _open(self, tmp_dir, name):
         path = os.path.join(tmp_dir, name)
-        meta = vol.create_volume_single(path, "self-pw")
-        key = vol.derive_volume_key_single("self-pw", meta)
+        meta = vol.create_volume_single(path, "self-pw-testpad")
+        key = vol.derive_volume_key_single("self-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, vc
@@ -3232,8 +3248,8 @@ class TestOpenFdRekeyOnRename:
 
     def _fs(self, tmp_dir, name):
         path = os.path.join(tmp_dir, name)
-        meta = vol.create_volume_single(path, "fdrk-pw")
-        key = vol.derive_volume_key_single("fdrk-pw", meta)
+        meta = vol.create_volume_single(path, "fdrk-pw-testpad")
+        key = vol.derive_volume_key_single("fdrk-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return path, key, QuantaCryptFUSE(vc)
@@ -3346,8 +3362,8 @@ class TestRenameOntoSlashlessDir:
 
     def test_slashless_dir_dest_raises_eisdir(self, tmp_dir):
         path = os.path.join(tmp_dir, "twin.qcv")
-        meta = vol.create_volume_single(path, "twin-pw")
-        key = vol.derive_volume_key_single("twin-pw", meta)
+        meta = vol.create_volume_single(path, "twin-pw-testpad")
+        key = vol.derive_volume_key_single("twin-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         vc.mkdir("/d")
@@ -3370,8 +3386,8 @@ class TestFailedUnmountKeepsPendingUnlink:
 
     def test_pending_unlink_survives_failed_unmount(self, tmp_dir):
         path = os.path.join(tmp_dir, "pu.qcv")
-        meta = vol.create_volume_single(path, "pu-pw")
-        key = vol.derive_volume_key_single("pu-pw", meta)
+        meta = vol.create_volume_single(path, "pu-pw-testpad")
+        key = vol.derive_volume_key_single("pu-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         fs = QuantaCryptFUSE(vc)
@@ -3405,8 +3421,8 @@ class TestFailedUnmountKeepsPendingUnlink:
 
     def test_successful_unmount_applies_pending_unlinks(self, tmp_dir):
         path = os.path.join(tmp_dir, "pu2.qcv")
-        meta = vol.create_volume_single(path, "pu-pw")
-        key = vol.derive_volume_key_single("pu-pw", meta)
+        meta = vol.create_volume_single(path, "pu-pw-testpad")
+        key = vol.derive_volume_key_single("pu-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         fs = QuantaCryptFUSE(vc)
@@ -3509,8 +3525,8 @@ class TestDeadMountReaping:
             _acquire_volume_lock, _volume_locks, get_mounted_volumes,
         )
         path = os.path.join(tmp_dir, "reap.qcv")
-        meta = vol.create_volume_single(path, "reap-pw")
-        key = vol.derive_volume_key_single("reap-pw", meta)
+        meta = vol.create_volume_single(path, "reap-pw-testpad")
+        key = vol.derive_volume_key_single("reap-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         mp = os.path.join(tmp_dir, "reapmnt")
@@ -3533,8 +3549,8 @@ class TestDeadMountReaping:
     def test_live_and_injected_entries_survive_reaping(self, tmp_dir):
         from quantacrypt.core.fuse_ops import get_mounted_volumes
         path = os.path.join(tmp_dir, "keep.qcv")
-        meta = vol.create_volume_single(path, "keep-pw")
-        key = vol.derive_volume_key_single("keep-pw", meta)
+        meta = vol.create_volume_single(path, "keep-pw-testpad")
+        key = vol.derive_volume_key_single("keep-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         mp = os.path.join(tmp_dir, "keepmnt")
@@ -3586,13 +3602,20 @@ class TestStatfsHostFreeSpace:
 
     def _fs(self, tmp_dir):
         path = os.path.join(tmp_dir, "sfs.qcv")
-        meta = vol.create_volume_single(path, "sfs-pw")
-        key = vol.derive_volume_key_single("sfs-pw", meta)
+        meta = vol.create_volume_single(path, "sfs-pw-testpad")
+        key = vol.derive_volume_key_single("sfs-pw-testpad", meta)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         return QuantaCryptFUSE(vc)
 
     def test_free_space_tracks_host_not_container(self, tmp_dir):
+        """Free space follows the host, full stop.
+
+        R11 briefly folded the write path's per-file memory ceiling into this
+        number; run 12 F-003 showed that turned a volume on a 274 GB disk
+        into a 2 GB drive. The ceiling now lives in write() as EFBIG, where
+        it is true, so this is back to asserting the host value.
+        """
         fs = self._fs(tmp_dir)
         st = fs.statfs("/")
         host = os.statvfs(tmp_dir)
@@ -3622,8 +3645,8 @@ class TestFlushSkipsUnchangedContent:
     @pytest.fixture
     def fuse_fs(self, tmp_dir):
         path = os.path.join(tmp_dir, "skip.qcv")
-        meta = vol.create_volume_single(path, "pw")
-        vc = vol.VolumeContainer(path, vol.derive_volume_key_single("pw", meta))
+        meta = vol.create_volume_single(path, "pw-testpad")
+        vc = vol.VolumeContainer(path, vol.derive_volume_key_single("pw-testpad", meta))
         vc.open()
         return QuantaCryptFUSE(vc)
 

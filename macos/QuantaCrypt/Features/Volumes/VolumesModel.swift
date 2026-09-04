@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Observation
 
 @MainActor
@@ -13,6 +14,19 @@ final class VolumesModel {
     static let brewCommand = "brew install --cask fuse-t"
     static let brewAlternative = "brew install --cask macfuse"
     static let mountRoot = (Paths.homeDirectory as NSString).appendingPathComponent("QuantaCrypt Volumes")
+
+    /// The protocol says these ops are short and never cancel, so a client
+    /// must fail them locally after a grace period
+    /// (docs/design/core-service-protocol.md). Without a bound, a helper that
+    /// launches and never answers leaves a spinner up with nothing to click.
+    static let inspectTimeout: Duration = .seconds(20)
+    static let checkTimeout: Duration = .seconds(10)
+
+    static func timedOut(_ what: String, after seconds: Int) -> CoreError {
+        CoreError(code: .helperUnavailable,
+                  message: "The encryption helper didn't answer. Try again — if it keeps happening, restart the helper in Settings.",
+                  detail: "\(what) timed out after \(seconds)s")
+    }
 
     private let core: CoreClient
     private let recents: RecentStore
@@ -56,7 +70,7 @@ final class VolumesModel {
     private var mountPointChosenByUser = false
     var mountCredential: MountCredential = .password
     var mountPassword = ""
-    var mountShares: [String] = ["", ""]
+    var mountShares: [ShareEntry] = [ShareEntry(), ShareEntry()]
     var mountProgress: CoreProgress?
     var mountRunning = false
     var mountCancelling = false
@@ -101,8 +115,11 @@ final class VolumesModel {
     func checkFuse(userInitiated: Bool = false) async {
         fuseChecking = true
         let before = fuse
+        let core = self.core
         do {
-            let check: FuseCheck = try await core.perform(.fuseCheck)
+            let check: FuseCheck = try await withTimeout(Self.checkTimeout) {
+                try await core.perform(.fuseCheck)
+            }
             fuse = check
             fuseError = nil
             if userInitiated {
@@ -113,6 +130,8 @@ final class VolumesModel {
             }
         } catch let error as CoreError {
             fuseError = error
+        } catch is TimeoutError {
+            fuseError = Self.timedOut("fuse_check", after: 10)
         } catch {
             fuseError = CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)")
         }
@@ -280,17 +299,22 @@ final class VolumesModel {
         Task { [core] in
             defer { if mountPath == path { mountInspecting = false } }
             do {
-                let info: VolumeInspectInfo = try await core.perform(.volumeInspect(path: path))
+                let info: VolumeInspectInfo = try await withTimeout(Self.inspectTimeout) {
+                    try await core.perform(.volumeInspect(path: path))
+                }
                 guard mountPath == path else { return }
                 mountInfo = info
                 mountCredential = info.isSplitKey ? .shares : .password
                 let needed = info.threshold ?? 2
                 if info.isSplitKey, mountShares.count < needed {
-                    mountShares = Array(repeating: "", count: needed)
+                    mountShares = (0..<needed).map { _ in ShareEntry() }
                 }
             } catch let error as CoreError {
                 guard mountPath == path else { return }
                 mountInspectError = Self.inspectFailure(error)
+            } catch is TimeoutError {
+                guard mountPath == path else { return }
+                mountInspectError = Self.timedOut("volume_inspect", after: 20)
             } catch {
                 guard mountPath == path else { return }
                 mountInspectError = Self.inspectFailure(
@@ -298,6 +322,15 @@ final class VolumesModel {
             }
         }
         return true
+    }
+
+    /// Re-run the inspection for the volume already on screen. A failed
+    /// inspect otherwise stands until the user picks the file again.
+    func retryInspect() {
+        guard let path = mountPath else { return }
+        // prepareMount keeps the mount point the user chose; re-selecting the
+        // same path is the whole retry.
+        prepareMount(path: path)
     }
 
     static func inspectFailure(_ error: CoreError) -> CoreError {
@@ -335,7 +368,7 @@ final class VolumesModel {
         case .shares:
             // The inspected threshold when the auth block was readable;
             // otherwise any two or more and the helper says how many it needs.
-            return ShareValidation.message(shares: mountShares, threshold: mountInfo?.threshold)
+            return ShareValidation.message(entries: mountShares, threshold: mountInfo?.threshold)
         }
         return nil
     }
@@ -431,6 +464,10 @@ final class VolumesModel {
         mountCancelling = false
         mountProgress = nil
         mountPassword = ""
+        // Shares are key material — k points on the polynomial that rebuilds
+        // the master key. Leaving them live in an @Observable model, rendered
+        // in plain TextFields, outlasts the operation they were typed for.
+        mountShares = mountShares.map { _ in ShareEntry() }
         recents.add(path, kind: .mounted)
         let volume = MountedVolume(mountPoint: result.mountPoint, volumePath: result.volumePath ?? path, stats: nil)
         if result.journalSuspicious {
@@ -454,16 +491,22 @@ final class VolumesModel {
     // MARK: Mounted list
 
     func refreshMounted() async {
+        let core = self.core
         do {
-            let list: VolumeListResult = try await core.perform(.volumeList)
+            let list: VolumeListResult = try await withTimeout(Self.checkTimeout) {
+                try await core.perform(.volumeList)
+            }
             mounted = list.volumes.sorted { $0.mountPoint < $1.mountPoint }
             listFailures = 0
             listLoaded = true
         } catch {
             // Polling: one transient failure just keeps the last list, but a
             // run of them means the rows on screen no longer describe reality.
+            // The error itself is the only trace of why — `listIsStale` says
+            // that the list is wrong, never what went wrong.
             listFailures += 1
             listLoaded = true
+            Logger.client.error("volume_list failed (\(self.listFailures, privacy: .public) in a row): \(String(describing: error), privacy: .public)")
         }
     }
 

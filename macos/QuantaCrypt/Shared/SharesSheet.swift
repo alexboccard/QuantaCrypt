@@ -23,7 +23,10 @@ struct SharesSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Give each person one share")
                     .font(.title2.weight(.semibold))
-                Text("Any \(context.k) of these \(context.n) shares unlock \(context.protectedName). Saving to files is what protects you — the clipboard clears in 60 s.")
+                // The old line credited the clipboard clearing with protecting
+                // the user; it is a 60-second timer that dies with the app,
+                // and a clipboard manager may have kept a copy regardless.
+                Text("Any \(context.k) of these \(context.n) shares unlock \(context.protectedName). Saving to files is what protects you. Use the Copy buttons rather than selecting a share by hand: a copied share sits on the clipboard until you copy something else, and QuantaCrypt clears it after 60 seconds, but only while it is running.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -89,15 +92,20 @@ struct SharesSheet: View {
     private func shareCard(_ share: Share) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
+                // Deliberately not selectable. AppKit's own ⌘C writes plain
+                // `public.utf8-plain-text` with no `ConcealedType` marker and
+                // no clear timer, so a hand-selected share lands in whatever
+                // clipboard-history database is running and stays there — the
+                // one outcome `Clipboard.copy` exists to prevent, reached by
+                // the more obvious gesture. The Copy buttons below cover the
+                // same need and go through it.
                 Text(share.code)
                     .font(.callout.monospaced())
-                    .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                 if let mnemonic = share.mnemonic {
                     Text(mnemonic)
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {

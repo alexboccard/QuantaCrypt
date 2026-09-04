@@ -58,9 +58,28 @@ private struct OpenRecentMenu: View {
                 Button(Format.fileName(path)) { state.open(URL(fileURLWithPath: path)) }
             }
             Divider()
+            // The sidebar row's other two actions live in a context menu,
+            // which a keyboard or VoiceOver user cannot open. Same actions,
+            // reachable the way every other command in the app is.
+            Menu("Show in Finder") {
+                recentButtons { path, _ in Finder.reveal(path) }
+            }
+            Menu("Remove from Recent") {
+                recentButtons { path, kind in state.recents.remove(path, kind: kind) }
+            }
             Button("Clear Menu") { state.recents.clear() }
                 .disabled(state.recents.isEmpty)
         }
         .disabled(state.recents.isEmpty)
+    }
+
+    @ViewBuilder
+    private func recentButtons(_ action: @escaping (String, RecentStore.Kind) -> Void) -> some View {
+        ForEach(state.recents.decrypted, id: \.self) { path in
+            Button(Format.fileName(path)) { action(path, .decrypted) }
+        }
+        ForEach(state.recents.mounted, id: \.self) { path in
+            Button(Format.fileName(path)) { action(path, .mounted) }
+        }
     }
 }

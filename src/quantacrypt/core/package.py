@@ -11,8 +11,11 @@ from __future__ import annotations
 import base64 as _b64
 import json
 import os
+import ctypes
 import struct
+import sys
 import tempfile
+import time
 import zipfile
 from typing import Callable, Iterable
 
@@ -21,6 +24,7 @@ from quantacrypt.core.crypto import (
     MAGIC, MIN_FORMAT_VERSION, MAX_FORMAT_VERSION, CancelledOperation,
 )
 from quantacrypt.core.errors import CorruptPayload, InvalidInput, InvalidRequest
+from quantacrypt.core.volume import _fsync_dir
 
 Progress = Callable[[str], None] | None
 CancelCheck = Callable[[], bool] | None
@@ -309,6 +313,39 @@ def unique_path(out_dir: str, name: str) -> tuple[str, bool]:
     return out, n > 2
 
 
+#: LSFileQuarantineType flags. 0x0081 = "downloaded, never opened" — the
+#: same shape Safari and Mail set, which is what makes Gatekeeper assess the
+#: file on first open.
+_QUARANTINE_FLAGS = "0081"
+
+
+def _mark_quarantined(path: str) -> None:
+    """Attach com.apple.quarantine to freshly decrypted output.
+
+    A .qcx is a transport container for someone else's content. Because
+    QuantaCrypt writes the plaintext itself, LaunchServices sees a locally
+    authored file — no quarantine, no Gatekeeper assessment — and both UIs
+    put an "Open file" button on the success card. A folder-sourced .qcx
+    decrypts to a .zip whose extracted .app would then run unchecked, and
+    .terminal/.webloc/.inetloc need no execute bit at all.
+
+    Note os.setxattr does not exist on macOS CPython, so this goes through
+    libc directly. Best-effort: never fail a completed decrypt over it.
+    """
+    if sys.platform != "darwin":
+        return
+    stamp = format(int(time.time()), "x")
+    value = f"{_QUARANTINE_FLAGS};{stamp};QuantaCrypt;".encode()
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.setxattr(
+            os.fsencode(path), b"com.apple.quarantine",
+            value, len(value), 0, 0,
+        )
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
 def _place_without_clobber(tmp: str, out_dir: str, name: str) -> tuple[str, bool]:
     """Move ``tmp`` to a fresh name in ``out_dir`` atomically: ``os.link``
     fails with EEXIST instead of replacing, so a file that appears between
@@ -354,12 +391,19 @@ def batch_output_paths(paths: list[str], out_dir: str) -> list[str]:
 # ── Folders ───────────────────────────────────────────────────────────────────
 
 def folder_stats(folder: str) -> tuple[int, int]:
-    """Return (file_count, total_bytes) for a folder tree."""
+    """Return (file_count, total_bytes) for a folder tree.
+
+    Symlinks are excluded because zip_folder() does not archive them; the
+    two have to agree or the progress line never reaches 100%.
+    """
     count, total = 0, 0
     for dirpath, _, filenames in os.walk(folder):
         for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full):
+                continue
             try:
-                total += os.path.getsize(os.path.join(dirpath, fn))
+                total += os.path.getsize(full)
             except OSError:
                 pass
             count += 1
@@ -367,29 +411,63 @@ def folder_stats(folder: str) -> tuple[int, int]:
 
 
 def zip_folder(folder: str, dst_path: str, progress_cb: Progress = None,
-               cancel_check: CancelCheck = None) -> None:
+               cancel_check: CancelCheck = None) -> list[str]:
     """Zip folder into dst_path with paths relative to folder's parent so the
     top-level directory name survives inside the archive.  The archive being
-    written is skipped if the walk reaches it (output inside source)."""
+    written is skipped if the walk reaches it (output inside source).
+
+    Returns the folder-relative paths of the symlinks that were skipped.
+
+    Symlinks are never followed.  A .qcx is made to be handed to someone
+    else, and ``zipfile.write()`` stores the *target's* bytes: a convenience
+    link to ``~/.ssh/id_ed25519`` or a shared credentials file sitting inside
+    the folder would otherwise ship inside the container with nothing saying
+    so.  ``zip(1)`` and ``tar(1)`` store links as links; zipfile cannot
+    without teaching every extractor to recreate them safely, so they are
+    left out and reported instead.
+
+    A directory entry is written for every real directory so that empty
+    folders survive the round trip.
+    """
     parent = os.path.dirname(os.path.abspath(folder))
     dst_abs = os.path.abspath(dst_path)
     total_files, _ = folder_stats(folder)
     done = 0
+    skipped: list[str] = []
     with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
         for dirpath, dirnames, filenames in os.walk(folder):
             dirnames.sort()
             filenames.sort()
+            # os.walk does not descend into symlinked directories, so prune
+            # them from dirnames too: recording the name without its contents
+            # would put an empty directory in the archive where a link was.
+            for d in list(dirnames):
+                if os.path.islink(os.path.join(dirpath, d)):
+                    dirnames.remove(d)
+                    skipped.append(os.path.relpath(os.path.join(dirpath, d), folder))
+            if cancel_check and cancel_check():
+                raise CancelledOperation("Compression cancelled")
+            zf.write(dirpath, os.path.relpath(dirpath, parent))
             for fn in filenames:
                 if cancel_check and cancel_check():
                     raise CancelledOperation("Compression cancelled")
                 full = os.path.join(dirpath, fn)
                 if os.path.abspath(full) == dst_abs:
                     continue
+                if os.path.islink(full):
+                    skipped.append(os.path.relpath(full, folder))
+                    continue
                 zf.write(full, os.path.relpath(full, parent))
                 done += 1
                 if progress_cb and total_files:
                     pct = done / total_files
                     progress_cb(f"Compressing folder… {int(pct * 100)}% ({done}/{total_files} files)")
+    if skipped and progress_cb:
+        progress_cb(
+            f"Skipped {len(skipped)} symlink{'' if len(skipped) == 1 else 's'} "
+            "— links are not followed, so their targets stay out of the archive."
+        )
+    return skipped
 
 
 # ── Encrypt / decrypt ─────────────────────────────────────────────────────────
@@ -407,6 +485,11 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
     single = mode in ("password", "single")
     if single and not password:
         raise InvalidInput("A password is required")
+    if single:
+        # The floor lives here so both front ends inherit it: the SwiftUI
+        # shell enforced 8 characters, the Tk UI enforced nothing, and Tk
+        # batch mode skipped even the soft warning.
+        cc.reject_weak_secret(password)      # raises InvalidInput
     if not single and not (k and n and 2 <= k <= n <= 255):
         raise InvalidRequest("Split-key mode needs 2 <= k <= n <= 255")
     if not os.path.exists(source):
@@ -420,6 +503,7 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
         raise InvalidInput("The output file can't be inside the folder being encrypted")
 
     staging = None
+    skipped_links: list[str] = []
     fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(out_abs)}.qc-enc-",
                                dir=os.path.dirname(out_abs) or None)
     os.close(fd)
@@ -429,7 +513,8 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
                 prefix=f".{os.path.basename(out_abs)}.qc-staging-", suffix=".zip",
                 dir=os.path.dirname(out_abs) or None)
             os.close(fd)
-            zip_folder(source, staging, progress_cb=progress, cancel_check=cancel_check)
+            skipped_links = zip_folder(source, staging, progress_cb=progress,
+                                       cancel_check=cancel_check)
             src_path = staging
             orig = os.path.basename(src_abs.rstrip(os.sep)) + ".zip"
         else:
@@ -459,7 +544,12 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
                 progress("Writing binary... 100%")
             blob = json.dumps({"meta": meta}, separators=(",", ":")).encode()
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
+            # The plaintext may be deleted the moment this returns, so
+            # ciphertext whose blocks never reached disk is unrecoverable.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, out_abs)
+        _fsync_dir(out_abs)
         if embed_binary:
             try:
                 os.chmod(out_abs, os.stat(out_abs).st_mode | 0o110)
@@ -485,6 +575,9 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
         "threshold": None if single else k,
         "total": None if single else n,
         "shares": [] if single else shares_with_mnemonics(shares, k),
+        # Reported, not silently dropped: the caller is the only one who can
+        # tell the user which links did not make it into the container.
+        "skipped_symlinks": skipped_links,
     }
 
 
@@ -526,6 +619,7 @@ def decrypt_qcx(path: str, output_dir: str, *, password: str | None = None,
                 raise
         name = safe_output_name(fname)
         out, renamed = _place_without_clobber(tmp, output_dir, name)
+        _mark_quarantined(out)
     except BaseException:
         try:
             os.remove(tmp)

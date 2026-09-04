@@ -1,0 +1,15 @@
+{
+  "event": "done",
+  "id": "fc",
+  "result": {
+    "fuse_backend": {
+      "detail": "fixture",
+      "ok": true
+    },
+    "fusepy": {
+      "detail": "fixture",
+      "ok": true
+    },
+    "ok": true
+  }
+}

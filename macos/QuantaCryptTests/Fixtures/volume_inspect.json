@@ -1,0 +1,12 @@
+{
+  "event": "done",
+  "id": "vi",
+  "result": {
+    "format_version": 2,
+    "mode": "single",
+    "path": "/fixture/v.qcv",
+    "size": 10347,
+    "threshold": null,
+    "total": null
+  }
+}

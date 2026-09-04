@@ -1,0 +1,9 @@
+{
+  "event": "done",
+  "id": "vc",
+  "result": {
+    "mode": "single",
+    "path": "/fixture/v.qcv",
+    "shares": []
+  }
+}

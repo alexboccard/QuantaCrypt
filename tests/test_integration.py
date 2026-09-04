@@ -16,7 +16,47 @@ import zipfile
 
 import pytest
 from quantacrypt.core import crypto as cc
-from tests.conftest import MAGIC, make_pkg_bytes, load_pkg, requires_tkinter
+from tests.conftest import (_widget_texts, MAGIC, make_pkg_bytes, load_pkg,
+                            requires_tkinter, HAS_TKINTER)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tk harness
+#
+# The Tk UI is outside the coverage gate, so the tests below drive real widgets
+# and assert on what those widgets end up showing — never on the text of the
+# methods that built them.  (Duplicated from test_gui_logic.py: conftest.py is
+# the natural home once both files can be touched together.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _write_qcx(tmp_path, password="s3cr3t-verify!!", data=b"hello verify" * 500,
+               chunk_size=None, name="data"):
+    """Write a real .qcx into ``tmp_path`` and return ``(path, meta)``.
+
+    ``chunk_size`` shrinks cc.CHUNK_SIZE for this encryption only, so a
+    multi-chunk payload costs kilobytes instead of the 4 MB the production
+    constant would otherwise require.  Nothing reads the constant back off the
+    file, so the shrunk value never escapes the call.
+    """
+    src_file = tmp_path / f"{name}.bin"
+    src_file.write_bytes(data)
+    qcx_file = tmp_path / f"{name}.qcx"
+    previous = cc.CHUNK_SIZE
+    if chunk_size:
+        cc.CHUNK_SIZE = chunk_size
+    try:
+        with open(qcx_file, "wb") as f:
+            offset = f.tell()
+            meta = cc.encrypt_single_streaming(str(src_file), f, password,
+                                               filename=f"{name}.bin")
+            meta["payload_offset"] = offset
+            blob = json.dumps({"meta": meta}, separators=(",", ":")).encode()
+            f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
+    finally:
+        cc.CHUNK_SIZE = previous
+    src_file.unlink()          # keep directory snapshots down to the .qcx alone
+    return qcx_file, meta
 
 
 
@@ -128,61 +168,70 @@ class TestIndividualShareFiles:
             assert len(code_lines) == 1, f"share-{i} file has {len(code_lines)} QCSHARE- code lines, expected 1"
 
 
-_HAS_DISPLAY = bool(__import__("os").environ.get("DISPLAY") or __import__("os").environ.get("WAYLAND_DISPLAY"))
-
 class TestClipboardTimer:
-    """Verify ClipboardTimer state machine."""
+    """Verify ClipboardTimer state machine.
+
+    These used to be gated on DISPLAY/WAYLAND_DISPLAY, which is never set on
+    macOS — so they only ever ran on Linux-with-a-display.  The tk_root fixture
+    gates on a Tk root that actually opens, which is the real precondition.
+    """
 
     def test_timer_class_exists(self):
         from quantacrypt.ui.shared import ClipboardTimer
         assert callable(ClipboardTimer)
 
-    @pytest.mark.skipif(not _HAS_DISPLAY, reason="no display")
-    def test_cancel_before_start_is_safe(self):
+    def test_cancel_before_start_is_safe(self, tk_root):
         import tkinter as tk
         from quantacrypt.ui.shared import ClipboardTimer
-        root = tk.Tk(); root.withdraw()
-        try:
-            lbl = tk.Label(root, text="")
-            timer = ClipboardTimer(root, lbl)
-            timer.cancel()  # must not raise
-        finally:
-            root.destroy()
+        lbl = tk.Label(tk_root, text="")
+        timer = ClipboardTimer(tk_root, lbl)
+        timer.cancel()  # must not raise
 
-    @pytest.mark.skipif(not _HAS_DISPLAY, reason="no display")
-    def test_start_sets_remaining(self):
+    def test_start_arms_the_countdown(self, tk_root):
         import tkinter as tk
         from quantacrypt.ui.shared import ClipboardTimer
-        root = tk.Tk(); root.withdraw()
-        try:
-            lbl = tk.Label(root, text="")
-            timer = ClipboardTimer(root, lbl, seconds=30)
-            timer.start()
-            assert timer._remain == 30
-            timer.cancel()
-        finally:
-            root.destroy()
+        lbl = tk.Label(tk_root, text="")
+        timer = ClipboardTimer(tk_root, lbl, seconds=30)
+        timer.start()
+        # start() runs the first tick straight away: it renders the full count,
+        # then decrements for the second the `after` job will show.  The old
+        # `_remain == 30` assertion never ran anywhere, and is simply wrong.
+        assert lbl.cget("text") == "Clipboard clears in 30s"
+        assert timer._remain == 29
+        assert timer._job is not None
+        timer.cancel()
 
-    @pytest.mark.skipif(not _HAS_DISPLAY, reason="no display")
-    def test_cancel_resets_state(self):
+    def test_cancel_resets_state(self, tk_root):
         import tkinter as tk
         from quantacrypt.ui.shared import ClipboardTimer
-        root = tk.Tk(); root.withdraw()
-        try:
-            lbl = tk.Label(root, text="")
-            timer = ClipboardTimer(root, lbl, seconds=30)
-            timer.start()
-            timer.cancel()
-            assert timer._remain == 0
-            assert timer._job is None
-            assert lbl.cget("text") == ""
-        finally:
-            root.destroy()
+        lbl = tk.Label(tk_root, text="")
+        timer = ClipboardTimer(tk_root, lbl, seconds=30)
+        timer.start()
+        timer.cancel()
+        assert timer._remain == 0
+        assert timer._job is None
+        assert lbl.cget("text") == ""
 
 
 @requires_tkinter
 class TestVerifyKeyMethod:
-    """Verify the structural correctness of the verify-without-decrypt feature."""
+    """Drive the verify-without-decrypt flow and assert what it actually does:
+    it proves the credentials, writes nothing, and leaves the wizard usable."""
+
+    @staticmethod
+    def _worker(qcx_path, meta, outcome):
+        """Bare namespace carrying only what DecryptorApp._verify_run touches,
+        so the worker body runs without a display.  ``outcome`` records which
+        completion callback the method routed to."""
+        import types
+        return types.SimpleNamespace(
+            _meta=meta, _qcx_path=str(qcx_path), _cancel=False,
+            _prog_cb=lambda *a, **k: None,
+            _after=lambda fn: fn(),          # run the main-thread callback inline
+            _verify_done=lambda: outcome.append(("ok", None)),
+            _cancelled=lambda: outcome.append(("cancelled", None)),
+            _fail=lambda exc: outcome.append(("fail", exc)),
+        )
 
     def test_verify_methods_exist(self):
         from quantacrypt.ui.decryptor import DecryptorApp
@@ -191,85 +240,151 @@ class TestVerifyKeyMethod:
         assert hasattr(DecryptorApp, "_verify_done")
         assert hasattr(DecryptorApp, "_reset_and_decrypt")
 
-    def test_verify_run_writes_no_tmp_file(self):
-        import inspect
+    def test_verify_run_writes_no_file(self, tmp_path):
+        """The contract is "nothing lands on disk" — so snapshot the directory
+        around a real verify run rather than grepping the method for ".tmp"."""
         from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._verify_run)
-        assert ".tmp" not in src, "_verify_run must not write any output file"
+        qcx_file, meta = _write_qcx(tmp_path)
+        before = sorted(os.listdir(tmp_path))
+        sizes_before = {n: (tmp_path / n).stat().st_size for n in before}
+        outcome = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, outcome), "s3cr3t-verify!!")
+        assert outcome == [("ok", None)]
+        assert sorted(os.listdir(tmp_path)) == before
+        assert {n: (tmp_path / n).stat().st_size for n in before} == sizes_before
 
-    def test_verify_run_checks_hmac(self):
-        """The HMAC check now lives in core.package.derive_final_key (which
-        the Tk wizard shares with qc-core); _verify_run must go through it."""
-        import inspect
+    def test_verify_run_derives_the_key_through_core_package(self, tmp_path, monkeypatch):
+        """Key derivation and its metadata-HMAC check belong to
+        core.package.derive_final_key, shared with qc-core.  Spy on the seam to
+        prove the wizard calls it, then hand back a bogus key to prove it *uses*
+        the result instead of deriving its own alongside."""
+        from quantacrypt.core import package as pkg
         from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._verify_run)
-        assert "derive_final_key" in src
-        assert "argon2id_derive" not in src and "_verify_meta_hmac" not in src, \
-            "key derivation must not be re-implemented in the UI"
+        qcx_file, meta = _write_qcx(tmp_path)
+        calls = []
+        real = pkg.derive_final_key
 
-    def test_verify_run_decrypts_only_first_chunk(self):
-        """Chunk-0 proof is core.package.verify_first_chunk; the wizard
-        must call it rather than carry its own copy."""
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._verify_run)
-        assert "verify_first_chunk" in src
-        assert "decrypt_streaming" not in src and "AESGCM" not in src
+        def spy(meta_arg, **kw):
+            calls.append((meta_arg, kw))
+            return real(meta_arg, **kw)
 
-    def test_start_verify_calls_validate(self):
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._start_verify)
-        assert "_validate" in src
+        monkeypatch.setattr(pkg, "derive_final_key", spy)
+        outcome = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, outcome), "s3cr3t-verify!!")
+        assert outcome == [("ok", None)]
+        assert len(calls) == 1
+        meta_arg, kw = calls[0]
+        assert meta_arg is meta
+        assert kw["password"] == "s3cr3t-verify!!" and kw["shares"] is None
 
-    def test_verify_done_leaves_decrypt_button_enabled(self):
-        import inspect
+        monkeypatch.setattr(pkg, "derive_final_key",
+                            lambda *a, **k: (b"\x00" * 64, b"\x00" * 32))
+        outcome = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, outcome), "s3cr3t-verify!!")
+        assert outcome and outcome[0][0] == "fail"
+
+    def test_verify_run_calls_verify_first_chunk(self, tmp_path, monkeypatch):
+        """Chunk-0 proof is core.package.verify_first_chunk; the wizard must
+        hand it the file, the metadata and the derived key."""
+        from quantacrypt.core import package as pkg
         from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._verify_done)
-        assert "self._btn.enable(False)" not in src
+        qcx_file, meta = _write_qcx(tmp_path)
+        seen = []
+        real = pkg.verify_first_chunk
+
+        def spy(path, meta_arg, key):
+            seen.append((path, meta_arg, key))
+            return real(path, meta_arg, key)
+
+        monkeypatch.setattr(pkg, "verify_first_chunk", spy)
+        outcome = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, outcome), "s3cr3t-verify!!")
+        assert outcome == [("ok", None)]
+        assert len(seen) == 1
+        path, meta_arg, key = seen[0]
+        assert path == str(qcx_file) and meta_arg is meta
+        assert key == pkg.derive_final_key(meta, password="s3cr3t-verify!!")[0]
+
+    def test_verify_run_reads_only_the_first_chunk(self, tmp_path):
+        """Corrupt chunk 1 and leave chunk 0 intact: verify must still pass —
+        it never reads that far — while a full decrypt of the same file fails."""
+        import io
+        from quantacrypt.core import package as pkg
+        from quantacrypt.ui.decryptor import DecryptorApp
+        qcx_file, meta = _write_qcx(tmp_path, chunk_size=4096, data=b"A" * 20000)
+        assert meta["payload_chunk_count"] > 1
+        raw = bytearray(qcx_file.read_bytes())
+        offset = meta["payload_offset"]
+        chunk0_len = struct.unpack(">I", raw[offset + 4:offset + 8])[0]
+        chunk1 = offset + 8 + chunk0_len                     # [seq:4][len:4][ct…]
+        assert struct.unpack(">I", raw[chunk1:chunk1 + 4])[0] == 1
+        raw[chunk1 + 8] ^= 0xFF                              # flip a byte of chunk 1
+        qcx_file.write_bytes(bytes(raw))
+
+        outcome = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, outcome), "s3cr3t-verify!!")
+        assert outcome == [("ok", None)]
+
+        final_key, _hmac_key = pkg.derive_final_key(meta, password="s3cr3t-verify!!")
+        with pytest.raises(Exception):
+            cc.decrypt_streaming(str(qcx_file), io.BytesIO(), meta, final_key)
+
+    def test_start_verify_passes_the_validation_result_through(self):
+        """_start_verify gates on _validate() and hands the result to _begin —
+        a validation error must reach _begin rather than be swallowed."""
+        import types
+        from quantacrypt.ui.decryptor import DecryptorApp
+        begun = []
+        obj = types.SimpleNamespace(_busy=False, _validate=lambda: "Enter a password",
+                                    _begin=lambda **kw: begun.append(kw))
+        DecryptorApp._start_verify(obj)
+        assert begun == [{"verify": True, "err": "Enter a password"}]
+        obj._validate = lambda: None
+        DecryptorApp._start_verify(obj)
+        assert begun[-1] == {"verify": True, "err": None}
+        obj._busy = True                    # no second run on top of a live worker
+        DecryptorApp._start_verify(obj)
+        assert len(begun) == 2
+
+    def test_verify_done_leaves_decrypt_button_enabled(self, tk_root, tmp_path, monkeypatch):
+        """Verify writes nothing, so the Decrypt button must stay usable —
+        unlike _done, which disables it until "Decrypt another"."""
+        import quantacrypt.ui.decryptor as dec_mod
+        from quantacrypt.ui.shared import RecentFiles
+        monkeypatch.setattr(RecentFiles, "_PATH", str(tmp_path / "recent.json"))
+        monkeypatch.setattr(dec_mod, "notify", lambda *a, **k: None)
+        qcx_file, meta = _write_qcx(tmp_path)
+        app = dec_mod.DecryptorApp(tk_root, payload={"meta": meta},
+                                   qcx_path=str(qcx_file))
+        app.withdraw()
+        try:
+            app._btn.enable(False)
+            app._verify_done()
+            assert app._btn._enabled is True
+            # Nothing was written, so the wizard stays on the Decrypt step.
+            assert app._wiz._active == 2
+            # Contrast: the real completion path does disable it.
+            out = tmp_path / "restored.bin"
+            out.write_bytes(b"z" * 10)
+            app._done(str(out), 10, fname="data.bin")
+            assert app._btn._enabled is False
+            assert app._wiz._active == len(app.STEPS)
+        finally:
+            app.destroy()
 
     def test_verify_end_to_end_single_password(self, tmp_path):
-        """Full verify run: encrypt a real file, then verify-only (no output written)."""
-        import base64, io
-        from quantacrypt.core import crypto as cc
-        src_file = tmp_path / "data.bin"
-        src_file.write_bytes(b"hello verify" * 500)
-        qcx_file = tmp_path / "data.qcx"
-        with open(qcx_file, "wb") as f:
-            meta = cc.encrypt_single_streaming(str(src_file), f, "s3cr3t!!", filename="data.bin")
-            blob = __import__("json").dumps({"meta": meta}, separators=(",",":")).encode()
-            f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
-        # Now do what _verify_run does: derive key, verify HMAC, decrypt first chunk
-        pkg = cc.__dict__  # not needed — call directly
-        import json, struct
-        with open(qcx_file, "rb") as f:
-            data = f.read()
-        i = data.rfind(cc.MAGIC)
-        n = struct.unpack(">I", data[i+len(cc.MAGIC):i+len(cc.MAGIC)+4])[0]
-        meta = json.loads(data[i+len(cc.MAGIC)+4:i+len(cc.MAGIC)+4+n])["meta"]
-        argon_key = cc.argon2id_derive(b"s3cr3t!!", base64.b64decode(meta["argon_salt"]))
-        sk = cc.aes_gcm_decrypt(argon_key, base64.b64decode(meta["kyber_sk_enc_nonce"]),
-                                base64.b64decode(meta["kyber_sk_enc"]))
-        kem_ss    = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]))
-        final_key = cc.xor_bytes(argon_key, kem_ss)
-        cc._verify_meta_hmac(final_key, meta)
-        # First chunk
-        payload_offset = meta.get("payload_offset", 0)
-        base_nonce = base64.b64decode(meta["payload_nonce"])
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        aes_key = cc.derive_aes_key(final_key)
-        cipher = AESGCM(aes_key)
-        with open(qcx_file, "rb") as f:
-            f.seek(payload_offset)
-            f.read(4)  # seq
-            ct_len = struct.unpack(">I", f.read(4))[0]
-            ct = f.read(ct_len)
-        nonce = cc._chunk_nonce(base_nonce, 0)
-        aad = cc._chunk_aad(0, meta["payload_chunk_count"] == 1)
-        plain = cipher.decrypt(nonce, ct, aad)
-        assert len(plain) > 0
-        # Confirm NO output file was written by verify logic
-        assert not (tmp_path / "data.qcx.tmp").exists()
+        """Real .qcx through the real worker: the right password verifies, the
+        wrong one fails, and neither leaves anything behind."""
+        from quantacrypt.ui.decryptor import DecryptorApp
+        qcx_file, meta = _write_qcx(tmp_path)
+        before = sorted(os.listdir(tmp_path))
+        good = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, good), "s3cr3t-verify!!")
+        assert good == [("ok", None)]
+        bad = []
+        DecryptorApp._verify_run(self._worker(qcx_file, meta, bad), "wrong-password")
+        assert bad and bad[0][0] == "fail"
+        assert sorted(os.listdir(tmp_path)) == before
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -848,7 +963,7 @@ class TestFolderEncryption:
 class TestBatchEncryptionLogic:
     """_validate_batch rejects bad inputs cleanly."""
 
-    def _make(self, batch_paths, out_dir, mode="single", pw="pw", pw2="pw", n=3, k=2):
+    def _make(self, batch_paths, out_dir, mode="single", pw="pw-testpad", pw2="pw-testpad", n=3, k=2):
         import types
         obj = types.SimpleNamespace(
             _batch_paths=batch_paths,
@@ -883,7 +998,7 @@ class TestBatchEncryptionLogic:
 
     def test_mismatched_passwords_rejected(self, tmp_path):
         f = tmp_path / "a.txt"; f.write_bytes(b"x")
-        obj = self._make([str(f)], str(tmp_path), pw="abc", pw2="xyz")
+        obj = self._make([str(f)], str(tmp_path), pw="abc-testpad", pw2="xyz")
         assert obj._validate_batch() is not None
 
     def test_valid_single_mode_passes(self, tmp_path):
@@ -904,38 +1019,89 @@ class TestBatchEncryptionLogic:
 
 @requires_tkinter
 class TestInspectFeature:
-    """Structural checks for the inspect-without-decrypting popup."""
+    """Drive the inspect-without-decrypting popup and read back what it shows."""
+
+    @staticmethod
+    def _app(tk_root, tmp_path, monkeypatch, meta, qcx_file):
+        import quantacrypt.ui.decryptor as dec_mod
+        from quantacrypt.ui.shared import RecentFiles
+        monkeypatch.setattr(RecentFiles, "_PATH", str(tmp_path / "recent.json"))
+        monkeypatch.setattr(dec_mod, "notify", lambda *a, **k: None)
+        app = dec_mod.DecryptorApp(tk_root, payload={"meta": meta},
+                                   qcx_path=str(qcx_file))
+        app.withdraw()
+        return app
+
+    @staticmethod
+    def _popup_texts(app):
+        """Open the details popup, collect its labels, close it again."""
+        import tkinter as tk
+        app._show_inspect()
+        app.update()
+        popups = [w for w in app.winfo_children() if isinstance(w, tk.Toplevel)]
+        assert popups, "_show_inspect should open a popup"
+        popup = popups[-1]
+        texts = _widget_texts(popup)
+        popup.grab_release()
+        popup.destroy()
+        app.update()
+        return texts
 
     def test_show_inspect_method_exists(self):
         from quantacrypt.ui.decryptor import DecryptorApp
         assert hasattr(DecryptorApp, "_show_inspect")
 
-    def test_show_inspect_does_not_decrypt(self):
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._show_inspect)
-        # Must not derive argon key or call decrypt functions
-        assert "argon2id_derive" not in src
-        assert "decrypt_streaming" not in src
-        assert "aes_gcm_decrypt" not in src
+    def test_show_inspect_does_not_decrypt(self, tk_root, tmp_path, monkeypatch):
+        """Booby-trap every path that would need the key: the popup is supposed
+        to be readable with no password at all, so none of them may be hit."""
+        from quantacrypt.core import package as pkg
+        qcx_file, meta = _write_qcx(tmp_path)
+        app = self._app(tk_root, tmp_path, monkeypatch, meta, qcx_file)
+        try:
+            def boom(*_a, **_k):
+                raise AssertionError("inspect must not touch the key material")
 
-    def test_show_inspect_uses_fingerprint(self):
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._show_inspect)
-        assert "sha256" in src or "hashlib" in src
+            for name in ("argon2id_derive", "decrypt_streaming", "aes_gcm_decrypt",
+                         "kyber_decaps"):
+                monkeypatch.setattr(cc, name, boom)
+            monkeypatch.setattr(pkg, "derive_final_key", boom)
+            monkeypatch.setattr(pkg, "verify_first_chunk", boom)
+            texts = self._popup_texts(app)
+            assert any("File details" in t for t in texts)
+        finally:
+            app.destroy()
 
-    def test_show_inspect_shows_mode(self):
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._show_inspect)
-        assert "mode" in src
+    def test_show_inspect_shows_the_file_fingerprint(self, tk_root, tmp_path, monkeypatch):
+        qcx_file, meta = _write_qcx(tmp_path)
+        expected = hashlib.sha256(qcx_file.read_bytes()[:65536]).hexdigest()[:16]
+        app = self._app(tk_root, tmp_path, monkeypatch, meta, qcx_file)
+        try:
+            texts = self._popup_texts(app)
+            assert any(expected in t for t in texts), texts
+        finally:
+            app.destroy()
 
-    def test_show_inspect_shows_version(self):
-        import inspect
-        from quantacrypt.ui.decryptor import DecryptorApp
-        src = inspect.getsource(DecryptorApp._show_inspect)
-        assert "version" in src
+    def test_show_inspect_describes_the_protection_mode(self, tk_root, tmp_path, monkeypatch):
+        qcx_file, meta = _write_qcx(tmp_path)
+        app = self._app(tk_root, tmp_path, monkeypatch, meta, qcx_file)
+        try:
+            assert any("Argon2id" in t for t in self._popup_texts(app))
+            # _show_inspect reads only self._meta, so swapping it in is enough
+            # to exercise the shamir copy without a second real encryption.
+            app._meta = {"mode": "shamir", "threshold": 2, "total": 3, "version": 1}
+            shamir = self._popup_texts(app)
+            assert any("any 2 of 3 shares" in t for t in shamir), shamir
+        finally:
+            app.destroy()
+
+    def test_show_inspect_shows_the_format_version(self, tk_root, tmp_path, monkeypatch):
+        qcx_file, meta = _write_qcx(tmp_path)
+        app = self._app(tk_root, tmp_path, monkeypatch, meta, qcx_file)
+        try:
+            texts = self._popup_texts(app)
+            assert any(f"v{meta['version']}" in t for t in texts), texts
+        finally:
+            app.destroy()
 
 
 class TestRecentFilesClassmethodAPI:

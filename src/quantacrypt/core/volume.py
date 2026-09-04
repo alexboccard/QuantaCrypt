@@ -30,7 +30,9 @@ import json
 import logging
 import os
 import secrets
+import stat
 import struct
+import tempfile
 import time
 import uuid
 from typing import IO, Any, Callable
@@ -38,6 +40,7 @@ from typing import IO, Any, Callable
 from quantacrypt.core.crypto import (
     CancelledOperation,
     KEY_BYTES,
+    reject_weak_secret,
     ARGON2_TIME_COST,
     ARGON2_MEMORY_COST,
     CHUNK_SIZE,
@@ -116,6 +119,20 @@ _OFF_DIR_NONCE  = 38  # 12 bytes
 _OFF_RESERVED   = 50  # 462 bytes padding
 
 
+def _typed_mode(entry: dict, mode: int) -> int:
+    """Re-attach *entry*'s own file-type bits to a caller-supplied mode.
+
+    The type never comes from the caller.  A FUSE backend that masks chmod's
+    argument with ALLPERMS hands us permission bits only, and an entry stored
+    that way reports no file type at all (`ls` shows `?---------`); a caller
+    passing S_IFDIR for a file makes the index disagree with itself.  Both
+    now reach the journal and survive every reopen, so neither is a mistake
+    the next unmount quietly undoes.
+    """
+    kind = stat.S_IFDIR if entry.get("type") == "dir" else stat.S_IFREG
+    return kind | (mode & 0o7777)
+
+
 # ── Header I/O ──────────────────────────────────────────────────────────────
 
 def write_header(
@@ -132,6 +149,27 @@ def write_header(
     header[_OFF_META_NONCE:_OFF_META_NONCE + 12] = meta_nonce
     header[_OFF_DIR_NONCE:_OFF_DIR_NONCE + 12] = dir_nonce
     f.write(bytes(header))
+
+
+def _fsync_dir(path: str) -> None:
+    """fsync the directory holding ``path`` so a rename is itself durable.
+
+    os.replace() is atomic with respect to ordering, not durability: after a
+    power loss the directory entry can point at a file whose data blocks were
+    never written. Best-effort — not every filesystem supports it, and a
+    failure here must not fail an otherwise complete write.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def read_header(f: IO[bytes]) -> dict:
@@ -476,6 +514,52 @@ def derive_volume_key_shamir(share_strings: list[str], meta: dict) -> bytes:
 
 # ── Volume creation ─────────────────────────────────────────────────────────
 
+def _write_new_container(
+    path: str,
+    volume_id: bytes,
+    meta_nonce: bytes,
+    dir_nonce: bytes,
+    auth_params: dict,
+    meta_ct: bytes,
+    dir_ct: bytes,
+) -> None:
+    """Write a fresh container beside *path*, then replace it atomically.
+
+    The scratch file gets a random name rather than ``path + ".part"``: a
+    fixed name that outlives a failure wedges that path permanently, because
+    every retry then collides with it and no screen in the app knows the name
+    to offer clearing it.  Any failure — ENOSPC being the realistic one —
+    removes the scratch file, matching encrypt_to_qcx() and compact().
+
+    mkstemp also creates the file 0600, so the container starts out readable
+    only by its owner, as .qcx output already does.
+    """
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.qc-vol-",
+        dir=os.path.dirname(os.path.abspath(path)) or None,
+    )
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            write_header(f, volume_id, meta_nonce, dir_nonce)
+            _write_auth_params(f, auth_params)
+            _write_encrypted_block(f, meta_ct)
+            _write_encrypted_block(f, dir_ct)
+            # Durability before atomicity: for a Shamir volume the shares are
+            # handed out the moment this returns, so a container whose blocks
+            # never reached disk is unrecoverable by design.
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path)
+
+
 def create_volume_single(
     path: str,
     password: str,
@@ -484,6 +568,9 @@ def create_volume_single(
 ) -> dict:
     """Create an empty .qcv volume protected by a password.
 
+    Enforces the same minimum length as .qcx encryption — a volume is the
+    longer-lived container of the two.
+
     Returns the volume metadata dict.
     """
     def _p(m):
@@ -491,6 +578,8 @@ def create_volume_single(
             raise CancelledOperation("Volume creation cancelled")
         if progress_cb:
             progress_cb(m)
+
+    reject_weak_secret(password)
 
     _p("Deriving 512-bit password key (Argon2id)...")
     argon_salt = secrets.token_bytes(32)
@@ -541,16 +630,8 @@ def create_volume_single(
     dir_nonce, dir_ct = encrypt_directory(final_key, dir_index)
 
     _p("Writing volume container...")
-    # Atomic and never clobbering: write beside the target, then replace.
-    # "xb" refuses an existing temp; the final os.replace is atomic.
-    tmp = path + ".part"
-    with open(tmp, "xb") as f:
-        write_header(f, volume_id, meta_nonce, dir_nonce)
-        _write_auth_params(f, auth_params)
-        _write_encrypted_block(f, meta_ct)
-        _write_encrypted_block(f, dir_ct)
-
-    os.replace(tmp, path)
+    _write_new_container(path, volume_id, meta_nonce, dir_nonce,
+                         auth_params, meta_ct, dir_ct)
     _p("Volume created.")
     return metadata
 
@@ -626,16 +707,8 @@ def create_volume_shamir(
     dir_nonce, dir_ct = encrypt_directory(final_key, dir_index)
 
     _p("Writing volume container...")
-    # Atomic and never clobbering: write beside the target, then replace.
-    # "xb" refuses an existing temp; the final os.replace is atomic.
-    tmp = path + ".part"
-    with open(tmp, "xb") as f:
-        write_header(f, volume_id, meta_nonce, dir_nonce)
-        _write_auth_params(f, auth_params)
-        _write_encrypted_block(f, meta_ct)
-        _write_encrypted_block(f, dir_ct)
-
-    os.replace(tmp, path)
+    _write_new_container(path, volume_id, meta_nonce, dir_nonce,
+                         auth_params, meta_ct, dir_ct)
     _p("Volume created.")
     return metadata, share_strings
 
@@ -681,6 +754,8 @@ class VolumeContainer:
         # authentication — the tamper/corruption shape, as opposed to the
         # benign run-out-of-bytes-at-EOF crash shape.
         self.journal_suspicious: bool = False
+        # Where the unreadable journal tail was copied, when one existed.
+        self.suspect_sidecar: str | None = None
         # Paths known to exist on disk (baseline or journal) as of the last
         # successful open/save/compact.  Coalescing consults this to decide
         # whether a delete/rename needs a tombstone record: dropping the
@@ -806,6 +881,48 @@ class VolumeContainer:
         # this snapshot to emit tombstones for later deletes/renames.
         self._persisted_paths = set(self.dir_index)
 
+    def _preserve_suspect_tail(self, valid_end: int) -> None:
+        """Save the unreadable journal tail beside the volume.
+
+        Best-effort: a failure here must never stop the volume opening, since
+        the alternative is a user locked out of their own data. Records the
+        sidecar path in ``suspect_sidecar`` so the UI can name it.
+        """
+        self.suspect_sidecar = None
+        try:
+            tail_len = self._file_size - valid_end
+            if tail_len <= 0:
+                return
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            sidecar = f"{self.path}.suspect-{stamp}"
+            fd = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with open(self.path, "rb") as src, os.fdopen(fd, "wb") as dst:
+                    fd = -1  # fdopen owns it now
+                    src.seek(valid_end)
+                    remaining = tail_len
+                    while remaining > 0:
+                        chunk = src.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        remaining -= len(chunk)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            self.suspect_sidecar = sidecar
+            logger.warning(
+                "Volume %s: preserved %d unreadable trailing bytes to %s "
+                "before they are overwritten by the next save",
+                self.path, tail_len, sidecar,
+            )
+        except OSError as e:
+            logger.warning(
+                "Volume %s: could not preserve the unreadable journal tail "
+                "(%s) — it will be lost on the next save",
+                self.path, e,
+            )
+
     def _replay_journal(self) -> None:
         """Apply journal records to the in-memory dir_index.
 
@@ -831,6 +948,16 @@ class VolumeContainer:
                 "reverted to the last valid record",
                 self.path, valid_end, self._file_size - valid_end,
             )
+            # Copy the tail out NOW, before anything can destroy it. Both
+            # persistence paths overwrite it: _append_journal() seeks to
+            # _journal_end and truncates, and compact() rewrites the whole
+            # container. _persist_locked() runs on nearly every filesystem
+            # operation, and macOS writes .DS_Store/Spotlight metadata to a
+            # fresh mount within seconds — so the one piece of evidence that
+            # a container may have been altered has a lifetime measured in
+            # seconds unless it is preserved here, at the only moment it is
+            # guaranteed to still exist.
+            self._preserve_suspect_tail(valid_end)
         for header, body_offset, body_length in records:
             op_type = header.get("type")
             vpath = header.get("vpath")
@@ -868,6 +995,18 @@ class VolumeContainer:
                     continue
                 if vpath in self.dir_index:
                     self.dir_index[new_vpath] = self.dir_index.pop(vpath)
+            elif op_type == "setattr":
+                entry = self.dir_index.get(vpath)
+                if entry is None and not vpath.endswith("/"):
+                    entry = self.dir_index.get(vpath + "/")
+                if entry is not None:
+                    if "mode" in header:
+                        # Normalise on the way in too, so an index poisoned
+                        # by a build that stored a bare permission mask heals
+                        # on the next open instead of staying broken.
+                        entry["mode"] = _typed_mode(entry, header["mode"])
+                    if "mtime" in header:
+                        entry["mtime"] = header["mtime"]
             elif op_type == "mkdir":
                 # Directories are cheap to recreate on rmdir/mkdir cycles;
                 # replay unconditionally sets the entry.
@@ -1122,7 +1261,10 @@ class VolumeContainer:
             data, self.final_key, self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
         )
         mtime = int(time.time())
-        mode = 0o100644
+        # Preserve a mode an earlier chmod set: rebuilding the entry from
+        # scratch made `chmod +x` then any write silently drop the bit.
+        existing = self.dir_index.get(vpath)
+        mode = existing.get("mode", 0o100644) if existing else 0o100644
         nonce_b64 = base64.b64encode(nonce).decode()
 
         self.dir_index[vpath] = {
@@ -1149,6 +1291,39 @@ class VolumeContainer:
             "content_hash": sha256_hex,
         })
         self._dirty = True
+
+    def set_attrs(self, vpath: str, *, mode: int | None = None,
+                  mtime: int | None = None) -> bool:
+        """Record a mode and/or mtime change so it survives unmount.
+
+        Previously chmod/utimens mutated the entry in place and marked
+        nothing dirty, so the change was discarded at unmount — except when
+        an unrelated write happened to trigger compact(), which carried it.
+        Same input, different outcome. Since utimens is what cp -p, rsync -t,
+        unzip, tar -x and Finder all issue after writing, every file copied
+        into a mounted volume came back stamped with its copy time.
+
+        Returns False if the path is unknown.
+        """
+        entry = self.dir_index.get(vpath)
+        if entry is None and not vpath.endswith("/"):
+            vpath = vpath + "/"
+            entry = self.dir_index.get(vpath)
+        if entry is None:
+            return False
+        record: dict[str, Any] = {"type": "setattr", "vpath": vpath}
+        if mode is not None:
+            mode = _typed_mode(entry, mode)
+            entry["mode"] = mode
+            record["mode"] = mode
+        if mtime is not None:
+            entry["mtime"] = mtime
+            record["mtime"] = mtime
+        if len(record) == 2:      # nothing actually changed
+            return True
+        self._pending_ops.append(record)
+        self._dirty = True
+        return True
 
     def mkdir(self, vpath: str) -> None:
         """Create a virtual directory."""
@@ -1432,6 +1607,19 @@ class VolumeContainer:
         # destination path (e.g. rename-replace's tombstone for the old
         # destination) — replay would then delete the fresh content.
         emit_pos: dict[int, int] = {}
+        # Indices of setattr ops keyed by their current effective path. A
+        # setattr is metadata on a name, so it has to follow that name the
+        # way a write does: rsync's sequence is write /.f.tmp → chmod/utimes
+        # /.f.tmp → rename to /f.txt, and leaving the setattr pinned to the
+        # temp emits it against a path that never materialises on replay.
+        setattr_owners: dict[str, list[int]] = {}
+        # setattr index → position it must be emitted at (always just after
+        # the write it belongs to), and its final effective path. Kept
+        # separately rather than rewriting the op in place: this function must
+        # be free of side effects on _pending_ops, or a second call sees a
+        # half-rewritten list and produces a different answer.
+        attr_emit_pos: dict[int, int] = {}
+        attr_final_path: dict[int, str] = {}
 
         for i, op in enumerate(ops):
             t = op["type"]
@@ -1443,6 +1631,8 @@ class VolumeContainer:
                 current_owner[vp] = i
                 write_final_path[i] = vp
                 emit_pos[i] = i
+            elif t == "setattr":
+                setattr_owners.setdefault(op["vpath"], []).append(i)
             elif t == "rename":
                 old = op["vpath"]
                 new = op.get("new_vpath")
@@ -1455,6 +1645,15 @@ class VolumeContainer:
                     current_owner[new] = idx
                     write_final_path[idx] = new
                     emit_pos[idx] = i
+                    # Carry any attribute changes on the old name across, and
+                    # emit them after the re-keyed write so replay applies
+                    # them to a path that exists.
+                    moved = setattr_owners.pop(old, [])
+                    for sidx in moved:
+                        attr_final_path[sidx] = new
+                        attr_emit_pos[sidx] = i
+                    if moved:
+                        setattr_owners.setdefault(new, []).extend(moved)
                     if old in on_disk:
                         converted[i] = {"type": "delete", "vpath": old}
                         on_disk.discard(old)
@@ -1466,6 +1665,17 @@ class VolumeContainer:
                     on_disk.discard(old)
                     if isinstance(new, str):
                         on_disk.add(new)
+                        # Deliberately NOT re-keyed to `new`. This rename is
+                        # emitted at its own index, after the setattr, and
+                        # replay's rename moves the whole entry — so an
+                        # attribute change applied to the old name travels
+                        # with it. Re-keying without also moving the emit
+                        # position (as the in-session branch above does) put
+                        # the setattr before the path it names existed, and
+                        # the change was lost. Only the ownership moves, so a
+                        # later delete of `new` still drops it.
+                        setattr_owners.setdefault(new, []).extend(
+                            setattr_owners.pop(old, []))
             elif t in ("delete", "rmdir"):
                 vp = op["vpath"]
                 if vp in current_owner:
@@ -1480,6 +1690,8 @@ class VolumeContainer:
                 else:
                     # Delete of a baseline path — emit it as-is.
                     on_disk.discard(vp)
+                for sidx in setattr_owners.pop(vp, []):
+                    dropped.add(sidx)
             # mkdir is emitted as-is; mkdir-then-rmdir coalescing would be
             # a further refinement but is rarely worth complicating.
 
@@ -1487,19 +1699,29 @@ class VolumeContainer:
         writes_at: dict[int, int] = {
             pos: idx for idx, pos in emit_pos.items() if idx not in dropped
         }
+        # position → setattr indices to emit there, after that position's write
+        attrs_at: dict[int, list[int]] = {}
+        for sidx, pos in attr_emit_pos.items():
+            if sidx not in dropped:
+                attrs_at.setdefault(pos, []).append(sidx)
 
         coalesced: list[dict] = []
         for i, op in enumerate(ops):
             if i in converted:
                 coalesced.append(converted[i])
-            elif i not in dropped and op["type"] != "write":
-                coalesced.append(op)
+            elif i not in dropped and op["type"] != "write" and i not in attr_emit_pos:
+                final = attr_final_path.get(i)
+                coalesced.append({**op, "vpath": final} if final else op)
             if i in writes_at:
                 w = ops[writes_at[i]]
                 final = write_final_path[writes_at[i]]
                 if final != w["vpath"]:
                     w = {**w, "vpath": final}
                 coalesced.append(w)
+            for sidx in attrs_at.get(i, []):
+                a = ops[sidx]
+                final = attr_final_path.get(sidx)
+                coalesced.append({**a, "vpath": final} if final else a)
         return coalesced
 
     def _append_journal(self, ops: list[dict] | None = None) -> None:
@@ -1645,6 +1867,7 @@ class VolumeContainer:
             raise
 
         os.replace(tmp_path, self.path)
+        _fsync_dir(self.path)
 
         # ── Commit point ──  The new container is on disk; only now do we
         # swap the in-memory state over to describe it.  _file_data is
@@ -1671,16 +1894,19 @@ class VolumeContainer:
         self._persisted_paths = set(self.dir_index)
 
     def stat(self) -> dict:
-        """Return volume statistics."""
-        file_count = sum(
-            1 for e in self.dir_index.values() if e.get("type") != "dir"
-        )
-        dir_count = sum(
-            1 for e in self.dir_index.values() if e.get("type") == "dir"
-        )
+        """Return volume statistics.
+
+        Snapshots the index first: this is reached from the service's
+        volume_list on a request worker that holds no FUSE lock, and the
+        Volumes screen polls it every three seconds while FUSE workers add
+        and remove keys — three live generator expressions over a mutating
+        dict is a reliable "dictionary changed size during iteration".
+        """
+        entries = list(self.dir_index.values())
+        file_count = sum(1 for e in entries if e.get("type") != "dir")
+        dir_count = sum(1 for e in entries if e.get("type") == "dir")
         total_size = sum(
-            e.get("size", 0) for e in self.dir_index.values()
-            if e.get("type") != "dir"
+            e.get("size", 0) for e in entries if e.get("type") != "dir"
         )
         return {
             "file_count": file_count,

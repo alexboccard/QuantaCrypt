@@ -12,7 +12,7 @@ __all__ = [
     "C", "F", "UI", "MONO", "SP", "ICON", "MOD", "MOD_LABEL", "REVEAL_LABEL",
     "accel", "bind_shortcut", "safe_after", "write_new_private_file",
     "styled_entry", "bind_context_menu", "fmt_size", "rule", "section_label",
-    "card", "kv_row", "confirm", "alert", "reveal_path",
+    "card", "kv_row", "confirm", "alert", "reveal_path", "copy_secret",
     "FlatButton", "SegmentedControl", "StagedProgressBar",
     "PasswordStrengthBar", "FileCard", "WizardSteps",
     "ClipboardTimer", "RecentFiles", "RecentVolumes", "AppPrefs",
@@ -362,6 +362,94 @@ def _find_app_icon() -> str:
     return ""
 
 
+def _js(s: str) -> str:
+    """Escape a Python string for a JavaScript double-quoted literal."""
+    return (s.replace("\\", "\\\\").replace('"', '\\"')
+             .replace("\n", "\\n").replace("\r", ""))
+
+
+def _run_jxa(script: str, timeout: float = 5.0):
+    """Run a JXA script and return its stdout, or None if it did not run.
+
+    The script travels on stdin, never in argv: a Shamir share passed as a
+    command-line argument would be visible in ``ps`` to every process on the
+    machine for as long as osascript lives.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-"],
+                           input=script, text=True, capture_output=True,
+                           timeout=timeout)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+# Maccy, Paste, Alfred, Raycast and LaunchBar all check for this marker before
+# recording a copy.  Without it a share code lands in a plaintext, searchable
+# clipboard history that outlives the app, the file and the volume — somewhere
+# QuantaCrypt can never clear it.  Mirrors macos/QuantaCrypt/Shared/Clipboard.swift.
+_CONCEALED_TYPE = "org.nspasteboard.ConcealedType"
+
+
+def copy_secret(widget, text: str):
+    """Put key material on the clipboard, hidden from clipboard managers.
+
+    Returns ``(concealed, change)``.  ``change`` is the macOS pasteboard
+    changeCount straight after the write, which is the only reliable witness
+    that the copy is still ours — Tk keeps answering ``clipboard_get()`` from
+    its own stale buffer after another app takes the pasteboard, so comparing
+    the text back would happily wipe whatever the user copied since.  Both are
+    for ``ClipboardTimer``; ``concealed`` is False when the marker could not be
+    written, so the caller can say so instead of implying a protection that
+    is not there.
+
+    Raises ``tk.TclError`` if the clipboard cannot be reached at all.
+    """
+    # Reach the clipboard through Tk first, while there is nothing secret on
+    # it: an unreachable clipboard fails here rather than after the share has
+    # been handed to a subprocess.  Then hand ownership back — Tkinter cannot
+    # declare an NSPasteboard type, so the marked write has to happen outside
+    # Tk, and a Tk that still owns the selection would answer clipboard_get()
+    # with its own empty buffer instead of the share.
+    widget.clipboard_clear()
+    widget.clipboard_append("")
+    if sys.platform == "darwin":
+        try:
+            widget.selection_clear(selection="CLIPBOARD")
+        except Exception:
+            pass
+        out = _run_jxa(
+            'ObjC.import("AppKit");\n'
+            'var pb = $.NSPasteboard.generalPasteboard;\n'
+            'pb.clearContents;\n'
+            'var it = $.NSPasteboardItem.alloc.init;\n'
+            f'it.setStringForType("{_js(text)}", $.NSPasteboardTypeString);\n'
+            f'it.setStringForType("", "{_CONCEALED_TYPE}");\n'
+            'pb.writeObjects($([it]));\n'
+            'String(pb.changeCount);\n')
+        if out is not None and out.strip().isdigit():
+            return True, int(out.strip())
+    widget.clipboard_append(text)
+    return False, None
+
+
+def clear_pasteboard_if_unchanged(change: int):
+    """Clear the macOS pasteboard only while ``change`` is still its
+    changeCount.  True = cleared, None = the user has copied something else
+    since, False = the check could not be run."""
+    out = _run_jxa(
+        'ObjC.import("AppKit");\n'
+        'var pb = $.NSPasteboard.generalPasteboard;\n'
+        # changeCount arrives as a string through the ObjC bridge, so === against
+        # a numeric literal is always false without the cast.
+        f'if (Number(pb.changeCount) === {int(change)}) {{ pb.clearContents; "cleared" }}\n'
+        'else { "kept" }\n')
+    if out is None:
+        return False
+    return True if out.strip() == "cleared" else None
+
+
 def notify(title: str, message: str, sound: bool = True) -> None:
     """Send a macOS notification if the app window is not in focus.
 
@@ -383,11 +471,6 @@ def notify(title: str, message: str, sound: bool = True) -> None:
         pass
 
     import subprocess
-
-    # Sanitise strings for JS embedding (escape backslash, quotes, newlines)
-    def _js(s: str) -> str:
-        return (s.replace("\\", "\\\\").replace('"', '\\"')
-                 .replace("\n", "\\n").replace("\r", ""))
 
     icon_path = _find_app_icon()
 
@@ -485,6 +568,11 @@ class FlatButton(tk.Label):
         padx = SP["m"] if small else SP["l"] + SP["xs"]
         pady = SP["s"] - 2 if small else SP["s"]
 
+        # tk.Label defaults -takefocus to "0", which short-circuits
+        # ::tk::FocusOK — so a FlatButton that is never enable()d sits outside
+        # the Tab order entirely, including both buttons of every confirm()
+        # dialog.  Opt in here; enable(False) still takes it back out.
+        kw.setdefault("takefocus", 1)
         super().__init__(parent, text=text, font=font,
                          bg=bg, fg=fg, cursor="hand2",
                          padx=padx, pady=pady, **kw)
@@ -573,7 +661,12 @@ class SegmentedControl(tk.Frame):
             self.columnconfigure(i, weight=1)
             lbl.bind("<Button-1>", lambda e, v=val: variable.set(v))
             self._labels[val] = lbl
-        variable.trace_add("write", lambda *_: self._refresh())
+        # Keep the trace id so destroy() can detach it. A trace added to a
+        # caller-owned variable outlives this widget: the variable survives,
+        # the callback keeps firing against a destroyed control, and the next
+        # widget sharing that variable sees ghost refreshes.
+        self._variable = variable
+        self._trace_id = variable.trace_add("write", lambda *_: self._refresh())
         self._refresh()
 
         # Keyboard: Tab focuses the control, Left/Right arrows switch options
@@ -619,6 +712,23 @@ class SegmentedControl(tk.Frame):
         for val, lbl in self._labels.items():
             lbl.config(bg=C["accent"] if val==v else C["surface"],
                        fg=C["text"]   if val==v else C["text3"])
+
+
+    def destroy(self):
+        """Detach the write trace before going away.
+
+        Without this the callback keeps firing against a destroyed widget for
+        as long as the caller's variable lives — which for the decryptor's
+        share-mode toggle means every rebuilt control adds another trace and
+        none are ever removed.
+        """
+        try:
+            if getattr(self, "_trace_id", None) is not None:
+                self._variable.trace_remove("write", self._trace_id)
+                self._trace_id = None
+        except Exception:
+            pass          # the interpreter may already be tearing down
+        super().destroy()
 
 
 class StagedProgressBar(tk.Frame):
@@ -920,7 +1030,26 @@ class PasswordStrengthBar(tk.Frame):
         self._queue: "queue.Queue" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._inflight: tuple[str, threading.Event, dict] | None = None
-        entry_var.trace_add("write", lambda *_: self._schedule_refresh())
+        # Same reason as SegmentedControl: detach on destroy.
+        self._entry_var = entry_var
+        self._trace_id = entry_var.trace_add(
+            "write", lambda *_: self._schedule_refresh())
+
+    def destroy(self):
+        """Detach the trace and cancel the debounce before going away."""
+        try:
+            if getattr(self, "_trace_id", None) is not None:
+                self._entry_var.trace_remove("write", self._trace_id)
+                self._trace_id = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_refresh_job", None) is not None:
+                self.after_cancel(self._refresh_job)
+                self._refresh_job = None
+        except Exception:
+            pass
+        super().destroy()
 
     def _on_configure(self, event):
         self._bar_w = event.width
@@ -1257,14 +1386,19 @@ class WizardSteps(tk.Canvas):
 
 class ClipboardTimer:
     """Auto-clears the clipboard after `seconds` and shows a countdown label.
-    
+
     Usage:
         timer = ClipboardTimer(widget, label_widget, seconds=60)
-        timer.start()     # call after clipboard_append()
+        timer.copy(widget, share)   # copies, conceals, arms the countdown
         timer.cancel()    # call if the user manually clears or copies something else
-    
+
     The label_widget text is updated every second: "Clipboard clears in 42s"
     When the timer fires, the clipboard is cleared and the label reset.
+
+    The wipe only ever removes the copy this timer made.  The clipboard is
+    shared with every other app on the machine, so a timer that cleared it
+    unconditionally would destroy whatever the user copied in the meantime —
+    an account number out of Safari at t=20 is gone at t=60.
     """
     _SECS = 60
 
@@ -1274,11 +1408,44 @@ class ClipboardTimer:
         self._secs   = seconds
         self._job    = None
         self._remain = 0
+        self._written   = None   # what this timer put on the clipboard
+        self._change    = None   # macOS pasteboard changeCount for that write
+        self._concealed = True
 
-    def start(self):
+    def copy(self, widget, text):
+        """Copy `text` as key material and arm the countdown.  Returns False
+        when the concealed-pasteboard marker could not be written."""
+        concealed, change = copy_secret(widget, text)
+        self.start(text, concealed=concealed, change=change)
+        return concealed
+
+    def start(self, value=None, *, concealed=True, change=None):
+        """`value` is the text just placed on the clipboard.  Without it the
+        clipboard is read back instead, which is what the caller has just
+        written — but a caller that knows should say so."""
         self.cancel()
+        self._written   = value if value is not None else self._clipboard_text()
+        self._change    = change
+        self._concealed = concealed
         self._remain = self._secs
         self._tick()
+
+    def _clipboard_text(self):
+        """The text really on the system clipboard, or None."""
+        if sys.platform == "darwin":
+            # Tk answers from its own buffer while it owns the selection, and
+            # on macOS it never notices another app taking the pasteboard.
+            import subprocess
+            try:
+                r = subprocess.run(["pbpaste"], capture_output=True, text=True,
+                                   timeout=5)
+                return r.stdout if r.returncode == 0 else None
+            except Exception:
+                return None
+        try:
+            return self._root.clipboard_get()
+        except Exception:
+            return None
 
     def cancel(self):
         if self._job is not None:
@@ -1286,6 +1453,9 @@ class ClipboardTimer:
             except Exception: pass
             self._job = None
         self._remain = 0
+        # Forget the copy too, so a later _clear can never act on a stale one.
+        self._written = None
+        self._change  = None
         try:
             if self._label.winfo_exists():
                 self._label.config(text="")
@@ -1295,23 +1465,56 @@ class ClipboardTimer:
         if self._remain <= 0:
             self._clear()
             return
+        # Say so when the copy is unmarked: on that path a clipboard manager
+        # keeps the share for ever and the countdown protects nothing.
+        note = "" if self._concealed else "  ·  a clipboard manager may keep it"
         try:
             if self._label.winfo_exists():
-                self._label.config(text=f"Clipboard clears in {self._remain}s", fg=C["text3"])
+                self._label.config(text=f"Clipboard clears in {self._remain}s{note}",
+                                   fg=C["text3"])
         except Exception:
             return
         self._remain -= 1
         self._job = self._root.after(1000, self._tick)
 
+    def _wipe(self):
+        """True cleared / None deliberately left alone / False tried and failed."""
+        if self._change is not None:
+            return clear_pasteboard_if_unchanged(self._change)
+        if self._written is None:
+            # Nothing was recorded, so nothing on the clipboard is known to be
+            # ours and there is no safe wipe to make.
+            return None
+        if self._clipboard_text() != self._written:
+            return None
+        try:
+            self._root.clipboard_clear()
+        except Exception:
+            return False
+        return True
+
     def _clear(self):
         self._job = None
-        try: self._root.clipboard_clear()
-        except Exception: pass
+        outcome = self._wipe()
+        # This copy is settled either way; never act on it a second time.
+        self._written = None
+        self._change  = None
+        if outcome is True:
+            text, fg, fade = f"Clipboard cleared {ICON['ok']}", C["success"], True
+        elif outcome is None:
+            text, fg, fade = "Clipboard already changed", C["text3"], True
+        else:
+            # Never claim a wipe that did not happen: for a Shamir share the
+            # claim is the whole security story, and the user has to know to
+            # clear it themselves.
+            text, fg, fade = (f"Couldn't clear the clipboard {ICON['warn']}",
+                              C["warning"], False)
         try:
             if self._label.winfo_exists():
-                self._label.config(text=f"Clipboard cleared {ICON['ok']}", fg=C["success"])
-                self._root.after(2000, lambda: (
-                    self._label.config(text="") if self._label.winfo_exists() else None))
+                self._label.config(text=text, fg=fg)
+                if fade:
+                    self._root.after(2000, lambda: (
+                        self._label.config(text="") if self._label.winfo_exists() else None))
         except Exception: pass
 
 

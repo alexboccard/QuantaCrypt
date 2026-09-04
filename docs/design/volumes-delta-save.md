@@ -1,5 +1,7 @@
 # Design: Delta-save for .qcv volumes (format v2)
 
+Status: **implemented** — shipped as `VOLUME_FORMAT_VERSION = 2` (append-only journal + compaction). The prose below is kept as the design record; where it reads as a proposal, read it as history.
+
 ## Problem
 
 `VolumeContainer.save()` rewrites the entire container on every invocation.

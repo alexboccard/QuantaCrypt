@@ -99,6 +99,32 @@ def xor_bytes(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
 
+#: Shortest password the core will encrypt with. The SwiftUI shell already
+#: enforces this in its own validation; the Tk UI enforced nothing at all and
+#: its batch path skipped even the soft "Weak password" warning, so the floor
+#: belongs here, where both front ends pass through.
+MIN_PASSWORD_LENGTH = 8
+
+
+def reject_weak_secret(secret: bytes | str) -> None:
+    """Refuse a password below MIN_PASSWORD_LENGTH.
+
+    Argon2id at t=4/m=64 MiB buys roughly 20 bits against an offline
+    attacker; it does not rescue a four-character password, and a .qcx is
+    designed to be handed to someone else over an untrusted channel.
+    """
+    if isinstance(secret, str):
+        secret = secret.encode()
+    _reject_empty_secret(secret)
+    if len(secret) < MIN_PASSWORD_LENGTH:
+        # InvalidInput, not ValueError: classify_error maps a bare ValueError
+        # to "format", the code meaning a damaged container. The service was
+        # reporting a too-short password from volume_create as "format" and
+        # the same condition from encrypt as "invalid_input".
+        from quantacrypt.core.errors import InvalidInput
+        raise InvalidInput(f"Use at least {MIN_PASSWORD_LENGTH} characters.")
+
+
 def _reject_empty_secret(secret: bytes) -> None:
     """Defense in depth: the UI already blocks empty passwords, but refuse
     them in the crypto layer too so a regression can't quietly derive a

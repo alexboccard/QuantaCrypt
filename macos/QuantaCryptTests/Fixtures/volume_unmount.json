@@ -1,0 +1,7 @@
+{
+  "event": "done",
+  "id": "vu",
+  "result": {
+    "mount_point": "/fixture/mnt"
+  }
+}

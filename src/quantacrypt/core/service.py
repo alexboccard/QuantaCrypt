@@ -407,7 +407,9 @@ def op_volume_inspect(params: dict, ctx: _Ctx) -> dict:
     return {
         "path": path,
         "size": os.path.getsize(path),
-        "format_version": header.get("format_version"),
+        # read_header() returns "version"; "format_version" was never a
+        # key, so this field was structurally always null.
+        "format_version": header.get("version"),
         "mode": mode,
         "threshold": auth.get("threshold"),
         "total": auth.get("total"),
@@ -471,8 +473,15 @@ def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
     ctx.check()
     ctx.progress("Mounting...")
     fuse_obj = mount_volume(path, key, mp)
-    suspicious = bool(getattr(getattr(fuse_obj, "volume", None), "journal_suspicious", False))
-    return {"mount_point": mp, "volume_path": path, "journal_suspicious": suspicious}
+    vc = getattr(fuse_obj, "volume", None)
+    suspicious = bool(getattr(vc, "journal_suspicious", False))
+    # Name the preserved tail to the caller. open() copies it to a sidecar
+    # beside the volume before the next save overwrites it, but evidence
+    # nobody is told about is indistinguishable from litter — the user finds
+    # an unexplained file next to their vault and deletes it.
+    sidecar = getattr(vc, "suspect_sidecar", None) if suspicious else None
+    return {"mount_point": mp, "volume_path": path,
+            "journal_suspicious": suspicious, "suspect_sidecar": sidecar}
 
 
 def op_volume_unmount(params: dict, ctx: _Ctx) -> dict:

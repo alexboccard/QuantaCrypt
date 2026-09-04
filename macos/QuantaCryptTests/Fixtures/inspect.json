@@ -1,0 +1,14 @@
+{
+  "event": "done",
+  "id": "i",
+  "result": {
+    "argon2": true,
+    "embedded": false,
+    "mode": "single",
+    "path": "/fixture/f.qcx",
+    "size": 57290,
+    "threshold": null,
+    "total": null,
+    "version": 1
+  }
+}

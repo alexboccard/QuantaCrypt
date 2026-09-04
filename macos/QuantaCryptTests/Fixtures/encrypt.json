@@ -1,0 +1,14 @@
+{
+  "event": "done",
+  "id": "e",
+  "result": {
+    "filename": "notes.txt",
+    "mode": "single",
+    "output": "/fixture/f.qcx",
+    "shares": [],
+    "size": 57290,
+    "skipped_symlinks": [],
+    "threshold": null,
+    "total": null
+  }
+}

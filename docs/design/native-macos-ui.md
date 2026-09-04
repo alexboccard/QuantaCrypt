@@ -1,6 +1,12 @@
 # Native macOS UI — options and recommendation
 
-Date: 2026-09-02. Status: **decision pending** (Alex).
+Date: 2026-09-02. Status: **implemented** — steps 1–3 of the staged plan below.
+Shipped in `e9bcba7` (the `qc-core` service, the SwiftUI shell, the bundled
+helper), with `d2042b7` (native-shell review fixes and the 2026-09 UI audit)
+and `0a080be` (render the `.icns` files before the shell build) following. It is
+built by `scripts/build.py --native`, by the `macos-shell` job in `ci.yml` and by
+`build-native` in `release.yml`. Step 4 — parity, then deleting
+`src/quantacrypt/ui/` — is still open, so the Tkinter app remains the shipped UI.
 
 ## Problem
 

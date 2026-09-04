@@ -39,6 +39,8 @@ Icon?
 .pytest_cache/
 .coverage
 .coverage.*
+.coverage-parts/
+coverage.json
 htmlcov/
 
 # Claude working files (internal docs, memory, scratchpads)

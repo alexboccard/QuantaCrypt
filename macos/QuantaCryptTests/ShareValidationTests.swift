@@ -70,6 +70,33 @@ final class ShareValidationTests: XCTestCase {
         XCTAssertEqual(ShareValidation.merge(["A"], into: [], threshold: nil, total: nil), ["A"])
     }
 
+    /// F-016: `prepared` drops blanks, so a load used to hand back fewer rows
+    /// than were on screen — a field disappearing under the user, and the
+    /// array shrink that an index-keyed `ForEach` traps on.
+    func testMergeNeverReturnsFewerRowsThanItWasGiven() {
+        XCTAssertEqual(ShareValidation.merge(["A"], into: ["a", "", "", ""], threshold: 3, total: nil),
+                       ["a", "A", "", ""])
+        XCTAssertEqual(ShareValidation.merge([], into: ["", "", ""], threshold: nil, total: nil).count, 3)
+        // The cut at `total` is the one deliberate shrink and stays.
+        XCTAssertEqual(ShareValidation.merge(["A", "B", "C"], into: ["", ""], threshold: 2, total: 2), ["A", "B"])
+    }
+
+    func testMergeKeepsTheIdentityOfRowsThatSurvive() {
+        let entries = [ShareEntry(text: "a"), ShareEntry(text: ""), ShareEntry(text: ""), ShareEntry(text: "")]
+        let merged = ShareValidation.merge(["A"], into: entries, threshold: 3, total: nil)
+        XCTAssertEqual(merged.map(\.text), ["a", "A", "", ""])
+        XCTAssertEqual(merged.count, entries.count, "a row must not vanish under the view")
+        XCTAssertEqual(merged[0].id, entries[0].id, "the row being typed into keeps its identity")
+        XCTAssertEqual(Set(merged.map(\.id)).count, merged.count, "identities are unique")
+    }
+
+    func testEntryOverloadsMatchTheStringOnes() {
+        let entries = [ShareEntry(text: "  " + code + " "), ShareEntry(text: "")]
+        XCTAssertEqual(ShareValidation.prepared(entries), [code])
+        XCTAssertEqual(ShareValidation.message(entries: entries, threshold: 2),
+                       ShareValidation.message(shares: [code, ""], threshold: 2))
+    }
+
     func testOversizedShareFileIsRefusedUnread() throws {
         let url = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString + ".txt")
         defer { try? FileManager.default.removeItem(at: url) }
