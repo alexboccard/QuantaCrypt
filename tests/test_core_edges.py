@@ -25,6 +25,7 @@ import time
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from tests.conftest import fusepy_backend
 from quantacrypt.core import crypto as cc
 from quantacrypt.core import fuse_ops as fo
 from quantacrypt.core import package as pkg
@@ -1038,6 +1039,7 @@ class TestFuseAvailabilityReporting:
         assert fo.check_fuse_components()["fuse_backend"] == expected
 
     def test_available_when_fusepy_imports(self):
+        fusepy_backend()
         ok, msg = fo.check_fuse_available()
         assert ok is True and "available" in msg
 
@@ -1493,7 +1495,7 @@ class TestMountVolume:
 
     def test_a_foreground_mount_returns_and_releases_the_lock(
             self, volume, tmp_path, monkeypatch):
-        import fuse as fusepy
+        fusepy = fusepy_backend()
         path, key, vc = volume
         seen = {}
 
@@ -1515,7 +1517,7 @@ class TestMountVolume:
 
     def test_a_worker_that_exits_without_error_is_not_registered(
             self, volume, tmp_path, monkeypatch):
-        import fuse as fusepy
+        fusepy = fusepy_backend()
         path, key, vc = volume
         monkeypatch.setattr(fo, "_FUSE_STARTUP_TIMEOUT", 1.0)
         monkeypatch.setattr(fusepy, "FUSE", lambda *a, **kw: None)
@@ -1527,7 +1529,7 @@ class TestMountVolume:
 
     def test_a_worker_that_raises_reports_the_reason(
             self, volume, tmp_path, monkeypatch):
-        import fuse as fusepy
+        fusepy = fusepy_backend()
         path, key, vc = volume
         monkeypatch.setattr(fo, "_FUSE_STARTUP_TIMEOUT", 1.0)
 
@@ -1543,7 +1545,7 @@ class TestMountVolume:
 
     def test_a_serving_mount_is_registered_with_its_lock(
             self, volume, tmp_path, monkeypatch):
-        import fuse as fusepy
+        fusepy = fusepy_backend()
         path, key, vc = volume
         serving = threading.Event()
         monkeypatch.setattr(fo, "_FUSE_STARTUP_TIMEOUT", 0.3)
@@ -1567,6 +1569,7 @@ class TestMountVolume:
             self, volume, tmp_path, monkeypatch):
         """Two racers can both pass the snapshot check; the loser must not
         strand the flock, or the volume becomes unmountable."""
+        fusepy_backend()
         path, key, vc = volume
         mp = str(tmp_path / "mnt")
 

@@ -37,6 +37,22 @@ requires_tkinter = pytest.mark.skipif(
     reason="Needs real tkinter (UI classes are MagicMock on headless systems)",
 )
 
+
+def fusepy_backend():
+    """Return the ``fuse`` module, or skip the calling test.
+
+    Not ``pytest.importorskip``: fusepy raises OSError (not ImportError)
+    when the package is installed but no libfuse backend loads, which is
+    the state of every macOS CI runner — the v1.4.0 release run failed
+    eight tests this way. CI's Ubuntu job installs libfuse2 and asserts
+    that these tests really ran, so the skip cannot hide a regression.
+    """
+    try:
+        import fuse
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"fusepy/libfuse unavailable: {exc}")
+    return fuse
+
 from quantacrypt.core import crypto as cc
 
 MAGIC = cc.MAGIC

@@ -24,6 +24,7 @@ from quantacrypt.core import fuse_ops as fo
 from quantacrypt.core import package as pkg
 from quantacrypt.core import volume as vol
 from quantacrypt.core.errors import InvalidInput
+from tests.conftest import fusepy_backend
 
 PW = "audit-password-2026"
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "v1")
@@ -600,7 +601,7 @@ class TestLruOversizedPut:
 
 class TestMountPointMustBeEmpty:
     def test_a_populated_directory_is_refused(self, tmp_path, monkeypatch):
-        fusepy = pytest.importorskip("fuse")
+        fusepy = fusepy_backend()
         path, key, _ = _volume(tmp_path)
         monkeypatch.setattr(fusepy, "FUSE", lambda *a, **kw: None)
         mp = tmp_path / "mnt"
@@ -611,7 +612,7 @@ class TestMountPointMustBeEmpty:
         assert (mp / "precious.txt").exists()
 
     def test_an_empty_or_missing_directory_is_fine(self, tmp_path, monkeypatch):
-        fusepy = pytest.importorskip("fuse")
+        fusepy = fusepy_backend()
         path, key, _ = _volume(tmp_path)
         monkeypatch.setattr(fusepy, "FUSE", lambda *a, **kw: None)
         fo.mount_volume(path, key, str(tmp_path / "fresh"), foreground=True)

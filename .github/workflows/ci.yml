@@ -92,6 +92,19 @@ jobs:
       - name: Coverage gate (95% per file)
         run: python scripts/check_coverage.py --min 95
 
+      # Assert the FUSE-backed tests really ran: they skip on hosts without a
+      # loadable libfuse (every macOS runner), and this is the one job that
+      # installs one, so a silent skip here would be a regression nobody sees.
+      - name: Assert the FUSE tests were not skipped
+        run: |
+          python -m pytest tests/test_core_edges.py tests/test_audit_2026_09.py -q -o addopts="" \
+            --no-header -p no:cacheprovider -p no:randomly -rs \
+            -k "TestMountVolume or test_available_when_fusepy_imports or TestMountPointMustBeEmpty" 2>&1 | tee /tmp/fuse.txt
+          if grep -qi "fusepy/libfuse unavailable" /tmp/fuse.txt; then
+            echo "::error::FUSE-backed tests skipped — libfuse2 is not loadable on this runner"
+            exit 1
+          fi
+
       # Assert the GUI suite really ran: a display that silently fails to
       # start would put us straight back to ~116 quiet skips.
       - name: Assert the GUI tests were not skipped
