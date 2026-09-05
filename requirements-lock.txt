@@ -10,7 +10,17 @@ argon2-cffi==25.1.0 \
     --hash=sha256:694ae5cc8a42f4c4e2bf2ca0e64e51e23a040c6a517a85074683d3959e1346c1 \
     --hash=sha256:fdc8b074db390fccb6eb4a3604ae7231f219aa669a2652e0f20e16ba513d5741
     # via quantacrypt
-argon2-cffi-bindings==26.1.0 \
+argon2-cffi-bindings==25.1.0 ; platform_machine == 'x86_64' and sys_platform == 'darwin' \
+    --hash=sha256:2630b6240b495dfab90aebe159ff784d08ea999aa4b0d17efa734055a07d2f44 \
+    --hash=sha256:3d3f05610594151994ca9ccb3c771115bdb4daef161976a266f0dd8aa9996b8f \
+    --hash=sha256:6dca33a9859abf613e22733131fc9194091c1fa7cb3e131c143056b4856aa47e \
+    --hash=sha256:8b8efee945193e667a396cbc7b4fb7d357297d6234d30a489905d96caabde56b \
+    --hash=sha256:aecba1723ae35330a008418a91ea6cfcedf6d31e5fbaa056a166462ff066d500 \
+    --hash=sha256:b957f3e6ea4d55d820e40ff76f450952807013d361a65d7f28acc0acbf29229d
+    # via
+    #   argon2-cffi
+    #   quantacrypt
+argon2-cffi-bindings==26.1.0 ; platform_machine != 'x86_64' or sys_platform != 'darwin' \
     --hash=sha256:061a6919145bbf282ebf1f9c59d3135d4833c25313c8595c0d68cf7712ddfce2 \
     --hash=sha256:0cc40f7b4050bb93eb67de95d2d759322fc7ce4930b9d645581ecf4913ec651e \
     --hash=sha256:151dfaad9de753f4af2a7854e707e4784f2acc434340ade64239c5b104b2d605 \
@@ -52,7 +62,9 @@ argon2-cffi-bindings==26.1.0 \
     --hash=sha256:f0c3103fcff20183e593459cfea6e012281c0e76ae3ed8b5565ad1b92eac3990 \
     --hash=sha256:f9c4420a7a864fe1b86ce35befc95b8e39fb852493b81cf798671ddc265de638 \
     --hash=sha256:ffff613aaa9ce6236766e2fc6dc560bb5abde7a2e2416e3db1f9ae395a2b4dd4
-    # via argon2-cffi
+    # via
+    #   argon2-cffi
+    #   quantacrypt
 boolean-py==5.0 \
     --hash=sha256:60cbc4bad079753721d32649545505362c754e121570ada4658b852a3a318d95 \
     --hash=sha256:ef28a70bd43115208441b53a045d1549e2f0ec6e3d08a9d142cbc41c1938e8d9
@@ -454,7 +466,13 @@ coverage==7.16.0 \
     --hash=sha256:fddd26ed9a2527a7e23f7e4c1fd0734c4a5b45f77b261da1c536b20a7d2e6f0c \
     --hash=sha256:fe5aa402d02318db2f41e471320b2ecca6085b8f595a034c037085732e49c04a
     # via pytest-cov
-cryptography==50.0.1 \
+cryptography==48.0.1 ; platform_machine == 'x86_64' and sys_platform == 'darwin' \
+    --hash=sha256:266f4ee051abb2f725b74ef8072b521ce1feacf685a3364fa6a6b45548db791a \
+    --hash=sha256:3e4a1a3232eef2e6c732827d5722db29a0cc8b27af2a4d865b094cf954be9ca1 \
+    --hash=sha256:4fdc69f8e4316bcf0c8c8ec1f26f285d12e8142d88d96c876a59a03be3f6ae67 \
+    --hash=sha256:f817adc181390bd54f2f700107a7419040fb7c1bdf2fc26f36551a06a68c3345
+    # via quantacrypt
+cryptography==50.0.1 ; platform_machine != 'x86_64' or sys_platform != 'darwin' \
     --hash=sha256:01f41478cf33fc605a6a089cd56d28b45c6c0b45a1928b61797f2621a04bac71 \
     --hash=sha256:05ba322c4da95b262a212c345af888ef2c37c88c0509756ea00a0e6d68850f23 \
     --hash=sha256:16c5ecd954b3330ebfb6605eca4fd952da8bef376551d5cc264534e3770a9ee6 \
@@ -871,9 +889,9 @@ sortedcontainers==2.4.0 \
     --hash=sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88 \
     --hash=sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0
     # via cyclonedx-python-lib
-tkinterdnd2-universal==1.7.3 \
-    --hash=sha256:5a0a5844c596951ed67c7b8c992abcced67fef87349557250de27419e12f70bf \
-    --hash=sha256:658b68cc6b733176993bfc72ad11d479c6d086c7c89e536668bab51a36c50e98
+tkinterdnd2==0.6.3 \
+    --hash=sha256:50c7386302104bfb30d8e15b4cc53c0581bc51a28186ff4d7ad3cb2cc820c936 \
+    --hash=sha256:53ed472ec08705702e087b5664f0534ca53a07a67102255f9cdc82bc5094158b
     # via quantacrypt
 tomli==2.4.1 \
     --hash=sha256:01f520d4f53ef97964a240a035ec2a869fe1a37dde002b57ebc4417a27ccd853 \

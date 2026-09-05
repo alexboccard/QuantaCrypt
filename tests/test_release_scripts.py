@@ -246,7 +246,7 @@ def test_release_stamps_the_version_structurally():
 def test_both_tk_build_jobs_verify_the_signature_before_uploading():
     text = _workflow("release.yml")
     for job in ("build-arm64", "build-x86_64"):
-        assert "codesign --verify --deep --strict dist/quantacrypt.app" in _job(text, job)
+        assert "codesign --verify --deep --strict dist/tk/quantacrypt.app" in _job(text, job)
 
 
 def test_bump_version_relocks_so_the_lock_cannot_lag_a_release():

@@ -70,7 +70,7 @@ python scripts/build.py --arch x86_64
 python scripts/build.py --arch arm64 --skip-tests
 ```
 
-Output lands in `dist/quantacrypt.app` and `dist/quantacrypt-{arch}.dmg`.
+Output lands in `dist/tk/quantacrypt.app` and `dist/quantacrypt-{arch}.dmg` (the `.app` sits under `dist/tk/` because its name and the native shell's `dist/QuantaCrypt.app` are the same path on a case-insensitive volume).
 
 ### Native app in one command
 
@@ -151,6 +151,15 @@ forever.
   verified against `PYTHON_PKG_SHA256`; the other jobs ask setup-python for
   the same version. Bump all three together (record the new SHA-256 with
   `shasum -a 256` on the downloaded pkg).
+- **Intel macOS is a lock fork.** `cryptography` stopped publishing
+  x86_64/universal2 macOS wheels after 48.0.1 and `argon2-cffi-bindings`
+  after 25.1.0, so `pyproject.toml` pins those two versions with a
+  `sys_platform == 'darwin' and platform_machine == 'x86_64'` marker and
+  everything else stays on the current release. The exported lock carries
+  both lines; pip picks by marker. Without the fork the x86_64 job compiles
+  both from source with an unpinned Rust/CMake toolchain (the v1.4.0 run
+  failed exactly there). 48.0.1 still has the one advisory that is reachable
+  here; the ones it lacks are X.509/PKCS#7, which this code never calls.
 - **XcodeGen** by release and SHA-256 in `scripts/install_xcodegen.sh` —
   it writes the build phases the signed xcodebuild executes, so it must not
   come from whatever homebrew-core serves that day. Bump the version and the

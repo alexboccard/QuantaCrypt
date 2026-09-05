@@ -33,8 +33,18 @@ dependencies = [
     # Only the OpenSSL one is reachable here — this code touches AESGCM,
     # HKDF and hashes, never X.509 or PKCS#7, and every buffer it hands to
     # AESGCM is a contiguous bytes/bytearray — but 50.0 covers all of them.
-    "cryptography>=50.0",
+    #
+    # Intel macOS is the exception: cryptography stopped publishing x86_64 /
+    # universal2 macOS wheels after 48.0.1 and argon2-cffi-bindings after
+    # 25.1.0, so a Rosetta build of the Intel DMG would compile both from
+    # source with an unpinned Rust/CMake toolchain. That platform pins the
+    # last wheel-backed releases instead — 48.0.1 still carries the one
+    # reachable fix; the X.509/PKCS#7 ones it lacks are unreachable here.
+    "cryptography>=50.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "cryptography>=48.0.1,<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "argon2-cffi>=23.1",
+    "argon2-cffi-bindings>=21.2; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "argon2-cffi-bindings>=21.2,<26; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     # Pinned to the major the code binds to, not the oldest that resolves.
     # kyber_encaps unpacks `Kyber768.encaps(pk)` as (shared_secret, ct); a
     # resolver landing on an older major with the opposite order would write
@@ -47,7 +57,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dnd = ["tkinterdnd2-universal>=1.7"]
+# tkinterdnd2-universal 1.7.x imports tkinter.tix, which Python 3.13 removed:
+# the module failed to import on the shipped interpreter and every Tk DMG
+# since has silently lost drag-and-drop (build.py only warns). The maintained
+# package keeps the import name and ships osx-arm64 / osx-x64 tkdnd binaries.
+dnd = ["tkinterdnd2>=0.6"]
 strength = ["zxcvbn>=4.4"]
 volumes = ["fusepy>=3.0"]
 # Pillow < 12.3 has a long tail of open advisories — decompression bombs and

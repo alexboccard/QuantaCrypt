@@ -97,9 +97,9 @@ jobs:
       # error; this is the independent check on the artefact we publish.
       - name: Verify the built app is arm64 and signed
         run: |
-          file dist/quantacrypt.app/Contents/MacOS/quantacrypt
-          file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "arm64" || { echo "ERROR: binary is not arm64!"; exit 1; }
-          codesign --verify --deep --strict dist/quantacrypt.app
+          file dist/tk/quantacrypt.app/Contents/MacOS/quantacrypt
+          file dist/tk/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "arm64" || { echo "ERROR: binary is not arm64!"; exit 1; }
+          codesign --verify --deep --strict dist/tk/quantacrypt.app
           echo "✓ Binary verified as arm64 and signed"
 
       - name: Upload DMG artifact
@@ -153,6 +153,18 @@ jobs:
           ARCHFLAGS: "-arch x86_64"
           _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
 
+      # The Intel side of the lock fork (cryptography 48.0.1, the last
+      # release with x86_64 wheels) carries three advisories that are
+      # unreachable here — X.509 path building and PKCS#7 decryption, which
+      # this code never calls — and pip-audit evaluates markers for the
+      # environment it runs in, so CI's Ubuntu audit never sees them.
+      # Audit that side too, ignoring exactly those three, so a NEW advisory
+      # against 48.0.1 still fails the Intel build.
+      - name: Audit the Intel side of the lock
+        run: |
+          arch -x86_64 venv-x86/bin/pip-audit -r requirements-lock.txt --strict --disable-pip \
+            --ignore-vuln PYSEC-2026-3552 --ignore-vuln PYSEC-2026-3553 --ignore-vuln PYSEC-2026-3554
+
       - name: Verify C extensions are x86_64
         run: |
           # Confirm critical native extensions are the right architecture
@@ -178,9 +190,9 @@ jobs:
       # error; this is the independent check on the artefact we publish.
       - name: Verify the built app is x86_64 and signed
         run: |
-          file dist/quantacrypt.app/Contents/MacOS/quantacrypt
-          file dist/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "x86_64" || { echo "ERROR: binary is not x86_64!"; exit 1; }
-          codesign --verify --deep --strict dist/quantacrypt.app
+          file dist/tk/quantacrypt.app/Contents/MacOS/quantacrypt
+          file dist/tk/quantacrypt.app/Contents/MacOS/quantacrypt | grep -q "x86_64" || { echo "ERROR: binary is not x86_64!"; exit 1; }
+          codesign --verify --deep --strict dist/tk/quantacrypt.app
           echo "✓ Binary verified as x86_64 and signed"
 
       - name: Upload DMG artifact

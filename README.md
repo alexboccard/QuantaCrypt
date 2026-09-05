@@ -155,7 +155,7 @@ On success it produces two artifacts in `dist/`:
 
 > **First launch:** macOS Gatekeeper will block unsigned apps. Right-click the `.app` → **Open**, or run:
 > ```bash
-> xattr -d com.apple.quarantine dist/quantacrypt.app
+> xattr -d com.apple.quarantine dist/tk/quantacrypt.app
 > ```
 
 ---

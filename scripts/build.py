@@ -2,7 +2,7 @@
 """
 Build script — produces a self-contained macOS app bundle.
 
-  macOS:   dist/quantacrypt.app   (double-clickable .app bundle)
+  macOS:   dist/tk/quantacrypt.app   (double-clickable .app bundle)
 
 The app handles all three launch modes:
   - Run directly              → Launcher (choose Encrypt or Decrypt)
@@ -31,6 +31,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC  = os.path.join(ROOT, "src")
 PKG  = os.path.join(SRC, "quantacrypt")
 DIST = os.path.join(ROOT, "dist")
+# The Tk app lives one level down: its bundle name "quantacrypt.app" and the
+# native shell's "QuantaCrypt.app" are the SAME path on a case-insensitive
+# APFS volume, so building both into dist/ made the second build silently
+# replace the first (measured: the native app on disk was the Tk app).  DMGs
+# still land in dist/ — their names differ.
+TK_DIST = os.path.join(DIST, "tk")
 WORK = os.path.join(ROOT, "build")
 NAME = "quantacrypt"
 BUNDLE_ID = "com.alexboccard.quantacrypt"
@@ -865,7 +871,7 @@ def main():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--name",      NAME,
-        "--distpath",  DIST,
+        "--distpath",  TK_DIST,
         "--workpath",  WORK,
         "--specpath",  WORK,
         "--noconsole",
@@ -933,7 +939,7 @@ def main():
                 os.remove(tmp)
         print("[!] Build failed"); sys.exit(1)
 
-    _post_build(os.path.join(DIST, NAME + SUF), doc_icon_tmp, arch_label,
+    _post_build(os.path.join(TK_DIST, NAME + SUF), doc_icon_tmp, arch_label,
                 skip_dmg=args.no_dmg, vol_icon_tmp=vol_icon_tmp)
 
 
