@@ -90,7 +90,7 @@ enum ShareValidation {
                 return "a code starts with QCSHARE- in capitals"
             }
             return codeIdentity(text) == nil
-                ? "the QCSHARE- code is incomplete or has a typo — copy it again from the share file"
+                ? "the QCSHARE- code is incomplete or has a typo; copy it again from the share file"
                 : nil
         }
         let words = text.split(whereSeparator: { $0.isWhitespace })
@@ -98,7 +98,7 @@ enum ShareValidation {
             return "expected a QCSHARE- code or a \(phraseWordCount)-word phrase, got \(words.count) word\(words.count == 1 ? "" : "s")"
         }
         if let bad = words.first(where: { !$0.unicodeScalars.allSatisfy(CharacterSet.letters.contains) }) {
-            return "\"\(bad)\" isn't a word — a phrase is \(phraseWordCount) plain words separated by spaces"
+            return "\"\(bad)\" isn't a word; a phrase is \(phraseWordCount) plain words separated by spaces"
         }
         return nil
     }
@@ -142,13 +142,13 @@ enum ShareValidation {
                 shares[$0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }.map { "\($0 + 1)" }
             if empty.isEmpty {
-                return "Enter \(needed) shares — \(entries.count) so far."
+                return "Enter \(needed) shares. \(entries.count) so far."
             }
-            return "Enter \(needed) shares — share\(empty.count == 1 ? "" : "s") \(empty.joined(separator: ", ")) \(empty.count == 1 ? "is" : "are") empty."
+            return "Enter \(needed) shares. Share\(empty.count == 1 ? "" : "s") \(empty.joined(separator: ", ")) \(empty.count == 1 ? "is" : "are") empty."
         }
         for entry in entries {
             if let problem = formatProblem(entry.text) {
-                return "Share \(entry.position) can't be read — \(problem)."
+                return "Share \(entry.position) can't be read: \(problem)."
             }
         }
         var seen: [String: Int] = [:]

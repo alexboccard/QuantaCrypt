@@ -197,7 +197,7 @@ def main():
             from quantacrypt.ui.decryptor import load_pkg, DecryptorApp
             try:
                 pkg = load_pkg(arg)
-            except (ValueError, OSError) as e:
+            except Exception as e:  # noqa: BLE001 — a hostile file must get the dialog, never a traceback
                 from tkinter import messagebox
                 from quantacrypt.ui.shared import friendly_error
                 messagebox.showerror(

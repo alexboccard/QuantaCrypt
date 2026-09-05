@@ -39,7 +39,9 @@ carries the version that was actually released.
    - Stamp the tag version into `pyproject.toml`, `__init__.py` and `macos/project.yml`
    - Build the Tkinter `.dmg` installers for **arm64** (Apple Silicon) and **x86_64** (Intel)
    - Build the native SwiftUI app and its `.dmg` (arm64, on a `macos-26` runner)
-   - Create a GitHub Release with all three DMGs attached
+   - Write `SHA256SUMS` for the three DMGs and sign a build-provenance
+     attestation for them (`gh attestation verify <dmg> --owner alexboccard`)
+   - Create a GitHub Release with the DMGs and `SHA256SUMS` attached
    - Auto-generate release notes from commits since the last tag
    - Commit the version bump back to `master`, together with a regenerated
      `uv.lock` / `requirements-lock.txt`, so the repo stays in sync
@@ -49,7 +51,8 @@ carries the version that was actually released.
    https://github.com/alexboccard/QuantaCrypt/releases/tag/v1.1.0
    ```
    with three downloads: `quantacrypt-arm64.dmg` and `quantacrypt-x86_64.dmg`
-   (Tkinter app), and `QuantaCrypt-native-arm64.dmg` (native SwiftUI app).
+   (Tkinter app), and `QuantaCrypt-native-arm64.dmg` (native SwiftUI app),
+   plus `SHA256SUMS`.
 
 ## Local build (without CI)
 
@@ -114,7 +117,7 @@ Follow [Semantic Versioning](https://semver.org):
 - **Minor** (1.1.0) — new features, backward-compatible
 - **Patch** (1.0.1) — bug fixes only
 
-The `.qcx` file format has its own `FORMAT_VERSION` (currently 1) in `crypto.py`, and `.qcv` volumes their own `VOLUME_FORMAT_VERSION` (currently 2) in `volume.py`. Both are independent of the app version and only change when the binary format itself changes.
+The `.qcx` file format has its own `FORMAT_VERSION` (currently 2) in `crypto.py`, and `.qcv` volumes their own `VOLUME_FORMAT_VERSION` (currently 3) in `volume.py`. Both are independent of the app version and only change when the binary format itself changes. Readers keep every earlier version openable: `tests/fixtures/v1/` holds real format-1 `.qcx` and format-2 `.qcv` containers written with the shipped Argon2id parameters, and `tests/test_audit_2026_09.py` opens them on every run.
 
 ## Dependency lock
 
@@ -134,8 +137,24 @@ regenerates both files after stamping the released version, because `uv.lock`
 records the project's own version and would otherwise lag by one release
 forever.
 
-The python.org installer used for the x86_64 release build is verified against
-`PYTHON_PKG_SHA256` in `release.yml`; update both together.
+### Every build input is pinned
+
+- **Actions** by full commit SHA with a `# vX.Y.Z` comment; Dependabot keeps
+  the pins current. `tests/test_release_scripts.py` fails on a tag pin.
+- **Python packages** by hash, and the *build backend* too: pip's build
+  isolation would otherwise fetch an unpinned setuptools to build fusepy's
+  sdist and this project, so every job installs `setuptools` from the lock
+  first (`scripts/lock_subset.py setuptools`) and then runs pip with
+  `--no-build-isolation`.
+- **The interpreter**: one `PYTHON_VERSION` in `release.yml` for all three
+  artefacts. The x86_64 job installs it from the python.org universal2 pkg,
+  verified against `PYTHON_PKG_SHA256`; the other jobs ask setup-python for
+  the same version. Bump all three together (record the new SHA-256 with
+  `shasum -a 256` on the downloaded pkg).
+- **XcodeGen** by release and SHA-256 in `scripts/install_xcodegen.sh` —
+  it writes the build phases the signed xcodebuild executes, so it must not
+  come from whatever homebrew-core serves that day. Bump the version and the
+  digest together (the script's header says how).
 
 ## Code signing
 
@@ -146,7 +165,17 @@ aborts the build**; the release jobs repeat the verification on the artefact
 they are about to upload. An `.app` with absent or inconsistent signatures
 opens as "damaged and can't be opened" instead of the expected
 unidentified-developer prompt, so a silently-unsigned build is worse than no
-build. Set `CODESIGN_IDENTITY` to sign with a Developer ID instead.
+build. Set `CODESIGN_IDENTITY` to sign with a Developer ID instead: the
+executable and the outer bundle are then signed with `--options runtime
+--timestamp` and `scripts/hardened-runtime.entitlements` (library validation
+off, so libfuse from another Team ID loads; unsigned executable memory, for
+cffi), which is what notarization will need.
+
+The native app is built with `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO` and
+checked afterwards: a plain `xcodebuild build` otherwise injects
+`com.apple.security.get-task-allow`, the entitlement that lets any same-user
+process attach a debugger to the running app and read the memory holding
+passwords and shares. `build.py` and the release job both fail on it.
 
 ## Future improvements
 

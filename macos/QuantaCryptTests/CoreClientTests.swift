@@ -139,7 +139,7 @@ final class CoreClientTests: XCTestCase {
         // The helper answers the cancel, then the original request errors out.
         let cancelId = try XCTUnwrap(cancelReq.id)
         await transport.emit(["id": cancelId, "event": "done", "result": ["cancelled": true]])
-        await transport.emit(["id": id, "event": "error", "code": "cancelled", "message": "Cancelled — nothing was written.", "detail": ""])
+        await transport.emit(["id": id, "event": "error", "code": "cancelled", "message": "Cancelled. Nothing was written.", "detail": ""])
         do {
             _ = try await task.value
             XCTFail("expected cancelled")

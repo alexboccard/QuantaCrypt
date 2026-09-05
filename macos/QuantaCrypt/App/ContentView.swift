@@ -20,8 +20,13 @@ struct ContentView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            if let note = state.openNote {
-                OpenNoteBar(note: note)
+            VStack(spacing: 0) {
+                if let warning = state.integrityWarning {
+                    IntegrityWarningBar(text: warning)
+                }
+                if let note = state.openNote {
+                    OpenNoteBar(note: note)
+                }
             }
         }
     }
@@ -143,6 +148,32 @@ struct OpenNoteBar: View {
     }
 }
 
+/// The app's own signature — nested helper included — failed to verify at
+/// launch. A strip, not a modal: an unsigned development build trips it on
+/// every launch, and the user who can act on it needs the words, not a
+/// door in their way.
+struct IntegrityWarningBar: View {
+    @Environment(AppState.self) private var state
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Label(text, systemImage: "exclamationmark.shield")
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button("Dismiss") { state.integrityWarning = nil }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+        .accessibilityElement(children: .contain)
+    }
+}
+
 /// Health of the encryption helper.
 ///
 /// Quiet when everything works — an 8pt dot and a subsystem version number
@@ -193,7 +224,7 @@ struct HelperStatusView: View {
         switch status {
         case .starting: return "Starting…"
         case .ready: return "Ready"
-        case .failed: return "Can't encrypt — helper unavailable"
+        case .failed: return "Can't encrypt: helper unavailable"
         }
     }
 

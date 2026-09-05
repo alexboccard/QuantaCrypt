@@ -69,10 +69,10 @@ final class CoreProtocolTests: XCTestCase {
     func testUserFacingCodesKeepTheHelperMessage() throws {
         let cases: [(code: String, expected: CoreError.Code)] = [("invalid_input", .invalidInput), ("format", .format)]
         for (code, expected) in cases {
-            let line = #"{"id":"r1","event":"error","code":"\#(code)","message":"Share 2 can't be read — checksum mismatch","detail":"InvalidInput"}"#
+            let line = #"{"id":"r1","event":"error","code":"\#(code)","message":"Share 2 can't be read: checksum mismatch","detail":"InvalidInput"}"#
             guard case .error(let error)? = try WireEvent.parse(line: line).coreEvent else { return XCTFail("not error") }
             XCTAssertEqual(error.code, expected)
-            XCTAssertEqual(error.message, "Share 2 can't be read — checksum mismatch")
+            XCTAssertEqual(error.message, "Share 2 can't be read: checksum mismatch")
             XCTAssertEqual(error.detail, "InvalidInput")
             XCTAssertFalse(error.message.contains("bug in the app"))
         }
@@ -149,9 +149,9 @@ final class CoreProtocolTests: XCTestCase {
         XCTAssertTrue(DecryptModel.userFacingError(wrong, info: splitFile, wrongPasswordCount: 0)
             .error.message.contains("Any 2 of the 3 shares"))
 
-        let damaged = CoreError(code: .format, message: "The file's contents are damaged — restore it from a backup.",
+        let damaged = CoreError(code: .format, message: "The file's contents are damaged. Restore it from a backup.",
                                 detail: "CorruptPayload")
-        let unreadable = CoreError(code: .invalidInput, message: "Share 1 can't be read — checksum mismatch",
+        let unreadable = CoreError(code: .invalidInput, message: "Share 1 can't be read: checksum mismatch",
                                    detail: "InvalidInput")
         for info in [passwordFile, splitFile] {
             for error in [damaged, unreadable] {
@@ -225,6 +225,6 @@ final class CoreProtocolTests: XCTestCase {
         let inspect: JSONValue = ["path": "/f.qcx", "size": 1, "version": 1, "mode": "shamir", "threshold": 2,
                                   "total": 3, "embedded": false]
         let i: InspectInfo = try inspect.decoded()
-        XCTAssertEqual(i.protectionSummary, "Protected by a split key — any 2 of the 3 shares unlock it.")
+        XCTAssertEqual(i.protectionSummary, "Protected by a split key. Any 2 of the 3 shares unlock it.")
     }
 }

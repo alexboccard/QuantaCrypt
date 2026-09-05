@@ -750,29 +750,33 @@ class TestShippedArgon2Parameters:
         assert cc.ARGON2_TIME_COST != _TEST_ARGON2_TIME_COST
         assert cc.ARGON2_MEMORY_COST != _TEST_ARGON2_MEMORY_COST
 
-    def test_neither_format_records_its_kdf_parameters(self, tmp_path):
-        """Documents a real forward-compatibility gap, not a desired property.
-
-        Both containers store only `argon_salt`. The time and memory costs
-        live solely in the code, so raising them — which OWASP guidance will
-        eventually call for — makes every existing .qcx and .qcv permanently
-        unopenable, and the failure surfaces as "wrong password", which is
-        the worst possible way to tell a user their data is gone.
-
-        This is why CLAUDE.md forbids changing them; the rule is a
-        consequence of the format, not a policy choice. Fixing it means
-        recording the parameters at the next FORMAT_VERSION bump and
-        defaulting a missing field to today's values.
-        """
-        vmeta = vol.create_volume_single(str(tmp_path / "real.qcv"), PW)
-        assert "argon_salt" in vmeta
-        assert not [k for k in vmeta if "cost" in k.lower()], \
-            "a cost field now exists — update this test and CLAUDE.md"
+    def test_both_formats_record_their_kdf_parameters(self, tmp_path):
+        """Format 2 (.qcx) and 3 (.qcv) record the Argon2id parameters the
+        container was made with, so raising the shipped values later cannot
+        strand existing files — a reader derives with what the file says.
+        The recorded values are the shipped ones, and the block that mount
+        reads before any credential exists carries the same copy."""
+        shipped = {"t": cc.ARGON2_TIME_COST, "m": cc.ARGON2_MEMORY_COST, "p": 1}
+        vpath = str(tmp_path / "real.qcv")
+        vmeta = vol.create_volume_single(vpath, PW)
+        assert vmeta["argon2"] == shipped and vmeta["kem"] == cc.KEM_ML_KEM768
+        _, auth = vol.read_volume_auth_params(vpath)
+        assert auth["argon2"] == shipped and auth["kem"] == cc.KEM_ML_KEM768
 
         src = tmp_path / "f.txt"
         src.write_bytes(b"data")
         pkg.encrypt_to_qcx(str(src), str(tmp_path / "f.qcx"),
                            mode="password", password=PW)
         qmeta = pkg.load_pkg(str(tmp_path / "f.qcx"))["meta"]
-        assert "argon_salt" in qmeta
-        assert not [k for k in qmeta if "cost" in k.lower()]
+        assert qmeta["argon2"] == shipped and qmeta["kem"] == cc.KEM_ML_KEM768
+
+    def test_a_reader_derives_with_the_recorded_parameters(self, tmp_path, monkeypatch):
+        """The whole point: a file made under one cost still opens after the
+        shipped cost changes, because the reader honours the file."""
+        src = tmp_path / "f.txt"
+        src.write_bytes(b"data")
+        out = str(tmp_path / "f.qcx")
+        pkg.encrypt_to_qcx(str(src), out, mode="password", password=PW)
+        monkeypatch.setattr(cc, "ARGON2_TIME_COST", cc.ARGON2_TIME_COST + 1)
+        assert pkg.decrypt_qcx(out, str(tmp_path), password=PW,
+                               verify_only=True)["verified"]

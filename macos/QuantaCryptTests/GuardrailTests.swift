@@ -102,7 +102,7 @@ final class GuardrailTests: XCTestCase {
                        "Checking whether this Mac can open volumes as drives…")
         model.fuseError = CoreError(code: .helperUnavailable, message: "no helper", detail: "")
         XCTAssertEqual(model.mountBlockedMessage,
-                       "Couldn't check whether this Mac can mount volumes — the helper isn't responding.")
+                       "Couldn't check whether this Mac can mount volumes: the helper isn't responding.")
     }
 
     // MARK: One job at a time (A-02)
@@ -156,7 +156,151 @@ final class GuardrailTests: XCTestCase {
         XCTAssertTrue(model.listIsStale)
     }
 
+    // MARK: Encrypt drop zone (S-09)
+
+    func testTheEncryptDropZoneTakesOnlyExistingFiles() throws {
+        XCTAssertFalse(EncryptModel.acceptsDrop(URL(string: "https://example.com/report.pdf")!),
+                       "a link dragged from a browser is not a file")
+        XCTAssertFalse(EncryptModel.acceptsDrop(URL(fileURLWithPath: "/nonexistent/\(UUID().uuidString)")))
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appending(path: "notes.txt")
+        try Data("hi".utf8).write(to: file)
+        XCTAssertTrue(EncryptModel.acceptsDrop(file))
+        XCTAssertTrue(EncryptModel.acceptsDrop(dir), "folders are zipped and encrypted too")
+    }
+
+    // MARK: Share files name the .qcx (F-032 / S-05)
+
+    func testSplitKeySharesNameTheEncryptedFileAndItsFingerprint() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let output = dir.appending(path: "report.pdf.qcx")
+        try Data("abc".utf8).write(to: output)
+
+        let result = EncryptResult(output: output.path, size: 3, filename: "report.pdf", mode: "shamir",
+                                   threshold: 2, total: 3,
+                                   shares: [Share(index: 1, code: "QCSHARE-A", mnemonic: nil)])
+        let presentation = try XCTUnwrap(result.makeSharesPresentation())
+        XCTAssertEqual(presentation.context.protectedName, "report.pdf.qcx",
+                       "the recipient is told to pick the encrypted file, so name that one")
+        XCTAssertEqual(presentation.context.stem, "report.pdf")
+        XCTAssertEqual(presentation.context.fingerprint, "ba7816bf8f01")
+        XCTAssertEqual(presentation.context.kind, .qcxFile)
+        XCTAssertEqual(presentation.shares.count, 1)
+
+        let password = EncryptResult(output: output.path, size: 3, filename: "report.pdf", mode: "single",
+                                     threshold: nil, total: nil, shares: [])
+        XCTAssertNil(password.makeSharesPresentation())
+    }
+
+    // MARK: Key material is dropped once proven (S-06)
+
+    func testAVerifiedEncryptDropsItsShares() async throws {
+        let transport = FakeTransport()
+        let state = AppState(core: CoreClient(transportFactory: { transport }),
+                             recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/report.pdf.qcx"
+        state.encrypt.result = EncryptResult(output: path, size: 3, filename: "report.pdf", mode: "shamir",
+                                             threshold: 2, total: 3,
+                                             shares: [Share(index: 1, code: "QCSHARE-A", mnemonic: nil)])
+
+        state.verifyEncrypted(path)
+        XCTAssertEqual(state.section, .decrypt)
+        await transport.waitForRequests(1)
+        let inspect = await transport.request(0)
+        XCTAssertEqual(inspect.op, "inspect")
+        await transport.emit(["id": inspect.id!, "event": "done",
+                              "result": ["path": path, "size": 3, "version": 2, "mode": "password",
+                                         "threshold": NSNull(), "total": NSNull(), "embedded": false]])
+        try await waitUntil("the inspect result to land") { state.decrypt.info != nil }
+        XCTAssertNotNil(state.encrypt.result?.shares, "inspecting proves nothing yet")
+
+        state.decrypt.password = "hunter2"
+        state.decrypt.verify()
+        await transport.waitForRequests(2)
+        let verify = await transport.request(1)
+        XCTAssertEqual(verify.op, "decrypt")
+        XCTAssertEqual(verify.params?["verify_only"], .bool(true))
+        await transport.emit(["id": verify.id!, "event": "done", "result": ["verified": true, "mode": "password"]])
+        try await waitUntil("the verify to finish") { state.decrypt.verifiedNote != nil }
+
+        XCTAssertNil(state.encrypt.result?.shares, "shares proven to work no longer belong in the model")
+        XCTAssertEqual(state.encrypt.result?.output, path, "the result card itself stays")
+    }
+
+    func testAVerifiedEncryptOfAnotherFileKeepsTheShares() {
+        let model = EncryptModel(core: CoreClient(transportFactory: { FakeTransport() }))
+        model.result = EncryptResult(output: "/tmp/a.qcx", size: 1, filename: "a", mode: "shamir",
+                                     threshold: 2, total: 3, shares: [Share(index: 1, code: "QCSHARE-A", mnemonic: nil)])
+        model.forgetShares(for: "/tmp/b.qcx")
+        XCTAssertNotNil(model.result?.shares)
+        model.forgetShares(for: "/tmp/a.qcx")
+        XCTAssertNil(model.result?.shares)
+    }
+
+    func testMountingTheCreatedVolumeDropsTheCreateResult() async throws {
+        let transport = FakeTransport()
+        let model = VolumesModel(core: CoreClient(transportFactory: { transport }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/Vault.qcv"
+        model.createResult = VolumeCreateResult(path: path, mode: "shamir", threshold: 2, total: 3,
+                                                shares: [Share(index: 1, code: "QCSHARE-A", mnemonic: nil)])
+        XCTAssertTrue(model.canShowSharesAgain)
+        model.fuse = FuseCheck(fuseBackend: .init(ok: true, detail: ""), fusepy: .init(ok: true, detail: ""), ok: true)
+        model.mountPath = path
+        model.mountPoint = "/tmp/mnt"
+        model.mountPassword = "hunter2"
+        XCTAssertTrue(model.canMountNow)
+
+        model.mount()
+        await transport.waitForRequests(1)
+        let mount = await transport.request(0)
+        XCTAssertEqual(mount.op, "volume_mount")
+        await transport.emit(["id": mount.id!, "event": "done",
+                              "result": ["mount_point": "/tmp/mnt", "volume_path": path, "journal_suspicious": false]])
+        try await waitUntil("the mount to finish") { model.mountedNote != nil }
+
+        XCTAssertNil(model.createResult, "a mounted volume has proven its shares; the row would otherwise hold the key all session")
+        XCTAssertFalse(model.canShowSharesAgain)
+        // The list refresh the mount kicked off; answer it so nothing lingers.
+        await transport.waitForRequests(2)
+        let list = await transport.request(1)
+        await transport.emit(["id": list.id!, "event": "done", "result": ["volumes": []]])
+    }
+
+    func testStartingANewCreateDropsThePreviousResult() throws {
+        let model = VolumesModel(core: CoreClient(transportFactory: { FakeTransport() }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        model.createResult = VolumeCreateResult(path: "/tmp/Old.qcv", mode: "shamir", threshold: 2, total: 3,
+                                                shares: [Share(index: 1, code: "QCSHARE-A", mnemonic: nil)])
+        model.createDirectory = FileManager.default.temporaryDirectory.path
+        model.createName = "Vault-\(UUID().uuidString)"
+        model.createPassword = "hunter2hunter2"
+        model.createConfirmation = "hunter2hunter2"
+        XCTAssertTrue(model.canCreate)
+        model.createVolume()
+        XCTAssertNil(model.createResult)
+        model.cancelCreate()
+    }
+
     // MARK: Helpers
+
+    /// Poll the main actor until `condition` holds, failing after five
+    /// seconds rather than hanging the suite.
+    private func waitUntil(_ what: String, _ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while !condition() {
+            if clock.now > deadline {
+                XCTFail("timed out waiting for \(what)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
 
     private static func presentation(named name: String) -> SharesPresentation {
         SharesPresentation(shares: [],

@@ -502,8 +502,15 @@ def _codesign_app_bundle(app_path, name=None):
     identity = os.environ.get("CODESIGN_IDENTITY", "-")
 
     sign_cmd = ["codesign", "--force", "--sign", identity]
+    # What the main executable and the outer bundle get on top: the
+    # hardened runtime needs a secure timestamp to notarize, and the two
+    # entitlements in scripts/hardened-runtime.entitlements — library
+    # validation would otherwise refuse libfuse (another Team ID) and cffi's
+    # executable memory.  Nested dylibs carry no entitlements.
+    exe_cmd = list(sign_cmd)
     if identity != "-":
-        sign_cmd += ["--options", "runtime"]
+        sign_cmd += ["--options", "runtime", "--timestamp"]
+        exe_cmd = sign_cmd + ["--entitlements", ENTITLEMENTS]
 
     # Every step below used to swallow its result: steps 1 and 2 never looked
     # at the return code and step 3 printed "(non-fatal)" and returned, so a
@@ -514,8 +521,9 @@ def _codesign_app_bundle(app_path, name=None):
     # prevent — so a signing error has to stop the build.
     failures = []
 
-    def _sign(target):
-        r = subprocess.run(sign_cmd + [target], capture_output=True, text=True)
+    def _sign(target, entitled=False):
+        cmd = exe_cmd if entitled else sign_cmd
+        r = subprocess.run(cmd + [target], capture_output=True, text=True)
         if r.returncode != 0:
             failures.append(
                 (target, r.stderr.strip() or f"codesign exited {r.returncode}")
@@ -541,10 +549,10 @@ def _codesign_app_bundle(app_path, name=None):
     # 2. Sign the main executable, after everything it ships with and before
     #    the outer bundle that seals the lot.
     if os.path.isfile(main_exe):
-        _sign(main_exe)
+        _sign(main_exe, entitled=True)
 
     # 3. Sign the outer .app bundle
-    _sign(app_path)
+    _sign(app_path, entitled=True)
 
     if failures:
         print(f"[!] Code signing failed for {len(failures)} target(s):")
@@ -703,6 +711,22 @@ def _build_helper(args):
     print(f"[+] Built {app} ({total / 1_000_000:.1f} MB), smoke test OK")
 NATIVE_DIR = os.path.join(ROOT, "macos")
 NATIVE_NAME = "QuantaCrypt"
+ENTITLEMENTS = os.path.join(ROOT, "scripts", "hardened-runtime.entitlements")
+
+
+def _assert_not_debuggable(app):
+    """Fail if the bundle carries com.apple.security.get-task-allow.
+
+    It is the entitlement that lets any same-user process take the app's
+    task port and read the memory holding passwords and shares — the one
+    switch that re-opens a hardened-runtime app to debugging.  Xcode injects
+    it into every non-archive build unless CODE_SIGN_INJECT_BASE_ENTITLEMENTS
+    is NO, and notarization rejects it outright.
+    """
+    r = subprocess.run(["codesign", "-d", "--entitlements", "-", app],
+                       capture_output=True, text=True)
+    if "get-task-allow" in (r.stdout + r.stderr):
+        print(f"[!] {app} carries com.apple.security.get-task-allow"); sys.exit(1)
 
 
 def _stage_native_icons():
@@ -736,6 +760,22 @@ def _stage_native_icons():
     return staged
 
 
+def _native_xcodebuild_cmd(identity, arch, derived):
+    """The Release xcodebuild invocation.  CODE_SIGN_INJECT_BASE_ENTITLEMENTS
+    is off because a plain ``build`` action otherwise injects get-task-allow
+    into the product (see _assert_not_debuggable)."""
+    cmd = ["xcodebuild", "-project", f"{NATIVE_NAME}.xcodeproj", "-scheme", NATIVE_NAME,
+           "-configuration", "Release", "-derivedDataPath", derived,
+           f"CODE_SIGN_IDENTITY={identity}", "CODE_SIGN_STYLE=Manual",
+           "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO"]
+    if arch:
+        cmd += [f"ARCHS={arch}", "ONLY_ACTIVE_ARCH=NO"]
+    if identity == "-":
+        cmd += ["CODE_SIGNING_ALLOWED=YES"]
+    cmd.append("build")
+    return cmd
+
+
 def _build_native(args):
     """One command → one .app.  Builds the qc-core helper bundle, renders
     the app/document icons from src/quantacrypt/assets into the Xcode
@@ -750,14 +790,7 @@ def _build_native(args):
 
     derived = os.path.join(NATIVE_DIR, "build")
     identity = os.environ.get("CODESIGN_IDENTITY", "-")
-    cmd = ["xcodebuild", "-project", f"{NATIVE_NAME}.xcodeproj", "-scheme", NATIVE_NAME,
-           "-configuration", "Release", "-derivedDataPath", derived,
-           f"CODE_SIGN_IDENTITY={identity}", "CODE_SIGN_STYLE=Manual"]
-    if args.arch:
-        cmd += [f"ARCHS={args.arch}", "ONLY_ACTIVE_ARCH=NO"]
-    if identity == "-":
-        cmd += ["CODE_SIGNING_ALLOWED=YES"]
-    cmd.append("build")
+    cmd = _native_xcodebuild_cmd(identity, args.arch, derived)
     print(f"\n{'='*60}\n  Building native app: {NATIVE_NAME}.app\n{'='*60}")
     r = subprocess.run(cmd, cwd=NATIVE_DIR, capture_output=True, text=True)
     if r.returncode != 0:
@@ -774,8 +807,9 @@ def _build_native(args):
                        capture_output=True, text=True)
     if v.returncode != 0:
         print(f"[!] Signature check failed: {v.stderr.strip()}"); sys.exit(1)
+    _assert_not_debuggable(app)
     total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(app) for f in fs)
-    print(f"[+] Built {app} ({total / 1_000_000:.1f} MB, helper bundled, signature OK)")
+    print(f"[+] Built {app} ({total / 1_000_000:.1f} MB, helper bundled, signature OK, not debuggable)")
     if not args.no_dmg:
         import platform
         _create_dmg(app, args.arch or platform.machine(), name=f"{NATIVE_NAME}-native")

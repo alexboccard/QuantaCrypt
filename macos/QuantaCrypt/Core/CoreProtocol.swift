@@ -218,19 +218,19 @@ struct CoreError: Error, Sendable, Equatable, LocalizedError {
         let code = Code(wire: code)
         // Never a bare "Something went wrong": if the helper sends an error
         // with no message, the user still needs a cause and a next step.
-        let helperMessage = message ?? "The helper reported a problem but didn't say what. Try again — if it keeps happening, restart the helper in Settings."
+        let helperMessage = message ?? "The helper reported a problem but didn't say what. Try again. If it keeps happening, restart the helper in Settings."
         guard code == .invalidRequest else {
             return CoreError(code: code, message: helperMessage, detail: detail ?? "")
         }
-        let combined = [helperMessage, detail ?? ""].filter { !$0.isEmpty }.joined(separator: " — ")
+        let combined = [helperMessage, detail ?? ""].filter { !$0.isEmpty }.joined(separator: ": ")
         return CoreError(code: .invalidRequest,
-                         message: "QuantaCrypt sent a request the helper rejected. This is a bug in the app, not a problem with your file — please report it.",
+                         message: "QuantaCrypt sent a request the helper rejected. This is a bug in the app, not a problem with your file. Please report it.",
                          detail: combined)
     }
 
     static let helperExited = CoreError(
         code: .helperExited,
-        message: "The encryption helper stopped unexpectedly. Try the action again — it restarts automatically.",
+        message: "The encryption helper stopped unexpectedly. Try the action again; it restarts automatically.",
         detail: "qc-core exited before answering")
 }
 
@@ -291,7 +291,7 @@ struct VolumeInspectInfo: Decodable, Sendable, Equatable {
 
     var protectionSummary: String {
         if isSplitKey, let k = threshold, let n = total {
-            return "Protected by a split key — any \(k) of the \(n) shares unlock it."
+            return "Protected by a split key. Any \(k) of the \(n) shares unlock it."
         }
         return "Protected by a password."
     }
@@ -311,7 +311,7 @@ struct InspectInfo: Decodable, Sendable, Equatable {
     /// Plain-language protection summary for the Decrypt screen.
     var protectionSummary: String {
         if isSplitKey, let k = threshold, let n = total {
-            return "Protected by a split key — any \(k) of the \(n) shares unlock it."
+            return "Protected by a split key. Any \(k) of the \(n) shares unlock it."
         }
         return "Protected by a password."
     }
@@ -327,11 +327,20 @@ struct Share: Decodable, Sendable, Equatable, Identifiable {
 struct EncryptResult: Decodable, Sendable, Equatable {
     let output: String
     let size: Int
+    /// The plaintext's name as the helper reports it — what was encrypted,
+    /// not the file a recipient will be asked to pick.
     let filename: String
     let mode: String
     let threshold: Int?
     let total: Int?
     let shares: [Share]?
+
+    /// The same result with its key material dropped, for once the shares
+    /// are proven saved and working.
+    func withoutShares() -> EncryptResult {
+        EncryptResult(output: output, size: size, filename: filename, mode: mode,
+                      threshold: threshold, total: total, shares: nil)
+    }
 }
 
 struct VerifyResult: Decodable, Sendable, Equatable {

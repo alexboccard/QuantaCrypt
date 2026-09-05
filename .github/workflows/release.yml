@@ -7,19 +7,26 @@ on:
 
   workflow_dispatch:   # allow manual runs for testing (no release created)
 
-# Least privilege: only `release` (gh release create) and `bump-version`
-# (git push) need write, and they say so per job.  The build jobs execute a
-# lot of code fetched at build time — Homebrew, PyInstaller, a python.org
-# installer, mutable tag-pinned actions — and a compromise in any of it
-# should fail the build, not rewrite the repository or publish a release.
+# Least privilege: only `release` (gh release create, the attestation) and
+# `bump-version` (git push) need write, and they say so per job.  The build
+# jobs execute a lot of code fetched at build time — PyInstaller, a
+# python.org installer, XcodeGen — and a compromise in any of it should fail
+# the build, not rewrite the repository or publish a release.  Everything
+# that runs here is pinned: actions by commit SHA (Dependabot keeps the pins
+# current), Python packages by hash from requirements-lock.txt, the
+# python.org installer and XcodeGen by SHA-256.
 permissions:
   contents: read
 
 env:
-  # Universal2 Python from python.org — contains both arm64 and x86_64
-  PYTHON_PKG_URL: "https://www.python.org/ftp/python/3.13.2/python-3.13.2-macos11.pkg"
-  # SHA-256 of that installer, recorded 2026-09-02; update together with the URL.
-  PYTHON_PKG_SHA256: "6c6792b3780f21284beb2546dca2eb5893bcf5b8d91c0cf0ec1fadeb75cbedea"
+  # One interpreter for all three artefacts.  The Tk arm64 and native jobs
+  # take it from actions/setup-python, the x86_64 job from the python.org
+  # universal2 installer, and the two have to name the same release or the
+  # DMGs under one tag ship different standard libraries.
+  PYTHON_VERSION: "3.13.15"
+  PYTHON_PKG_URL: "https://www.python.org/ftp/python/3.13.15/python-3.13.15-macos11.pkg"
+  # SHA-256 of that installer, recorded 2026-09-04; update all three together.
+  PYTHON_PKG_SHA256: "3b7eaf7f29825f796e8267024435540ddf1f17fc9a97ad58095daa7a75bfdcd3"
   PYTHON_BIN: "/usr/local/bin/python3.13"
 
 jobs:
@@ -27,17 +34,23 @@ jobs:
     name: Run tests
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies (hash-pinned)
+      # The lock pins what is installed; pip's build isolation would still
+      # fetch an unpinned setuptools to build fusepy's sdist and this
+      # project.  Install the backend from the lock first, then build with
+      # no isolation so nothing outside the lock ever runs.
+      - name: Install dependencies (hash-pinned, no build isolation)
         run: |
-          pip install --require-hashes -r requirements-lock.txt
-          pip install --no-deps .
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          pip install --no-deps --no-build-isolation .
 
       # -p no:randomly: pytest-randomly is in the lock because the periodic
       # shuffled run is the only thing that catches order-dependence, but a
@@ -49,9 +62,10 @@ jobs:
     name: Build (arm64)
     needs: test
     runs-on: macos-14
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # sed exits 0 when nothing matches, so a reformatted version line used
       # to ship a release labelled with the previous version — and the
@@ -62,14 +76,16 @@ jobs:
         run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies (hash-pinned)
+      - name: Install dependencies (hash-pinned, no build isolation)
         run: |
-          pip install --require-hashes -r requirements-lock.txt
-          pip install --no-deps .
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          pip install --no-deps --no-build-isolation .
 
       - name: Build .app and .dmg
         run: python scripts/build.py --arch arm64 --skip-tests
@@ -87,7 +103,7 @@ jobs:
           echo "✓ Binary verified as arm64 and signed"
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quantacrypt-arm64
           path: dist/quantacrypt-arm64.dmg
@@ -97,9 +113,10 @@ jobs:
     name: Build (x86_64 via Rosetta)
     needs: test
     runs-on: macos-14
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/v')
@@ -123,11 +140,15 @@ jobs:
           # Verify the venv Python is actually x86_64
           arch -x86_64 venv-x86/bin/python -c "import struct; assert struct.calcsize('P') * 8 == 64; import platform; print(f'venv arch: {platform.machine()}')"
 
-      - name: Install dependencies (x86_64)
+      # The venv's bundled pip performs the hash-checked install; a
+      # `pip install --upgrade pip` here would be the one unpinned fetch in
+      # the job, and pip itself is in the lock anyway.
+      - name: Install dependencies (x86_64, hash-pinned, no build isolation)
         run: |
-          arch -x86_64 venv-x86/bin/python -m pip install --upgrade pip
-          arch -x86_64 venv-x86/bin/python -m pip install --require-hashes -r requirements-lock.txt
-          arch -x86_64 venv-x86/bin/python -m pip install --no-deps .
+          arch -x86_64 venv-x86/bin/python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          arch -x86_64 venv-x86/bin/python -m pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          arch -x86_64 venv-x86/bin/python -m pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          arch -x86_64 venv-x86/bin/python -m pip install --no-deps --no-build-isolation .
         env:
           ARCHFLAGS: "-arch x86_64"
           _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
@@ -163,7 +184,7 @@ jobs:
           echo "✓ Binary verified as x86_64 and signed"
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quantacrypt-x86_64
           path: dist/quantacrypt-x86_64.dmg
@@ -176,38 +197,52 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Stamp version from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies (hash-pinned)
+      - name: Install dependencies (hash-pinned, no build isolation)
         run: |
-          pip install --require-hashes -r requirements-lock.txt
-          pip install --no-deps .
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          pip install --no-deps --no-build-isolation .
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      # XcodeGen generates the .xcodeproj — every build phase the Release
+      # xcodebuild executes — so it is pinned by release and SHA-256 like
+      # the python.org installer, not resolved from homebrew-core.
+      - name: Install XcodeGen (pinned, SHA-256 verified)
+        run: bash scripts/install_xcodegen.sh
 
       # One command → one .app: helper bundle + icons + xcodegen + Release
       # xcodebuild + DMG (scripts/build.py --native).
       - name: Build QuantaCrypt.app and DMG
         run: python scripts/build.py --native --skip-tests --arch arm64
 
-      - name: Verify the app is arm64 and carries the helper
+      # get-task-allow lets any same-user process take the app's task port
+      # and read the memory holding passwords and shares; Xcode injects it
+      # into every non-archive build unless told not to.  build.py passes
+      # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO and checks; this is the
+      # independent check on the artefact we publish.
+      - name: Verify the app is arm64, carries the helper, and is not debuggable
         run: |
           file dist/QuantaCrypt.app/Contents/MacOS/QuantaCrypt | grep -q arm64
           test -x dist/QuantaCrypt.app/Contents/Helpers/qc-core.app/Contents/MacOS/qc-core
           codesign --verify --deep --strict dist/QuantaCrypt.app
+          if codesign -d --entitlements - dist/QuantaCrypt.app 2>&1 | grep -q get-task-allow; then
+            echo "::error::QuantaCrypt.app carries com.apple.security.get-task-allow"
+            exit 1
+          fi
 
       - name: Upload native DMG artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: QuantaCrypt-native-arm64
           path: dist/QuantaCrypt-native-arm64.dmg
@@ -218,31 +253,28 @@ jobs:
     needs: [build-arm64, build-x86_64, build-native]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write        # gh release create
+      id-token: write        # Sigstore signing for the provenance attestation
+      attestations: write    # store the attestation on the repository
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download all DMG artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
 
-      - name: Extract version from tag
-        id: version
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Collect by glob rather than by hand: the previous list named
+      # artifacts/QuantaCrypt-arm64/QuantaCrypt-arm64.dmg, which was wrong
+      # in both segments (the native job uploads QuantaCrypt-native-arm64),
+      # so every tag failed here after a ~60-minute build and bump-version
+      # never ran. Asserting the count keeps a silently-missing artifact
+      # from publishing a partial release instead.
+      - name: Collect the DMGs and write SHA256SUMS
         run: |
-          # Collect by glob rather than by hand: the previous list named
-          # artifacts/QuantaCrypt-arm64/QuantaCrypt-arm64.dmg, which was wrong
-          # in both segments (the native job uploads QuantaCrypt-native-arm64),
-          # so every tag failed here after a ~60-minute build and bump-version
-          # never ran. Asserting the count keeps a silently-missing artifact
-          # from publishing a partial release instead.
           mapfile -t DMGS < <(find artifacts -name '*.dmg' | sort)
           echo "Found ${#DMGS[@]} DMG(s):"
           printf '  %s\n' "${DMGS[@]}"
@@ -250,27 +282,52 @@ jobs:
             echo "::error::expected 3 DMGs (arm64, x86_64, native), got ${#DMGS[@]}"
             exit 1
           fi
-          gh release create "${{ steps.version.outputs.tag }}" \
-            "${DMGS[@]}" \
-            --title "QuantaCrypt ${{ steps.version.outputs.tag }}" \
-            --generate-notes
+          mkdir -p release
+          for dmg in "${DMGS[@]}"; do cp "$dmg" release/; done
+          # Basenames only, so `shasum -a 256 -c SHA256SUMS` works from the
+          # folder a user downloaded the DMGs into.
+          (cd release && sha256sum -- *.dmg | tee SHA256SUMS)
+
+      # Signed statement, verifiable offline against Sigstore, that these
+      # exact bytes came out of this workflow at this commit:
+      #   gh attestation verify <file> --owner alexboccard
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.dmg
+            release/SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" release/*.dmg release/SHA256SUMS \
+            --title "QuantaCrypt $TAG" \
+            --generate-notes \
+            --notes "Verify a download with \`shasum -a 256 -c SHA256SUMS\` (macOS) or \`sha256sum -c SHA256SUMS\`, and its provenance with \`gh attestation verify <file> --owner alexboccard\`."
 
   bump-version:
     name: Commit released version back to repo
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write        # git push origin master
 
     steps:
-      - uses: actions/checkout@v6
+      # persist-credentials: false — the steps below resolve packages and
+      # build an sdist; none of that should run with a write token sitting
+      # in .git/config.  The push authenticates explicitly.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: master
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       # Same structural stamp as the build jobs, so master cannot end up
       # carrying a version the release never built.  It also reaches
@@ -287,12 +344,16 @@ jobs:
       # the resolver version is pinned too.
       - name: Regenerate the dependency lock
         run: |
-          pip install --require-hashes -r requirements-lock.txt
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
           uv lock
           uv export --frozen --no-emit-project --all-extras \
             --format requirements.txt -o requirements-lock.txt
 
       - name: Commit and push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER="${GITHUB_REF#refs/tags/v}"
           git config user.name "github-actions[bot]"
@@ -301,4 +362,4 @@ jobs:
                   uv.lock requirements-lock.txt
           git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
           git commit -m "chore: bump version to $VER [skip ci]"
-          git push origin master
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:master

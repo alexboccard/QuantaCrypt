@@ -141,12 +141,26 @@ enum HelperLocator {
             }
         }
 
+        // A bundled helper is measured like any other: the app's seal over
+        // its nested code is only checked when something asks (see
+        // `bundleIntegrityWarning`), so "it is inside the bundle" proves
+        // nothing about the bytes by itself. Its hash rides on the launch so
+        // the transport re-measures it right before `exec`.
+        func bundled(_ url: URL) -> Resolution? {
+            let status = signature(url)
+            if let denial = bundledRefusal(url, status: status) {
+                if refusal == nil { refusal = denial }
+                searched.append("Refused: \(denial.reason)")
+                return nil
+            }
+            return Resolution(launch: HelperLaunch(executable: url, arguments: [], origin: "bundle",
+                                                   approvedCDHash: status.cdHash),
+                              searched: searched, refusal: refusal)
+        }
+
         if let url = bundle.url(forAuxiliaryExecutable: "qc-core") {
             searched.append("Bundle auxiliary executable: \(url.path)")
-            if executable(url.path) {
-                return Resolution(launch: HelperLaunch(executable: url, arguments: [], origin: "bundle"),
-                                  searched: searched, refusal: refusal)
-            }
+            if executable(url.path), let resolution = bundled(url) { return resolution }
         }
 
         // scripts/build.py --helper ships a headless bundle at
@@ -157,9 +171,9 @@ enum HelperLocator {
                     "Contents/Helpers/qc-core"] {
             let helpers = bundle.bundleURL.appending(path: rel)
             searched.append("Bundle: \(helpers.path)")
-            if executable(helpers.path), !isDirectory(helpers.path, fileManager) {
-                return Resolution(launch: HelperLaunch(executable: helpers, arguments: [], origin: "bundle"),
-                                  searched: searched, refusal: refusal)
+            if executable(helpers.path), !isDirectory(helpers.path, fileManager),
+               let resolution = bundled(helpers) {
+                return resolution
             }
         }
 
@@ -198,11 +212,17 @@ enum HelperLocator {
 
     /// Why `url` may not be launched as the helper, or nil when it may.
     ///
-    /// Inside the app bundle needs no approval: the app's own signature
-    /// covers its payload, so replacing the bundled helper already breaks the
-    /// bundle. Everything else needs a signature *and* a click, because a
-    /// planted preference is the whole attack and only a person can tell the
-    /// two apart.
+    /// Inside the app bundle needs no approval, but it does need a
+    /// signature. This used to say the app's own signature "covers its
+    /// payload, so replacing the bundled helper already breaks the bundle" —
+    /// which is true only when something evaluates that seal: Gatekeeper at
+    /// the first launch of a quarantined copy, and `bundleIntegrityWarning`
+    /// at ours. The kernel checks each executable's *own* signature and
+    /// nothing above it, so a helper swapped in and ad-hoc re-signed launches
+    /// without complaint. Refusing an unsigned one is the check that costs
+    /// nothing; the click is reserved for paths the user chose, because a
+    /// planted preference is the whole attack there and only a person can
+    /// tell the two apart.
     ///
     /// Only a binary that satisfies the pin can be approved. Compiling the
     /// requirement and then treating "signed by someone else" exactly like
@@ -216,21 +236,68 @@ enum HelperLocator {
                                 approved: (String, Data) -> Bool) -> Refusal? {
         let path = url.standardizedFileURL.path
         let bundleRoot = bundle.bundleURL.standardizedFileURL.path
-        if path == bundleRoot || path.hasPrefix(bundleRoot + "/") { return nil }
+        if path == bundleRoot || path.hasPrefix(bundleRoot + "/") {
+            return bundledRefusal(url, status: status)
+        }
         switch status {
         case .unsigned(let detail):
             return Refusal(path: path,
-                           reason: "\(path) isn't code-signed, so QuantaCrypt can't tell what it is (\(detail)). It stays unused — clear the path above to use the bundled helper.",
+                           reason: "\(path) isn't code-signed, so QuantaCrypt can't tell what it is (\(detail)). It stays unused. Clear the path above to use the bundled helper.",
                            approvable: false)
         case .signedButUnpinned(let detail):
             return Refusal(path: path,
-                           reason: "\(path) is signed, but not as QuantaCrypt's qc-core helper (\(detail)). It stays unused — clear the path above to use the bundled helper.",
+                           reason: "\(path) is signed, but not as QuantaCrypt's qc-core helper (\(detail)). It stays unused. Clear the path above to use the bundled helper.",
                            approvable: false)
         case .satisfiesPin(let cdHash):
             guard !approved(path, cdHash) else { return nil }
             return Refusal(path: path,
                            reason: "\(path) is outside QuantaCrypt, and every password and share you type goes to it. It stays unused until you approve it here.",
                            approvable: true)
+        }
+    }
+
+    /// Why a helper *inside* the app bundle may not be launched, or nil when
+    /// it may. Only an unsigned one is refused: it cannot be measured, so
+    /// nothing could be re-checked before `exec`. There is no button for
+    /// this — the fix is a reinstall, not a click.
+    static func bundledRefusal(_ url: URL, status: SignatureStatus) -> Refusal? {
+        guard case .unsigned(let detail) = status else { return nil }
+        let path = url.standardizedFileURL.path
+        return Refusal(path: path,
+                       reason: "The helper bundled with QuantaCrypt at \(path) isn't code-signed (\(detail)), so it can't be checked and won't be used. Reinstall QuantaCrypt from a release you trust.",
+                       approvable: false)
+    }
+
+    /// Whether the app bundle — nested helper included — still matches the
+    /// signature it shipped with. Nil when it does; otherwise one sentence
+    /// for the user.
+    ///
+    /// `kSecCSCheckNestedCode` is what makes this cover the helper: the
+    /// default check stops at the app's own executable and resource seal.
+    /// `kSecCSStrictValidate` refuses the lenient interpretations older
+    /// signatures are allowed. The result is a warning, never a refusal to
+    /// run: a build with signing disabled (CI's `CODE_SIGNING_ALLOWED=NO`)
+    /// has no seal at all and must still launch, and an attacker who can
+    /// swap the helper can swap this check too — the point is that a copy
+    /// that *was* altered no longer looks identical to one that was not.
+    static func bundleIntegrityWarning(for bundle: Bundle = .main) -> String? {
+        var code: SecStaticCode?
+        let created = SecStaticCodeCreateWithPath(bundle.bundleURL as CFURL, [], &code)
+        guard created == errSecSuccess, let code else {
+            return "QuantaCrypt couldn't read its own code signature (OSStatus \(created)), so it can't check that this copy hasn't been altered."
+        }
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSCheckNestedCode | kSecCSStrictValidate))
+        let status = SecStaticCodeCheckValidity(code, flags, nil)
+        switch status {
+        case errSecSuccess:
+            return nil
+        case errSecCSUnsigned:
+            return "This copy of QuantaCrypt isn't code-signed, so it can't check that it hasn't been altered."
+        default:
+            // Security's own phrasing ("nested code is modified or invalid")
+            // rather than the CFError's "OSStatus error -67061".
+            let reason = (SecCopyErrorMessageString(status, nil) as String?) ?? "OSStatus \(status)"
+            return "QuantaCrypt's code signature doesn't verify (\(reason)). This copy, or the encryption helper inside it, may have been altered. Reinstall QuantaCrypt from a release you trust before typing a password into it."
         }
     }
 

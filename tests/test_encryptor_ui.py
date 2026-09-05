@@ -16,6 +16,8 @@ import gc
 import hashlib
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -89,6 +91,27 @@ def _alive(w):
         return bool(w.winfo_exists())
     except tk.TclError:
         return False
+
+
+def _clipboard_empty(root):
+    """True when nothing is on the system clipboard.  On macOS the wipe is
+    made outside Tk (NSPasteboard), so it is read back outside Tk too."""
+    if sys.platform == "darwin":
+        r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
+        return r.stdout == ""
+    try:
+        root.clipboard_get()
+    except tk.TclError:
+        return True
+    return False
+
+
+def _menu_labels(menu):
+    end = menu.index("end")
+    if end is None:
+        return []
+    return ["--" if menu.type(i) == "separator" else menu.entrycget(i, "label")
+            for i in range(end + 1)]
 
 
 def _press(app, sequence, widget=None, **kw):
@@ -389,12 +412,27 @@ class TestReveal:
     def test_open_file_uses_open_on_macos(self, popen_calls, monkeypatch):
         monkeypatch.setattr(enc.sys, "platform", "darwin")
         assert _reveal("/tmp/a b.qcx", open_file=True) is True
-        assert popen_calls == [["open", "/tmp/a b.qcx"]]
+        assert popen_calls == [["open", "--", "/tmp/a b.qcx"]]
+
+    def test_open_file_keeps_a_dashed_name_out_of_opens_flags(self, popen_calls,
+                                                              monkeypatch):
+        """The Output field is free text: -foo.qcx is a file, not options."""
+        monkeypatch.setattr(enc.sys, "platform", "darwin")
+        assert _reveal("-foo.qcx", open_file=True) is True
+        assert popen_calls == [["open", "--", "-foo.qcx"]]
 
     def test_open_file_uses_xdg_open_elsewhere(self, popen_calls, monkeypatch):
         monkeypatch.setattr(enc.sys, "platform", "linux")
         assert _reveal("/tmp/a.qcx", open_file=True) is True
         assert popen_calls == [["xdg-open", "/tmp/a.qcx"]]
+
+    def test_open_file_absolutises_the_path_for_xdg_open(self, popen_calls,
+                                                         monkeypatch, tmp_path):
+        """xdg-open has no ``--``; an absolute path can never read as a flag."""
+        monkeypatch.setattr(enc.sys, "platform", "linux")
+        monkeypatch.chdir(tmp_path)
+        assert _reveal("-foo.qcx", open_file=True) is True
+        assert popen_calls == [["xdg-open", str(tmp_path / "-foo.qcx")]]
 
     def test_open_file_uses_startfile_on_windows(self, monkeypatch):
         started = []
@@ -637,15 +675,65 @@ class TestShareCard:
         card._copy()
         assert card._copy_btn.cget("text") == "⚠ Failed"
 
-    def test_marking_saved_disables_copying_and_stops_the_countdown(
+    def test_marking_saved_disables_copying_and_blanks_the_countdown_label(
             self, tk_root, shamir_shares):
         card, _code, _mn = self._card(tk_root, shamir_shares)
         card._copy()
         card.mark_saved()
         assert card._copy_btn.cget("text") == "✓ Saved"
         assert card._copy_btn._enabled is False
-        assert card._clip_lbl.cget("text") == ""      # countdown cancelled
+        assert card._clip_lbl.cget("text") == ""      # label detached, not the wipe
         assert card.cget("highlightbackground") == enc.C["success"]
+
+    def test_saving_keeps_the_clipboard_wipe_armed(self, tk_root, shamir_shares):
+        """Copy, then "Save individual files →" seconds later: the share is
+        still on the pasteboard, and the 60 s wipe the banner promises has
+        to fire for it.  Saving may only take the label away."""
+        card, _code, mnemonic = self._card(tk_root, shamir_shares)
+        card._copy()
+        timer = card._clip_timer
+        card.mark_saved()
+        assert timer._job is not None, "still counting down"
+        assert timer._written == mnemonic, "the copy is still known"
+        assert timer._concealed is False or timer._change is not None, \
+            "the changeCount witness survives the save"
+        timer._remain = 0
+        timer._tick()                                  # the countdown runs out
+        assert _clipboard_empty(tk_root)
+        assert timer._written is None and timer._change is None
+
+    def test_command_c_on_the_share_text_is_a_concealed_timed_copy(
+            self, tk_root, shamir_shares):
+        """Select-all + ⌘C on the share is the habitual copy gesture; it has
+        to arm the same countdown as the button rather than Tk's stock
+        append that a clipboard manager keeps for ever."""
+        card, _code, mnemonic = self._card(tk_root, shamir_shares)
+        tk_root.clipboard_clear()
+        card._txt.tag_add("sel", "1.0", "end")
+        card._txt.event_generate("<<Copy>>")
+        tk_root.update()
+        assert tk_root.clipboard_get() == mnemonic
+        assert card._clip_timer._written == mnemonic
+        assert card._clip_lbl.cget("text").startswith("Clipboard clears in")
+        assert card._copy_btn.cget("text") == "✓ Copied"
+
+    def test_the_context_menu_copy_takes_the_same_route(self, tk_root,
+                                                        shamir_shares, monkeypatch):
+        posted = []
+        monkeypatch.setattr(tk.Menu, "tk_popup",
+                            lambda self, x, y, entry="": posted.append(self))
+        card, _code, mnemonic = self._card(tk_root, shamir_shares)
+        card._txt.tag_add("sel", "1.0", "end")
+        tk_root.update()
+        card._txt.event_generate("<Button-3>", x=3, y=3)
+        tk_root.update()
+        menu, = posted
+        tk_root.clipboard_clear()
+        menu.invoke(_menu_labels(menu).index("Copy"))
+        tk_root.update()
+        assert tk_root.clipboard_get() == mnemonic
+        assert card._clip_timer._written == mnemonic
+        assert card._clip_lbl.cget("text").startswith("Clipboard clears in")
 
     def test_marking_a_destroyed_card_is_survivable(self, tk_root, shamir_shares):
         # Contract: mark_saved is fired from a save handler that may outlive
@@ -794,7 +882,7 @@ class TestKeyboardShortcuts:
         app._busy = True
         _press(app, f"<{_MOD}-o>")
         assert opened == []
-        assert app._err.cget("text") == "Busy — please wait for encryption to finish"
+        assert app._err.cget("text") == "Busy. Please wait for encryption to finish"
 
     def test_command_return_starts_the_run(self, mkapp, tmp_path, monkeypatch):
         app = mkapp()
@@ -812,7 +900,7 @@ class TestKeyboardShortcuts:
         app = mkapp()
         app._busy = True
         _press(app, f"<{_MOD}-Return>")
-        assert app._err.cget("text") == "Busy — please wait for encryption to finish"
+        assert app._err.cget("text") == "Busy. Please wait for encryption to finish"
 
 
 @requires_tkinter
@@ -1881,7 +1969,7 @@ class TestValidateSingle:
         self._ready(app, tmp_path)
         app._is_folder = True
         app._path = str(tmp_path / "gone")
-        assert app._validate() == "Folder no longer exists — please re-select"
+        assert app._validate() == "Folder no longer exists. Please re-select"
 
     def test_an_empty_output_path(self, mkapp, tmp_path):
         app = mkapp()
@@ -1896,7 +1984,7 @@ class TestValidateSingle:
         app._out.delete(0, "end")
         app._out.insert(0, str(src))
         assert app._validate() == (
-            "Output path is the same as the input — choose a different location")
+            "Output path is the same as the input. Choose a different location")
 
     def test_a_stat_failure_does_not_abort_validation(self, mkapp, tmp_path, monkeypatch):
         app = mkapp()
@@ -2040,7 +2128,7 @@ class TestValidateBatch:
         app = mkapp()
         paths, _out = self._ready(app, tmp_path)
         os.unlink(paths[0])
-        assert app._validate_batch() == "1 file(s) no longer exist — re-select"
+        assert app._validate_batch() == "1 file(s) no longer exist. Re-select"
 
     def test_no_output_folder(self, mkapp, tmp_path):
         app = mkapp()
@@ -2536,7 +2624,7 @@ class TestSingleRun:
         app._busy = True
         app._run(params)
         assert _pump_until(app, lambda: app._busy is False, 20)
-        assert app._err.cget("text") == "File not found — it may have been moved or deleted."
+        assert app._err.cget("text") == "File not found. It may have been moved or deleted."
         assert app._err.cget("fg") == enc.C["error"]
         assert not out.exists()
         assert app._btn._enabled is True          # the form is usable again
@@ -2551,7 +2639,7 @@ class TestSingleRun:
         app._run({"path": str(src), "out": str(out), "mode": "single", "pw": PW,
                   "n": 3, "k": 2, "embed": False, "is_folder": False})
         assert _pump_until(app, lambda: app._busy is False, 30)
-        assert app._err.cget("text") == "Encryption cancelled — no output was written."
+        assert app._err.cget("text") == "Encryption cancelled. No output was written."
         assert not out.exists()
         assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob(".*qc-enc-*"))
         assert app._wiz._active == 4
@@ -2563,7 +2651,7 @@ class TestSingleRun:
         app._request_cancel()
         assert app._cancel_event.is_set()
         assert app._cancel_btn._enabled is False
-        assert app._err.cget("text") == "Cancelling — finishing the current chunk…"
+        assert app._err.cget("text") == "Cancelling. Finishing the current chunk…"
 
     def test_cancel_still_arms_the_worker_when_the_button_is_gone(self, mkapp):
         # The button lives in the results area, which a reset can tear down
@@ -2573,7 +2661,7 @@ class TestSingleRun:
         app._cancel_btn.destroy()
         app._request_cancel()
         assert app._cancel_event.is_set()
-        assert app._err.cget("text") == "Cancelling — finishing the current chunk…"
+        assert app._err.cget("text") == "Cancelling. Finishing the current chunk…"
 
     def test_cancel_does_nothing_when_no_job_is_running(self, mkapp):
         app = mkapp()
@@ -2614,7 +2702,7 @@ class TestFailureMessages:
     def test_an_unmapped_exception_gets_the_generic_advice(self, mkapp):
         app = mkapp()
         msg = self._fail(app, RuntimeError("segment 4 misaligned"))
-        assert msg == ("Something went wrong during encryption — segment 4 misaligned. "
+        assert msg == ("Something went wrong during encryption: segment 4 misaligned. "
                        "Try a different output location or restart the app.")
 
     def test_a_plain_string_failure_is_shown_as_is(self, mkapp):
@@ -2735,7 +2823,7 @@ class TestBatchRun:
         assert (out / "a.qcx").exists()
         assert not (out / "b.qcx").exists() and not (out / "c.qcx").exists()
         assert app._err.cget("text") == (
-            "Cancelled — 1 of 3 files were encrypted; 2 not started, "
+            "Cancelled. 1 of 3 files were encrypted; 2 not started, "
             "no partial file was written.")
         assert "✓  1 file encrypted  ·  cancelled" in _widget_texts(app._results)
         assert app._show_done is False
@@ -3038,7 +3126,7 @@ class TestSaveIndividualShares:
         assert (folder / "will_2.share-2-of-3.txt").exists()
         note = " ".join(_widget_texts(app._shares_warn))
         assert "will_2.share-2-of-3.txt" in note
-        assert "the earlier files were left untouched" in note
+        assert "The earlier files were left untouched" in note
 
     def test_a_source_with_no_name_still_produces_a_stem(self, ready, tmp_path, monkeypatch):
         app, _out, shares = ready
@@ -3155,7 +3243,7 @@ class TestSaveIndividualShares:
         assert (folder / "will.share-1-of-3_2.txt").exists()
         note = " ".join(_widget_texts(app._shares_warn))
         assert "will.share-1-of-3_2.txt" in note
-        assert "the earlier files were left untouched" in note
+        assert "The earlier files were left untouched" in note
 
     def test_a_missing_qcx_leaves_the_fingerprint_out(self, ready, tmp_path, monkeypatch):
         app, out, shares = ready
@@ -3210,8 +3298,8 @@ class TestSaveCombinedShares:
         text = target.read_text()
         assert "Threshold: 2 of 3" in text
         for i, s in enumerate(shares, 1):
-            assert f"Share {i} — QCSHARE- code:\n{s}" in text
-            assert f"Share {i} — 50-word mnemonic:" in text
+            assert f"Share {i}, QCSHARE- code:\n{s}" in text
+            assert f"Share {i}, 50-word mnemonic:" in text
         digest = hashlib.sha256(out.read_bytes()[:65536]).hexdigest()[:12]
         assert f"Fingerprint (SHA-256 prefix): {digest}..." in text
         assert oct(os.stat(target).st_mode & 0o777) == "0o600"
@@ -3230,7 +3318,7 @@ class TestSaveCombinedShares:
         assert target.read_text() == "AN EARLIER RUN'S ONLY KEYS"
         moved = tmp_path / "will.shares_2.txt"
         assert moved.exists() and shares[0] in moved.read_text()
-        assert "the earlier file was left untouched" in " ".join(
+        assert "The earlier file was left untouched" in " ".join(
             _widget_texts(app._shares_warn))
 
     def test_a_qcx_that_vanished_is_still_named_in_the_header(
@@ -3585,7 +3673,7 @@ class TestClosing:
         app._close()
         assert _alive(app)
         assert app._err.cget("text") == (
-            "Encryption in progress — please wait until it finishes")
+            "Encryption in progress. Please wait until it finishes")
 
     def test_closing_with_unsaved_shares_asks(self, mkapp, monkeypatch):
         app = mkapp(on_close=lambda: None)
@@ -3651,7 +3739,7 @@ class TestTestDecrypt:
         broken.write_bytes(b"not a quantacrypt file")
         app._test_decrypt(str(broken))
         assert _alive(app)
-        assert app._err.cget("text").startswith("Couldn't open the decryptor — ")
+        assert app._err.cget("text").startswith("Couldn't open the decryptor: ")
         assert app._err.cget("fg") == enc.C["error"]
 
 
@@ -3679,7 +3767,7 @@ class TestRevealUI:
         target = str(tmp_path / "a.qcx")
         app._reveal_ui(target)
         assert app._err.cget("text") == (
-            f"Couldn't open the file manager — the file is at {target}")
+            f"Couldn't open the file manager. The file is at {target}")
 
     def test_a_failed_open_says_open_the_file(self, mkapp, tmp_path, monkeypatch):
         app = mkapp()
@@ -3687,4 +3775,4 @@ class TestRevealUI:
         target = str(tmp_path / "a.qcx")
         app._reveal_ui(target, open_file=True)
         assert app._err.cget("text") == (
-            f"Couldn't open the file — the file is at {target}")
+            f"Couldn't open the file. The file is at {target}")

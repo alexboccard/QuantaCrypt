@@ -159,11 +159,15 @@ def write_new_private_file(path: str, text: str) -> tuple[str, bool]:
             continue   # appeared between the probe and the open — next name
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            # This file is the only copy of a share: it has to be on disk,
+            # not in a page cache a power cut would discard.
+            f.flush()
+            os.fsync(f.fileno())
         return out, n > 1
     raise FileExistsError(
         errno.EEXIST,
         f"{_MAX_NAME_ATTEMPTS} files named like {os.path.basename(path)} already "
-        "exist here — choose another name or folder", path)
+        "exist here. Choose another name or folder", path)
 
 
 def bind_context_menu(widget):
@@ -333,12 +337,15 @@ def reveal_path(path: str) -> bool:
     import subprocess
     try:
         if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
+            # "--": a self-typed name like -foo.qcx must never read as flags.
+            subprocess.Popen(["open", "-R", "--", path])
         elif sys.platform == "win32":
             subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
         else:
             target = path if os.path.isdir(path) else os.path.dirname(path)
-            subprocess.Popen(["xdg-open", target])
+            # xdg-open rejects "--" outright, so absolutise instead: an
+            # absolute path can never start with a dash.
+            subprocess.Popen(["xdg-open", os.path.abspath(target)])
         return True
     except Exception:
         return False
@@ -450,6 +457,21 @@ def clear_pasteboard_if_unchanged(change: int):
     return True if out.strip() == "cleared" else None
 
 
+def _spawn_osascript(argv: list, script: str) -> None:
+    """Start osascript with ``script`` on stdin and return without waiting.
+
+    Same rule as ``_run_jxa``: argv is readable by every local process
+    through ``ps``, and a notification quotes file names, mount points and
+    failure text — none of which belongs there."""
+    import subprocess
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, text=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc.stdin.write(script)
+    finally:
+        proc.stdin.close()
+
+
 def notify(title: str, message: str, sound: bool = True) -> None:
     """Send a macOS notification if the app window is not in focus.
 
@@ -470,8 +492,6 @@ def notify(title: str, message: str, sound: bool = True) -> None:
     except Exception:
         pass
 
-    import subprocess
-
     icon_path = _find_app_icon()
 
     # --- Primary: JXA via osascript (shows app icon) ---
@@ -491,11 +511,7 @@ def notify(title: str, message: str, sound: bool = True) -> None:
             )
         jxa += '$.NSUserNotificationCenter.defaultUserNotificationCenter'
         jxa += '.deliverNotification(n);\n'
-        subprocess.Popen(
-            ["osascript", "-l", "JavaScript", "-e", jxa],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _spawn_osascript(["osascript", "-l", "JavaScript", "-"], jxa)
         return
     except Exception:
         pass
@@ -507,11 +523,7 @@ def notify(title: str, message: str, sound: bool = True) -> None:
             f'display notification "{_js(message)}" '
             f'with title "{_js(title)}"{sound_part}'
         )
-        subprocess.Popen(
-            ["osascript", "-e", script],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _spawn_osascript(["osascript", "-"], script)
     except Exception:
         pass
 
@@ -1457,9 +1469,24 @@ class ClipboardTimer:
         self._written = None
         self._change  = None
         try:
-            if self._label.winfo_exists():
-                self._label.config(text="")
+            self._set_label("")
         except Exception: pass
+
+    def detach_label(self):
+        """Blank and forget the countdown label, keeping the wipe armed.
+
+        For a card that has just been saved: the share is still on the
+        clipboard, and this timer's wipe is the only thing that will ever
+        take it off.  ``cancel()`` would forget the copy along with the
+        label."""
+        try:
+            self._set_label("")
+        except Exception: pass
+        self._label = None
+
+    def _set_label(self, text, **kw):
+        if self._label is not None and self._label.winfo_exists():
+            self._label.config(text=text, **kw)
 
     def _tick(self):
         if self._remain <= 0:
@@ -1469,9 +1496,7 @@ class ClipboardTimer:
         # keeps the share for ever and the countdown protects nothing.
         note = "" if self._concealed else "  ·  a clipboard manager may keep it"
         try:
-            if self._label.winfo_exists():
-                self._label.config(text=f"Clipboard clears in {self._remain}s{note}",
-                                   fg=C["text3"])
+            self._set_label(f"Clipboard clears in {self._remain}s{note}", fg=C["text3"])
         except Exception:
             return
         self._remain -= 1
@@ -1510,11 +1535,9 @@ class ClipboardTimer:
             text, fg, fade = (f"Couldn't clear the clipboard {ICON['warn']}",
                               C["warning"], False)
         try:
-            if self._label.winfo_exists():
-                self._label.config(text=text, fg=fg)
-                if fade:
-                    self._root.after(2000, lambda: (
-                        self._label.config(text="") if self._label.winfo_exists() else None))
+            self._set_label(text, fg=fg)
+            if fade:
+                self._root.after(2000, lambda: self._set_label(""))
         except Exception: pass
 
 
@@ -1527,8 +1550,29 @@ def _data_dir() -> str:
         base = os.environ.get("XDG_DATA_HOME",
                               os.path.expanduser("~/.local/share"))
     d = os.path.join(base, "QuantaCrypt")
-    os.makedirs(d, exist_ok=True)
+    # The stores under it list every file decrypted and volume mounted.
+    os.makedirs(d, mode=0o700, exist_ok=True)
     return d
+
+
+def _write_private_json(path: str, data) -> None:
+    """Dump ``data`` to ``path`` through a 0600 temp file beside it.  The
+    rename is atomic, so a crash mid-write keeps the previous store rather
+    than a truncated one, and the umask never widens what the file holds."""
+    import json
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".", suffix=".tmp",
+                               dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class RecentFiles:
@@ -1571,12 +1615,16 @@ class RecentFiles:
 
     @classmethod
     def _write_raw(cls, entries):
-        import json
         try:
-            with open(cls._resolve_path(), "w") as f:
-                json.dump(entries, f, indent=2)
+            _write_private_json(cls._resolve_path(), entries)
         except Exception:
             pass
+
+    @staticmethod
+    def _well_formed(raw):
+        """Only entries whose path is a string: the store is user-editable,
+        and ``os.path.isfile(None)`` is a TypeError, not a missing file."""
+        return [e for e in raw if isinstance(e, dict) and isinstance(e.get("path"), str)]
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1584,8 +1632,8 @@ class RecentFiles:
     def load(cls):
         """Return list of (path, meta_dict) tuples, newest first, existing only."""
         raw = cls._read_raw()
-        valid = [(e["path"], e) for e in raw
-                 if isinstance(e, dict) and os.path.isfile(e.get("path", ""))]
+        valid = [(e["path"], e) for e in cls._well_formed(raw)
+                 if os.path.isfile(e["path"])]
         # Persist filtered list if anything was trimmed
         if len(valid) != len(raw):
             cls._write_raw([e for _, e in valid])
@@ -1595,8 +1643,7 @@ class RecentFiles:
     def add(cls, path, meta=None):
         """Insert path at front, deduplicate, trim to MAX_ITEMS, save."""
         import time
-        raw = cls._read_raw()
-        raw = [e for e in raw if isinstance(e, dict) and e.get("path") != path]
+        raw = [e for e in cls._well_formed(cls._read_raw()) if e["path"] != path]
         entry = {"path": path, "ts": time.time()}
         if meta:
             entry["mode"]      = meta.get("mode", "single")
@@ -1607,7 +1654,7 @@ class RecentFiles:
 
     @classmethod
     def remove(cls, path):
-        raw = [e for e in cls._read_raw() if isinstance(e, dict) and e.get("path") != path]
+        raw = [e for e in cls._well_formed(cls._read_raw()) if e["path"] != path]
         cls._write_raw(raw)
 
     @classmethod
@@ -1647,11 +1694,9 @@ class AppPrefs:
 
     @classmethod
     def set(cls, key, value):
-        import json
         data = cls._read()
         data[key] = value
         try:
-            with open(cls._resolve_path(), "w") as f:
-                json.dump(data, f, indent=2)
+            _write_private_json(cls._resolve_path(), data)
         except Exception:
             pass

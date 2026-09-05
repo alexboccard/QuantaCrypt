@@ -37,23 +37,23 @@ def friendly_error(exc: BaseException) -> str:
     if isinstance(exc, (InvalidRequest, InvalidInput, CorruptPayload)):
         return str(exc)
     if isinstance(exc, FileNotFoundError):
-        return "File not found — it may have been moved or deleted."
+        return "File not found. It may have been moved or deleted."
     if isinstance(exc, FileExistsError):
         name = exc.filename or str(exc)
-        return f"{name} already exists — choose a different name."
+        return f"{name} already exists. Choose a different name."
     if isinstance(exc, KeyError):
-        return (f"The file is missing the field {exc.args[0]!r} — it may be corrupt "
+        return (f"The file is missing the field {exc.args[0]!r}, so it may be corrupt "
                 "or from an unsupported version.")
     if isinstance(exc, PermissionError):
-        return ("Access denied — check you have permission to read / write "
+        return ("Access denied. Check you have permission to read / write "
                 "this file, and that it isn't open in another app.")
     if isinstance(exc, IsADirectoryError):
         return "That path is a folder, not a file."
     if isinstance(exc, OSError):
         if exc.errno == _errno.ENOSPC:
-            return "Disk is full — free up space and try again."
+            return "Disk is full. Free up space and try again."
         if exc.errno == _errno.EIO:
-            return "Disk read / write error — the drive may be failing."
+            return "Disk read / write error: the drive may be failing."
         if exc.errno == _errno.EROFS:
             return "Destination is read-only."
 
@@ -69,10 +69,10 @@ def friendly_error(exc: BaseException) -> str:
         return ("This file uses an older format. Decrypt it with the "
                 "original app version, then re-encrypt with this one.")
     if "truncat" in lower or "appears truncated" in lower:
-        return ("The file appears to be truncated or incomplete — "
-                "re-download or restore from backup.")
+        return ("The file appears to be truncated or incomplete. "
+                "Re-download or restore from backup.")
     if "hmac" in lower:
-        return ("The file's integrity check failed — the file may be "
+        return ("The file's integrity check failed. It may be "
                 "corrupt or tampered with.")
     if not msg:
         return f"{type(exc).__name__} (no additional detail)"
@@ -91,7 +91,7 @@ def classify_error(exc: BaseException) -> tuple[str, str, str]:
     detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     message = friendly_error(exc)
     if isinstance(exc, CancelledOperation):
-        return "cancelled", "Cancelled — nothing was written.", detail
+        return "cancelled", "Cancelled. Nothing was written.", detail
     if isinstance(exc, InvalidRequest):
         return "invalid_request", message, detail
     if isinstance(exc, InvalidInput):

@@ -491,7 +491,26 @@ class TestOpenFile:
         monkeypatch.setattr(dec.sys, "platform", "darwin")
         monkeypatch.setattr(dec.subprocess, "run", lambda a, **k: calls.append(a))
         dec._open_file("/tmp/a b.txt")
-        assert calls == [["open", "/tmp/a b.txt"]]
+        assert calls == [["open", "--", "/tmp/a b.txt"]]
+
+    def test_macos_keeps_a_dashed_name_out_of_opens_flags(self, monkeypatch):
+        """The recovered original name is the payload's to choose."""
+        import quantacrypt.ui.decryptor as dec
+        calls = []
+        monkeypatch.setattr(dec.sys, "platform", "darwin")
+        monkeypatch.setattr(dec.subprocess, "run", lambda a, **k: calls.append(a))
+        dec._open_file("-rf.txt")
+        assert calls == [["open", "--", "-rf.txt"]]
+
+    def test_linux_hands_xdg_open_an_absolute_path(self, monkeypatch, tmp_path):
+        """xdg-open rejects ``--``; an absolute path cannot start with a dash."""
+        import quantacrypt.ui.decryptor as dec
+        calls = []
+        monkeypatch.setattr(dec.sys, "platform", "linux")
+        monkeypatch.setattr(dec.subprocess, "run", lambda a, **k: calls.append(a))
+        monkeypatch.chdir(tmp_path)
+        dec._open_file("-rf.txt")
+        assert calls == [["xdg-open", str(tmp_path / "-rf.txt")]]
 
     def test_windows_uses_startfile(self, monkeypatch):
         import quantacrypt.ui.decryptor as dec
@@ -523,7 +542,7 @@ class TestOpenFile:
 
         monkeypatch.setattr(dec.subprocess, "run", _boom)
         assert dec._open_file("/tmp/x") is None
-        assert tried == [["open", "/tmp/x"]]
+        assert tried == [["open", "--", "/tmp/x"]]
 
 
 class TestShareList:
@@ -597,12 +616,12 @@ class TestProtectionLabel:
     def test_shamir_mode_names_the_threshold(self):
         from quantacrypt.ui.decryptor import _protection_label
         assert _protection_label({"mode": "shamir", "threshold": 2, "total": 5}) == \
-            "A split key — any 2 of 5 shares unlock it"
+            "A split key. Any 2 of 5 shares unlock it"
 
     def test_shamir_without_parameters_says_so_rather_than_crashing(self):
         from quantacrypt.ui.decryptor import _protection_label
         assert _protection_label({"mode": "shamir"}) == \
-            "A split key — any ? of ? shares unlock it"
+            "A split key. Any ? of ? shares unlock it"
 
     def test_unknown_mode_is_echoed(self):
         from quantacrypt.ui.decryptor import _protection_label
@@ -627,7 +646,7 @@ class TestFileInfoCard:
         from quantacrypt.ui.decryptor import FileInfoCard
         card = FileInfoCard(ui_root, {"mode": "single"}, None)
         texts = _widget_texts(card)
-        assert "Hidden — shown after decryption" in texts
+        assert "Hidden; shown after decryption" in texts
         assert "A password" in texts
 
     def test_recovered_filename_replaces_the_placeholder(self, ui_root):
@@ -635,12 +654,12 @@ class TestFileInfoCard:
         card = FileInfoCard(ui_root, {"mode": "single"}, "report.pdf")
         texts = _widget_texts(card)
         assert "report.pdf" in texts
-        assert "Hidden — shown after decryption" not in texts
+        assert "Hidden; shown after decryption" not in texts
 
     def test_shamir_card_names_the_threshold(self, ui_root):
         from quantacrypt.ui.decryptor import FileInfoCard
         card = FileInfoCard(ui_root, {"mode": "shamir", "threshold": 3, "total": 5}, None)
-        assert "A split key — any 3 of 5 shares unlock it" in _widget_texts(card)
+        assert "A split key. Any 3 of 5 shares unlock it" in _widget_texts(card)
 
     def test_size_and_date_rows_appear_only_once_known(self, ui_root):
         from quantacrypt.ui.decryptor import FileInfoCard
@@ -1702,7 +1721,7 @@ class TestInspectPopup:
         app._show_inspect()
         win = app.winfo_children()[-1]
         try:
-            assert "A split key — any 2 of 3 shares unlock it (Shamir secret sharing)" \
+            assert "A split key. Any 2 of 3 shares unlock it (Shamir secret sharing)" \
                 in _widget_texts(win)
         finally:
             win.destroy()
@@ -2420,7 +2439,7 @@ class TestValidate:
         app._out.delete(0, "end")
         app._out.insert(0, str(tmp_path / "nowhere"))
         app._pw.insert(0, PW)
-        assert app._validate() == "That output folder doesn't exist — choose another"
+        assert app._validate() == "That output folder doesn't exist. Choose another"
 
     def test_an_empty_password(self, loaded_app):
         app, _qcx = loaded_app
@@ -2441,12 +2460,12 @@ class TestValidate:
     def test_shamir_with_no_shares_names_the_empty_slots(self, shamir_app):
         app, _meta, _shares = shamir_app
         assert app._validate() == \
-            "Shares 1 and 2 are empty — this file needs 2 shares"
+            "Shares 1 and 2 are empty; this file needs 2 shares"
 
     def test_shamir_with_one_share_names_the_remaining_slot(self, shamir_app):
         app, _meta, shares = shamir_app
         app._inputs[0].set_words(_mnemonic_for(shares[0]).split())
-        assert app._validate() == "Share 2 is empty — this file needs 2 shares"
+        assert app._validate() == "Share 2 is empty; this file needs 2 shares"
 
     def test_a_half_typed_phrase_is_reported_with_its_progress(self, shamir_app):
         app, _meta, shares = shamir_app
@@ -2479,7 +2498,7 @@ class TestValidate:
         app._entries[0].insert(0, "hello")
         app._entries[1].insert(0, shares[1])
         assert app._validate() == \
-            "Share 1 doesn't look right — code shares start with QCSHARE-"
+            "Share 1 doesn't look right: code shares start with QCSHARE-"
 
     def test_raw_mode_pluralises_two_bad_fields(self, shamir_app):
         app, _meta, _shares = shamir_app
@@ -2487,13 +2506,13 @@ class TestValidate:
         app._entries[0].insert(0, "a")
         app._entries[1].insert(0, "b")
         assert app._validate() == \
-            "Shares 1 and 2 don't look right — code shares start with QCSHARE-"
+            "Shares 1 and 2 don't look right: code shares start with QCSHARE-"
 
     def test_raw_mode_names_the_empty_field(self, shamir_app):
         app, _meta, shares = shamir_app
         app._imode.set("raw"); app.update()
         app._entries[0].insert(0, shares[0])
-        assert app._validate() == "Share 2 is empty — this file needs 2 shares"
+        assert app._validate() == "Share 2 is empty; this file needs 2 shares"
 
     def test_raw_mode_validates_when_both_codes_are_present(self, shamir_app):
         app, _meta, shares = shamir_app
@@ -3047,7 +3066,7 @@ class TestVerifyFlow:
 
         assert os.listdir(str(out)) == []
         texts = _widget_texts(app._results)
-        assert f"{ICON['ok']}  Key verified — your credentials are correct" in texts
+        assert f"{ICON['ok']}  Key verified. Your credentials are correct" in texts
         assert app._wiz._active == 2, "verify does not complete the wizard"
         assert app._btn._enabled is True
 
@@ -3097,7 +3116,7 @@ class TestVerifyFlow:
         app._verify_run(PW, None)
         assert _pump_until(app, lambda: not app._busy)
         assert read == [], "the payload must never be touched after a cancel"
-        assert app._err.cget("text") == "Verification cancelled — nothing was written."
+        assert app._err.cget("text") == "Verification cancelled. Nothing was written."
 
     def test_a_cancel_before_the_key_check_writes_nothing(self, loaded_app, tmp_path):
         app, _qcx = loaded_app
@@ -3106,7 +3125,7 @@ class TestVerifyFlow:
         app._cancel = True                 # the worker's own post-derive check
         app._verify_run(PW, None)
         assert _pump_until(app, lambda: not app._busy)
-        assert app._err.cget("text") == "Verification cancelled — nothing was written."
+        assert app._err.cget("text") == "Verification cancelled. Nothing was written."
         assert app._results.winfo_children() == []
 
 
@@ -3122,7 +3141,7 @@ class TestCancellation:
             app._request_cancel()
             assert app._cancel is True
             assert app._cancel_btn._enabled is False
-            assert app._err.cget("text") == "Cancelling — finishing the current step…"
+            assert app._err.cget("text") == "Cancelling. Finishing the current step…"
         finally:
             app._busy = False
             app._cancel = False
@@ -3140,7 +3159,7 @@ class TestCancellation:
                 app._cancel_btn.enable(False)     # what _request_cancel survives
             app._request_cancel()
             assert app._cancel is True
-            assert app._err.cget("text") == "Cancelling — finishing the current step…"
+            assert app._err.cget("text") == "Cancelling. Finishing the current step…"
         finally:
             app._busy = False
             app._cancel = False
@@ -3159,7 +3178,7 @@ class TestCancellation:
         app._cancel = True                 # derive_final_key checks after Argon2id
         app._run(str(out), PW)
         assert _pump_until(app, lambda: not app._busy)
-        assert app._err.cget("text") == "Decryption cancelled — nothing was written."
+        assert app._err.cget("text") == "Decryption cancelled. Nothing was written."
         assert os.listdir(str(out)) == []
         assert app._prog.winfo_manager() == "", "the bar is taken down"
         assert app._btn._enabled is True
@@ -3189,7 +3208,7 @@ class TestCancellation:
         assert app._busy is True
         app._cancel_btn._fire()
         assert _pump_until(app, lambda: not app._busy)
-        assert app._err.cget("text") == "Decryption cancelled — nothing was written."
+        assert app._err.cget("text") == "Decryption cancelled. Nothing was written."
         assert seen["progress"] == app._prog_cb   # the bound method, not a wrapper
 
 
@@ -3253,7 +3272,7 @@ class TestSuccessCard:
         self._prime(app)
         app._done(str(out), 8)
         assert app._orig is None
-        assert "Hidden — shown after decryption" in _widget_texts(app._info_wrap)
+        assert "Hidden; shown after decryption" in _widget_texts(app._info_wrap)
 
     def test_an_unrenderable_timestamp_only_drops_that_fragment(self, loaded_app,
                                                                 tmp_path):
@@ -3559,6 +3578,106 @@ class TestExtractFolder:
         assert _pump_until(app, lambda: not app._busy)
         assert (tmp_path / "solo" / "only file.txt").read_text() == "just me"
 
+    def test_a_lone_top_level_file_lands_inside_a_folder_named_after_the_zip(
+            self, loaded_app, tmp_path, monkeypatch):
+        """A zip holding one file at its top has the one-root shape of a
+        folder archive, but stripping that "root" would leave nothing to
+        write and an empty directory of the file's name."""
+        import quantacrypt.ui.decryptor as dec
+        app, _qcx = loaded_app
+        d = _Dialogs(monkeypatch, dec)
+        monkeypatch.setattr(dec, "reveal_path", lambda p: True)
+        z = self._zip(tmp_path, name="notes.zip", members=[("readme.txt", "hello")])
+        app._extract_folder(z)
+        assert _pump_until(app, lambda: not app._busy)
+        assert (tmp_path / "notes" / "readme.txt").read_text() == "hello"
+        assert not (tmp_path / "readme.txt").exists()
+        assert d.alert_titles == ["Folder extracted"]
+
+    def test_a_sibling_that_merely_starts_with_the_root_name_keeps_it(
+            self, loaded_app, tmp_path, monkeypatch):
+        """The strip is a path component, not a string prefix: "docs-old/b"
+        under a "docs" root must not come out as "-old/b"."""
+        import quantacrypt.ui.decryptor as dec
+        app, _qcx = loaded_app
+        _Dialogs(monkeypatch, dec)
+        monkeypatch.setattr(dec, "reveal_path", lambda p: True)
+        z = self._zip(tmp_path, name="mixed.zip",
+                      members=[("docs/a.txt", "alpha"), ("docs-old/b.txt", "beta"),
+                               ("docsfile", "gamma")])
+        dest = str(tmp_path / "out-sibling")
+        app._busy = True
+        app._extracting = True
+        app._cancel = False
+        app._extract_run(z, dest, "docs", 20, False)
+        assert _pump_until(app, lambda: not app._busy)
+        assert (tmp_path / "out-sibling" / "a.txt").read_text() == "alpha"
+        assert (tmp_path / "out-sibling" / "docs-old" / "b.txt").read_text() == "beta"
+        assert (tmp_path / "out-sibling" / "docsfile").read_text() == "gamma"
+        assert not (tmp_path / "out-sibling" / "-old").exists()
+
+    def test_extracted_files_and_folders_are_private(self, loaded_app, tmp_path,
+                                                     monkeypatch):
+        """The zip came out of a 0600 plaintext; the tree it expands to must
+        not be widened to the process umask."""
+        import quantacrypt.ui.decryptor as dec
+        app, _qcx = loaded_app
+        _Dialogs(monkeypatch, dec)
+        monkeypatch.setattr(dec, "reveal_path", lambda p: True)
+        # No directory entry for x/ or x/y/: those are the levels os.makedirs
+        # would have left at the umask.
+        z = self._zip(tmp_path, name="perm.zip",
+                      members=[("perm/a.txt", "a"), ("perm/sub/b.txt", "b"),
+                               ("perm/empty/", ""), ("perm/x/y/z.txt", "z")])
+        app._extract_folder(z)
+        assert _pump_until(app, lambda: not app._busy)
+        dest = tmp_path / "perm"
+        for d in (dest, dest / "sub", dest / "empty", dest / "x", dest / "x" / "y"):
+            assert os.stat(d).st_mode & 0o777 == 0o700, d
+        for f in (dest / "a.txt", dest / "sub" / "b.txt", dest / "x" / "y" / "z.txt"):
+            assert os.stat(f).st_mode & 0o777 == 0o600, f
+
+    def test_the_extracted_tree_is_quarantined(self, loaded_app, tmp_path,
+                                               monkeypatch):
+        """Same rule as the core's decrypted output: the folder and every
+        file in it are stamped so Gatekeeper looks at an .app inside."""
+        import quantacrypt.ui.decryptor as dec
+        app, _qcx = loaded_app
+        _Dialogs(monkeypatch, dec)
+        monkeypatch.setattr(dec, "reveal_path", lambda p: True)
+        stamped = []
+        monkeypatch.setattr(corepkg, "_mark_quarantined", stamped.append)
+        z = self._zip(tmp_path, name="q.zip",
+                      members=[("q/a.txt", "a"), ("q/sub/b.txt", "b")])
+        app._extract_folder(z)
+        assert _pump_until(app, lambda: not app._busy)
+        dest = tmp_path / "q"
+        assert set(stamped) == {str(dest), str(dest / "a.txt"),
+                                str(dest / "sub" / "b.txt")}
+
+    def test_a_duplicate_entry_is_refused_rather_than_overwritten(
+            self, loaded_app, tmp_path, monkeypatch):
+        """The destination is this run's own fresh tree, so a name that
+        already exists can only be the archive repeating itself."""
+        import warnings
+        import quantacrypt.ui.decryptor as dec
+        app, _qcx = loaded_app
+        d = _Dialogs(monkeypatch, dec)
+        z = tmp_path / "twice.zip"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")           # zipfile's "Duplicate name"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr("twice/a.txt", "first")
+                zf.writestr("twice/a.txt", "second")
+        dest = str(tmp_path / "out-twice")
+        app._busy = True
+        app._extracting = True
+        app._cancel = False
+        app._extract_run(str(z), dest, "twice", 20, False)
+        assert _pump_until(app, lambda: not app._busy)
+        assert not os.path.exists(dest)
+        assert d.alert_titles == ["Extraction failed"]
+
     def test_extraction_is_refused_while_something_else_runs(self, loaded_app,
                                                              tmp_path, monkeypatch):
         import quantacrypt.ui.decryptor as dec
@@ -3583,7 +3702,7 @@ class TestExtractFolder:
         app._extract_run(z, dest, "docs", 2000, False)
         assert _pump_until(app, lambda: not app._busy)
         assert not os.path.exists(dest), "nothing partial may survive"
-        assert app._err.cget("text") == "Extraction cancelled — nothing was kept."
+        assert app._err.cget("text") == "Extraction cancelled. Nothing was kept."
 
     def test_a_cancel_landing_mid_file_is_caught_inside_the_write_loop(self,
                                                                        loaded_app,
@@ -3592,8 +3711,8 @@ class TestExtractFolder:
         """The between-members check cannot help a single huge member: Cancel
         has to be honoured between chunks too, and still take the whole
         half-written destination with it.  The flag is flipped from the
-        per-file ``makedirs`` so it lands *after* that member's loop-top
-        check and *before* its first chunk is written."""
+        per-file directory creation so it lands *after* that member's
+        loop-top check and *before* its first chunk is written."""
         import quantacrypt.ui.decryptor as dec
         app, _qcx = loaded_app
         z = tmp_path / "onebig.zip"
@@ -3601,21 +3720,20 @@ class TestExtractFolder:
             zf.writestr("onebig/big.bin", b"z" * (3 << 20))
         dest = str(tmp_path / "out-midcancel")
 
-        real_makedirs = os.makedirs
+        real_mkdirs = dec._makedirs_private
 
-        def _flip(path, *a, **kw):
-            if kw.get("exist_ok"):        # the per-file call, not the top one
-                app._cancel = True
-            return real_makedirs(path, *a, **kw)
+        def _flip(path):                  # per entry only; the top one is makedirs
+            app._cancel = True
+            return real_mkdirs(path)
 
-        monkeypatch.setattr(dec.os, "makedirs", _flip)
+        monkeypatch.setattr(dec, "_makedirs_private", _flip)
         app._busy = True
         app._extracting = True
         app._cancel = False
         app._extract_run(str(z), dest, "onebig", 3 << 20, False)
         assert _pump_until(app, lambda: not app._busy)
         assert not os.path.exists(dest), "the half-written tree goes with it"
-        assert app._err.cget("text") == "Extraction cancelled — nothing was kept."
+        assert app._err.cget("text") == "Extraction cancelled. Nothing was kept."
 
     def test_an_index_that_lies_about_the_size_aborts(self, loaded_app, tmp_path,
                                                       monkeypatch):
@@ -3850,7 +3968,7 @@ class TestCloseGuards:
             assert app.winfo_exists(), "the window must outlive the worker"
             assert app._close_pending is True and app._cancel is True
             assert app._cancel_btn._enabled is False
-            assert app._err.cget("text").startswith("Cancelling —")
+            assert app._err.cget("text").startswith("Cancelling.")
         finally:
             app._busy = False
             app._close_pending = False
@@ -3870,7 +3988,7 @@ class TestCloseGuards:
             app._close()
             assert app.winfo_exists(), "still never destroyed under a worker"
             assert app._cancel is True and app._close_pending is True
-            assert app._err.cget("text").startswith("Cancelling —")
+            assert app._err.cget("text").startswith("Cancelling.")
         finally:
             app._busy = False
             app._close_pending = False
@@ -3914,7 +4032,7 @@ class TestCloseGuards:
         assert _pump_until(app, lambda: not app._close_pending, timeout=5.0)
         assert app.winfo_exists() and closed_before
         assert app._err.cget("text") == \
-            "Finished before it could be cancelled — see the result below."
+            "Finished before it could be cancelled. See the result below."
         assert app._finished_ok is False
 
     def test_polling_stops_when_the_window_is_gone(self, ui_root, tmp_path,

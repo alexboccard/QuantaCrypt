@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Applied by scripts/build.py to the two PyInstaller bundles (the Tk app
+    and the qc-core helper) when CODESIGN_IDENTITY names a real certificate,
+    i.e. when the hardened runtime is enabled.  Ad-hoc builds never use it.
+
+    disable-library-validation: fusepy loads macFUSE / FUSE-T's libfuse
+    through ctypes, and it is signed by a different Team ID.  Library
+    validation would refuse the dlopen and every volume mount would fail.
+
+    allow-unsigned-executable-memory: cffi (argon2-cffi) and ctypes create
+    libffi closures in writable+executable pages.
+  -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

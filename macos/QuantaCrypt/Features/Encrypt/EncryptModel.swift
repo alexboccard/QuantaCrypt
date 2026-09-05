@@ -14,6 +14,25 @@ struct SharesPresentation: Identifiable {
     let context: ShareFiles.Context
 }
 
+extension EncryptResult {
+    /// The shares to hand over, or nil for a password-mode result.
+    ///
+    /// The file they name is the `.qcx` — the one a recipient is told to
+    /// pick in Decrypt — not the plaintext the helper reports in `filename`.
+    /// A share file that said "one of the 3 keys to report.pdf" and then
+    /// "pick the encrypted file" was read years later by someone who had
+    /// never seen either. The fingerprint is read from the `.qcx` now,
+    /// while it is exactly the file that was just written.
+    func makeSharesPresentation() -> SharesPresentation? {
+        guard let shares, !shares.isEmpty, let threshold, let total else { return nil }
+        return SharesPresentation(
+            shares: shares,
+            context: ShareFiles.Context(stem: Format.stem(output), protectedName: Format.fileName(output),
+                                        k: threshold, n: total, kind: .qcxFile,
+                                        fingerprint: ShareFiles.fingerprint(ofFileAt: output)))
+    }
+}
+
 @MainActor
 @Observable
 final class EncryptModel {
@@ -94,6 +113,13 @@ final class EncryptModel {
 
     static func busyMessage(for path: String) -> String {
         "Finish or cancel the current job to open \(Format.fileName(path))."
+    }
+
+    /// What the drop zone takes: a file URL for something that exists. A
+    /// link dragged out of a browser arrives as a URL too, and its `.path`
+    /// used to become the source, to be answered with "not found".
+    static func acceptsDrop(_ url: URL) -> Bool {
+        url.isFileURL && Paths.exists(url.path)
     }
 
     /// The section that can open `path`, when it is already a QuantaCrypt
@@ -229,12 +255,16 @@ final class EncryptModel {
         self.result = result
         password = ""
         confirmation = ""
-        if let shares = result.shares, !shares.isEmpty, let k = result.threshold, let n = result.total {
-            sharesToShow = SharesPresentation(
-                shares: shares,
-                context: ShareFiles.Context(stem: Format.stem(result.output),
-                                            protectedName: result.filename, k: k, n: n, kind: .qcxFile))
-        }
+        sharesToShow = result.makeSharesPresentation()
+    }
+
+    /// Drop the shares once the user has proven they open `output`. Until
+    /// then "Show shares again" is the only way back from a mis-click on
+    /// "Discard shares"; after it, the saved files are the copy that matters
+    /// and k-of-n shares are the master key sitting in a long-lived model.
+    func forgetShares(for output: String) {
+        guard let result, result.output == output, result.shares != nil else { return }
+        self.result = result.withoutShares()
     }
 
     private func fail(_ error: CoreError) {

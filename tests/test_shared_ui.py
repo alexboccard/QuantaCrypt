@@ -444,6 +444,22 @@ class TestWriteNewPrivateFile:
         assert renamed is False and os.path.getsize(out) == 0
         assert os.stat(out).st_mode & 0o777 == 0o600
 
+    def test_the_share_is_fsynced_before_the_file_is_closed(self, tmp_path,
+                                                            monkeypatch):
+        """The file is the only copy of the key: it has to be on the disk,
+        not in a page cache a power cut would drop."""
+        synced = []
+        real_fsync = os.fsync
+
+        def _spy(fd):
+            synced.append((os.fstat(fd).st_ino, os.fstat(fd).st_size))
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _spy)
+        out, _ = write_new_private_file(str(tmp_path / "a.txt"), "share-1")
+        # One sync, on this file, after the share was flushed into it.
+        assert synced == [(os.stat(out).st_ino, len("share-1"))]
+
 
 # ── safe_after ───────────────────────────────────────────────────────────────
 
@@ -547,7 +563,27 @@ class TestRevealPath:
         calls = self._spy(monkeypatch)
         monkeypatch.setattr(sys, "platform", "darwin")
         assert reveal_path("/tmp/my file.qcx") is True
-        assert calls == [["open", "-R", "/tmp/my file.qcx"]]
+        assert calls == [["open", "-R", "--", "/tmp/my file.qcx"]]
+
+    def test_macos_a_name_starting_with_a_dash_is_not_read_as_flags(
+            self, monkeypatch):
+        """A self-typed output name like -foo.qcx reaches ``open`` behind
+        ``--`` so it is a file, not an option ``open`` rejects."""
+        calls = self._spy(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert reveal_path("-foo.qcx") is True
+        assert calls == [["open", "-R", "--", "-foo.qcx"]]
+
+    def test_linux_hands_xdg_open_an_absolute_path(self, monkeypatch, tmp_path):
+        """xdg-open refuses ``--`` outright, so a relative name is made
+        absolute instead — an absolute path can never start with a dash."""
+        (tmp_path / "-sub").mkdir()
+        calls = self._spy(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.chdir(tmp_path)
+        assert reveal_path("-sub") is True
+        assert calls == [["xdg-open", str(tmp_path / "-sub")]]
+        assert not calls[0][1].startswith("-")
 
     def test_windows_normalises_the_path_for_explorer(self, monkeypatch):
         calls = self._spy(monkeypatch)
@@ -624,14 +660,35 @@ class TestNotify:
     """notify() shells out to osascript; the strings it interpolates come
     from file names and error messages, so the escaping is the contract."""
 
+    class _Proc:
+        """What Popen hands back: a stdin that records the script.  No
+        ``wait``/``communicate`` on purpose — notify() must not block on
+        osascript, so calling either is a failure this double surfaces."""
+
+        def __init__(self):
+            self.script = ""
+            self.closed = False
+            self.stdin = self
+
+        def write(self, s):
+            assert not self.closed
+            self.script += s
+
+        def close(self):
+            self.closed = True
+
     def _spy(self, monkeypatch, fail_first=False, fail_both=False):
+        """Records ``(argv, proc)`` per launch; ``proc.script`` is what went
+        down the pipe."""
         calls = []
 
         def fake_popen(argv, **k):
-            calls.append(argv)
+            proc = self._Proc()
+            calls.append((argv, proc))
             if fail_both or (fail_first and len(calls) == 1):
                 raise OSError("osascript missing")
-            return object()
+            assert k.get("stdin") is subprocess.PIPE and k.get("text") is True
+            return proc
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         return calls
@@ -660,13 +717,27 @@ class TestNotify:
         self._unfocused(tk_root, monkeypatch)
         shared.notify("Encrypted", "vault.qcx is ready")
         assert len(calls) == 1
-        assert calls[0][:4] == ["osascript", "-l", "JavaScript", "-e"]
-        script = calls[0][4]
+        argv, proc = calls[0]
+        assert argv == ["osascript", "-l", "JavaScript", "-"]
+        script = proc.script
         assert 'n.title = "Encrypted";' in script
         assert 'n.informativeText = "vault.qcx is ready";' in script
         assert "NSUserNotificationDefaultSoundName" in script
         assert "contentImage" not in script      # no icon file was found
         assert "deliverNotification(n)" in script
+        assert proc.closed, "stdin is closed so osascript sees EOF and runs"
+
+    def test_the_file_name_never_travels_in_argv(self, tk_root, monkeypatch):
+        """argv is readable by every local process through ``ps``; what was
+        encrypted, decrypted or mounted goes down the pipe instead, on both
+        transports."""
+        calls = self._spy(monkeypatch, fail_first=True)
+        self._unfocused(tk_root, monkeypatch)
+        shared.notify("Decrypted", "tax-return-2025.pdf is ready")
+        assert len(calls) == 2
+        for argv, proc in calls:
+            assert not any("tax-return-2025" in part for part in argv)
+        assert "tax-return-2025.pdf" in calls[1][1].script
 
     def test_a_broken_focus_probe_does_not_block_the_banner(self, tk_root, monkeypatch):
         """The probe is a nicety; if Tk is mid-teardown the banner still goes."""
@@ -688,14 +759,14 @@ class TestNotify:
         calls = self._spy(monkeypatch)
         self._unfocused(tk_root, monkeypatch)
         shared.notify("T", "M", sound=False)
-        assert "soundName" not in calls[0][4]
+        assert "soundName" not in calls[0][1].script
 
     def test_icon_is_attached_when_one_is_found(self, tk_root, monkeypatch):
         calls = self._spy(monkeypatch)
         self._unfocused(tk_root, monkeypatch)
         monkeypatch.setattr(shared, "_find_app_icon", lambda: '/Apps/My "App"/icon.png')
         shared.notify("T", "M")
-        script = calls[0][4]
+        script = calls[0][1].script
         assert 'initByReferencingFile("/Apps/My \\"App\\"/icon.png")' in script
         assert '{forKey: "contentImage"}' in script
 
@@ -704,7 +775,7 @@ class TestNotify:
         calls = self._spy(monkeypatch)
         self._unfocused(tk_root, monkeypatch)
         shared.notify('He said "hi" \\ bye', "line1\r\nline2")
-        script = calls[0][4]
+        script = calls[0][1].script
         assert 'n.title = "He said \\"hi\\" \\\\ bye";' in script
         assert 'n.informativeText = "line1\\nline2";' in script
         assert "\r" not in script and "\n" in script   # only the literal \n pair survives
@@ -714,15 +785,40 @@ class TestNotify:
         self._unfocused(tk_root, monkeypatch)
         shared.notify("Title", "Body")
         assert len(calls) == 2
-        assert calls[1][:2] == ["osascript", "-e"]
-        assert calls[1][2] == ('display notification "Body" '
+        argv, proc = calls[1]
+        assert argv == ["osascript", "-"]
+        assert proc.script == ('display notification "Body" '
                                'with title "Title" sound name "Glass"')
+        assert proc.closed
 
     def test_fallback_drops_the_sound_too(self, tk_root, monkeypatch):
         calls = self._spy(monkeypatch, fail_first=True)
         self._unfocused(tk_root, monkeypatch)
         shared.notify("Title", "Body", sound=False)
-        assert calls[1][2] == 'display notification "Body" with title "Title"'
+        assert calls[1][1].script == 'display notification "Body" with title "Title"'
+
+    def test_a_pipe_that_breaks_falls_back_to_applescript(self, tk_root, monkeypatch):
+        """osascript dying before it reads its stdin is the same failure as
+        not launching: nothing was shown, so the fallback is still owed."""
+        calls = self._spy(monkeypatch)
+        self._unfocused(tk_root, monkeypatch)
+
+        def _broken_write(s):
+            raise BrokenPipeError("osascript exited")
+
+        real_popen = subprocess.Popen
+
+        def _popen(argv, **k):
+            proc = real_popen(argv, **k)
+            if len(calls) == 1:
+                proc.stdin.write = _broken_write
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+        shared.notify("Title", "Body")
+        assert [argv for argv, _ in calls] == [["osascript", "-l", "JavaScript", "-"],
+                                               ["osascript", "-"]]
+        assert calls[0][1].closed, "the broken pipe is still closed"
 
     def test_both_paths_failing_is_silent(self, tk_root, monkeypatch):
         """Documented contract: a notification is never worth crashing a
@@ -782,6 +878,15 @@ class TestDataDir:
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         assert shared._data_dir() == shared._data_dir()
+
+    def test_the_directory_is_private_to_the_user(self, monkeypatch, tmp_path):
+        """It holds the paths of every file decrypted and volume mounted;
+        on a shared Linux host XDG_DATA_HOME is not necessarily 0700."""
+        self._home(monkeypatch, tmp_path)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        d = shared._data_dir()
+        assert os.stat(d).st_mode & 0o777 == 0o700
 
     def test_a_directory_that_cannot_be_created_raises_here_and_is_absorbed_above(
             self, monkeypatch, tmp_path):
@@ -885,6 +990,45 @@ class TestRecentFiles:
         (recents / "recent.json").write_text(
             json.dumps(["a string", 42, None, {"no_path": 1}, {"path": p}]))
         assert [q for q, _ in RecentFiles.load()] == [p]
+
+    def test_an_entry_whose_path_is_not_a_string_is_dropped_not_fatal(self, recents):
+        """``os.path.isfile(None)`` is a TypeError, not a missing file; a
+        hand-edited or half-restored store must never brick start-up."""
+        p = _touch(recents, "a.qcx")
+        (recents / "recent.json").write_text(json.dumps(
+            [{"path": None}, {"path": []}, {"path": {}}, {"path": 0},
+             {"path": 1.5}, {"path": p}]))
+        assert [q for q, _ in RecentFiles.load()] == [p]
+        assert json.load(open(recents / "recent.json")) == [{"path": p}], \
+            "the junk is pruned from disk too"
+        (recents / "recent.json").write_text(json.dumps([{"path": None}]))
+        RecentFiles.add(p)                       # neither writer trips on it
+        RecentFiles.remove(p)
+        assert RecentFiles.load() == []
+
+    def test_the_store_is_private_and_leaves_no_temp_file_behind(self, recents):
+        p = _touch(recents, "a.qcx")
+        RecentFiles.add(p)
+        assert os.stat(recents / "recent.json").st_mode & 0o777 == 0o600
+        assert [f for f in os.listdir(recents) if f.endswith(".tmp")] == []
+
+    def test_a_write_that_fails_midway_keeps_the_previous_store(self, recents,
+                                                               monkeypatch):
+        """The dump goes to a temp file and is renamed over the store, so a
+        crash mid-write can only ever lose the newest entry — never the list."""
+        a, b = _touch(recents, "a.qcx"), _touch(recents, "b.qcx")
+        RecentFiles.add(a)
+        real_replace = os.replace
+
+        def _no_replace(src, dst):
+            if dst.endswith("recent.json"):
+                raise OSError("disk full")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", _no_replace)
+        RecentFiles.add(b)                           # survived, per the contract
+        assert [p for p, _ in RecentFiles.load()] == [a]
+        assert [f for f in os.listdir(recents) if f.endswith(".tmp")] == []
 
     def test_a_corrupt_store_reads_as_empty(self, recents):
         (recents / "recent.json").write_text("{not json")
@@ -1007,6 +1151,18 @@ class TestAppPrefs:
         assert AppPrefs.get("a", "d") == "d"
         AppPrefs.set("a", 1)
         assert AppPrefs.get("a") == 1
+
+    def test_the_file_is_private_and_written_atomically(self, monkeypatch):
+        AppPrefs.set("a", 1)
+        assert os.stat(self.path).st_mode & 0o777 == 0o600
+        assert [f for f in os.listdir(self.path.parent) if f.endswith(".tmp")] == []
+        real_replace = os.replace
+        monkeypatch.setattr(os, "replace", lambda s, d: (
+            (_ for _ in ()).throw(OSError("disk full")) if d.endswith("prefs.json")
+            else real_replace(s, d)))
+        AppPrefs.set("a", 2)
+        assert AppPrefs.get("a") == 1, "the old value survives a failed write"
+        assert [f for f in os.listdir(self.path.parent) if f.endswith(".tmp")] == []
 
     def test_a_json_list_instead_of_an_object_reads_as_empty(self):
         self.path.write_text(json.dumps([1, 2, 3]))
@@ -3510,6 +3666,34 @@ class TestClipboardTimer:
         timer.start("secret")
         timer.cancel()
         assert timer._written is None and timer._change is None
+
+    def test_detaching_the_label_keeps_the_wipe_armed(self, tk_root):
+        """A card that has just been saved drops its countdown label, but
+        the share it copied moments before is still on the clipboard and
+        the wipe is the only thing that will take it off."""
+        timer, lbl = self._timer(tk_root, seconds=5)
+        tk_root.clipboard_clear()
+        tk_root.clipboard_append("secret")
+        timer.start("secret")
+        timer.detach_label()
+        assert lbl.cget("text") == ""
+        assert timer._job is not None, "still counting"
+        assert timer._written == "secret", "the copy is still known"
+        timer._remain = 0
+        timer._tick()
+        with pytest.raises(tk.TclError):
+            tk_root.clipboard_get()
+        assert timer._job is None and timer._written is None
+
+    def test_a_detached_timer_never_touches_the_label_again(self, tk_root):
+        timer, lbl = self._timer(tk_root, seconds=5)
+        timer.start("secret")
+        timer.detach_label()
+        lbl.config(text="something the caller put here")
+        timer._tick()
+        timer._clear()
+        timer.cancel()
+        assert lbl.cget("text") == "something the caller put here"
 
     def test_an_unmarked_copy_says_the_clipboard_may_keep_it(self, tk_root):
         """A countdown that cannot be trusted must not read like one that can:

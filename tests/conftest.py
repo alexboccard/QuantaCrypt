@@ -79,13 +79,16 @@ def _make_qcx(tmp_path, data, password="pw-testpad", filename="test.bin", n=None
         mk  = cc.shamir_recover(sd)
         sk  = cc.aes_gcm_decrypt(mk, base64.b64decode(meta["kyber_sk_enc_nonce"]),
                                   base64.b64decode(meta["kyber_sk_enc"]))
-        ks  = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]))
+        ks  = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]),
+                              cc.validate_kem(meta.get("kem")))
         fk  = cc.xor_bytes(mk, ks)
     else:
-        ak  = cc.argon2id_derive(password.encode(), base64.b64decode(meta["argon_salt"]))
+        ak  = cc.argon2id_derive(password.encode(), base64.b64decode(meta["argon_salt"]),
+                                 meta.get("argon2"))
         sk  = cc.aes_gcm_decrypt(ak, base64.b64decode(meta["kyber_sk_enc_nonce"]),
                                   base64.b64decode(meta["kyber_sk_enc"]))
-        ks  = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]))
+        ks  = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]),
+                              cc.validate_kem(meta.get("kem")))
         fk  = cc.xor_bytes(ak, ks)
     return enc, meta, shares, fk
 
@@ -151,8 +154,6 @@ def _argon2_targets():
     try:
         from quantacrypt.core import crypto as _cc
         mods.append(_cc)
-        from quantacrypt.core import volume as _vol
-        mods.append(_vol)          # imports the names directly
     except Exception:
         pass
     return mods
@@ -188,9 +189,9 @@ def _cheap_argon2(request, monkeypatch):
     if not request.node.get_closest_marker("real_argon2"):
         return
     for mod in _argon2_targets():
-        if _REAL_ARGON2.get("time") is not None:
+        if _REAL_ARGON2.get("time") is not None and hasattr(mod, "ARGON2_TIME_COST"):
             monkeypatch.setattr(mod, "ARGON2_TIME_COST", _REAL_ARGON2["time"])
-        if _REAL_ARGON2.get("memory") is not None:
+        if _REAL_ARGON2.get("memory") is not None and hasattr(mod, "ARGON2_MEMORY_COST"):
             monkeypatch.setattr(mod, "ARGON2_MEMORY_COST", _REAL_ARGON2["memory"])
 
 

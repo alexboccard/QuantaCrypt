@@ -59,7 +59,7 @@ FILE_SUB_DROP   = "Click anywhere · .qcx is QuantaCrypt's encrypted format · o
 FILE_SUB_NODROP = "Click anywhere · .qcx is QuantaCrypt's encrypted format"
 SEC_HINT_EMPTY  = "Open a file to see how it's protected."
 OUT_HINT_EMPTY  = "Open a file first to set the output folder."
-OUT_HINT_LOADED = "Output folder — the original filename will be restored."
+OUT_HINT_LOADED = "Output folder. The original filename will be restored."
 VERIFY_HELP     = ("Verify key only checks that your password or shares are right "
                    "without writing anything to disk.")
 NO_RECOVERY_NOTE = "There is no way to recover this file without the password."
@@ -104,15 +104,35 @@ def _zip_member_ok(name):
     return ".." not in n.split("/")
 
 
+def _makedirs_private(path):
+    """``os.makedirs`` applies its mode to the leaf only, so an archive
+    without directory entries would leave the intermediate folders at the
+    umask.  Every level made here is 0700."""
+    missing = []
+    while not os.path.isdir(path):
+        missing.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    for p in reversed(missing):
+        try:
+            os.mkdir(p, 0o700)
+        except FileExistsError:
+            pass
+
+
 def _open_file(path):
     """Open the decrypted file directly with the system default application."""
     try:
         if sys.platform == "darwin":
-            subprocess.run(["open", path], check=False)
+            # "--": a recovered name starting with a dash is not a flag.
+            subprocess.run(["open", "--", path], check=False)
         elif sys.platform == "win32":
             os.startfile(path)  # type: ignore[attr-defined]
         else:
-            subprocess.run(["xdg-open", path], check=False)
+            # xdg-open rejects "--"; an absolute path cannot start with a dash.
+            subprocess.run(["xdg-open", os.path.abspath(path)], check=False)
     except Exception:
         pass
 
@@ -490,7 +510,7 @@ class MnemonicShareInput(tk.Frame):
             return
         words = text.strip().split()
         if len(words) != 50:
-            alert(top, "Wrong length", f"A share phrase has 50 words — the clipboard has {len(words)}.")
+            alert(top, "Wrong length", f"A share phrase has 50 words; the clipboard has {len(words)}.")
             return
         bad = [w for w in words if w.lower() not in self._wl]
         if bad and not confirm(top, "Unknown words",
@@ -509,7 +529,7 @@ def _protection_label(meta):
     if mode == "single":
         return "A password"
     if mode == "shamir":
-        return (f"A split key — any {meta.get('threshold','?')} of "
+        return (f"A split key. Any {meta.get('threshold','?')} of "
                 f"{meta.get('total','?')} shares unlock it")
     return str(mode)
 
@@ -522,7 +542,7 @@ class FileInfoCard(tk.Frame):
         inner = tk.Frame(self, bg=C["surface"])
         inner.pack(fill="x", padx=SP["l"], pady=SP["s"])
         # Filename is always inside the encrypted payload (revealed after decryption).
-        file_label = orig if orig else "Hidden — shown after decryption"
+        file_label = orig if orig else "Hidden; shown after decryption"
         rows = [
             ("File",        file_label),
             ("Protected by", _protection_label(meta)),
@@ -669,7 +689,7 @@ class DecryptorApp(tk.Toplevel):
         self._err_detail.config(text=detail)
 
     def _flash_busy(self):
-        self._set_status("Busy — please wait for decryption to finish")
+        self._set_status("Busy. Please wait for decryption to finish")
         self.after(2000, lambda: self._set_status("")
                    if self._err.cget("text").startswith("Busy") else None)
 
@@ -712,7 +732,7 @@ class DecryptorApp(tk.Toplevel):
                 self._cancel = True
                 try: self._cancel_btn.enable(False)
                 except Exception: pass
-                self._set_status("Cancelling — this window closes when the current step finishes…")
+                self._set_status("Cancelling. This window closes when the current step finishes…")
                 self._poll_close()
             return
         self.destroy()
@@ -733,7 +753,7 @@ class DecryptorApp(tk.Toplevel):
         self._close_pending = False
         if self._finished_ok:
             self._finished_ok = False
-            self._set_status("Finished before it could be cancelled — see the result below.")
+            self._set_status("Finished before it could be cancelled. See the result below.")
             return
         self._close()
 
@@ -768,13 +788,13 @@ class DecryptorApp(tk.Toplevel):
             parts = raw.split("} {")
         path = parts[0] if parts else ""
         if os.path.isdir(path):
-            self._set_error("That's a folder — drop a single .qcx file instead.")
+            self._set_error("That's a folder. Drop a single .qcx file instead.")
             return
         if not os.path.isfile(path):
-            self._set_error("Nothing usable was dropped — drop a .qcx file, or click the box to choose one.")
+            self._set_error("Nothing usable was dropped. Drop a .qcx file, or click the box to choose one.")
             return
         if len(parts) > 1:
-            self._set_status(f"Only one file can be decrypted at a time — using {os.path.basename(path)}.")
+            self._set_status(f"Only one file can be decrypted at a time, so using {os.path.basename(path)}.")
         self._file_card.load(path)
         self._on_file(path)
 
@@ -904,7 +924,7 @@ class DecryptorApp(tk.Toplevel):
             msg = str(e)
             low = msg.lower()
             if "not a quantacrypt" in low:
-                self._set_error("This isn't a QuantaCrypt .qcx file — choose a file that "
+                self._set_error("This isn't a QuantaCrypt .qcx file. Choose a file that "
                                 "QuantaCrypt encrypted.")
             elif "newer version" in low or "older format" in low:
                 self._set_error(friendly_error(e))
@@ -1002,7 +1022,7 @@ class DecryptorApp(tk.Toplevel):
         mode = meta.get("mode", "?")
         if mode == "shamir":
             k, n = meta.get("threshold", "?"), meta.get("total", "?")
-            protect = (f"A split key — any {k} of {n} shares unlock it "
+            protect = (f"A split key. Any {k} of {n} shares unlock it "
                        f"(Shamir secret sharing)")
         else:
             protect = "A password, slowed down against guessing (Argon2id)"
@@ -1034,7 +1054,7 @@ class DecryptorApp(tk.Toplevel):
             kv_row(body, "Fingerprint", f"{fp}…  (first 64 KB, SHA-256)",
                    label_width=12, wraplength=320)
         tk.Label(win,
-                 text="The original filename and size are encrypted too —\n"
+                 text="The original filename and size are encrypted too.\n"
                       "they're revealed only after a successful decryption.",
                  font=F["small"], bg=C["bg"], fg=C["text3"],
                  justify="left").pack(anchor="w", padx=P2, pady=(SP["s"],0))
@@ -1225,7 +1245,7 @@ class DecryptorApp(tk.Toplevel):
                 else:
                     inp.clear()
             if skipped:
-                self._set_error(f"{_share_list(skipped)} couldn't be read — the code may be damaged.")
+                self._set_error(f"{_share_list(skipped)} couldn't be read; the code may be damaged.")
         else:
             for i, entry in enumerate(self._entries):
                 entry.delete(0, "end")
@@ -1342,7 +1362,7 @@ class DecryptorApp(tk.Toplevel):
         if not self._payload: return "Open a .qcx file first"
         out_dir = self._out.get().strip()
         if not out_dir: return "Choose a folder to save the decrypted file in"
-        if not os.path.isdir(out_dir): return "That output folder doesn't exist — choose another"
+        if not os.path.isdir(out_dir): return "That output folder doesn't exist. Choose another"
         if self._mode_val == "single":
             if not hasattr(self, "_pw") or not self._pw.get(): return "Enter your password"
         else:
@@ -1356,19 +1376,19 @@ class DecryptorApp(tk.Toplevel):
                     return "Incomplete: " + ", ".join(f"Share {i}: {n}/50 words" for i, n in partial)
                 if len(complete) < k:
                     empty = [i+1 for i, inp in enumerate(self._inputs) if not inp.has_input()]
-                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty — "
+                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty; "
                             f"this file needs {k} shares")
             else:
                 vals = [e.get().strip() for e in self._entries]
                 bad_fmt = [i+1 for i, v in enumerate(vals) if v and not v.startswith("QCSHARE-")]
                 if bad_fmt:
                     verb = "don't" if len(bad_fmt) > 1 else "doesn't"
-                    return (f"{_share_list(bad_fmt)} {verb} look right — "
+                    return (f"{_share_list(bad_fmt)} {verb} look right: "
                             f"code shares start with QCSHARE-")
                 good = [v for v in vals if v]
                 if len(good) < k:
                     empty = [i+1 for i, v in enumerate(vals) if not v]
-                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty — "
+                    return (f"{_share_list(empty)} {'is' if len(empty)==1 else 'are'} empty; "
                             f"this file needs {k} shares")
         return None
 
@@ -1403,7 +1423,7 @@ class DecryptorApp(tk.Toplevel):
         k = self._meta.get("threshold", "?") if self._meta else "?"
         n = self._meta.get("total", "?") if self._meta else "?"
         return (f"These shares don't unlock this file. Any {k} of the {n} shares will "
-                f"work, so try swapping in a different share — QuantaCrypt can't tell "
+                f"work, so try swapping in a different share. QuantaCrypt can't tell "
                 f"which one is wrong.")
 
     def _focus_credential(self):
@@ -1576,7 +1596,7 @@ class DecryptorApp(tk.Toplevel):
                 mn_k = sd.get("threshold", 0)
                 if mn_k and mn_k != k:
                     raise ValueError(
-                        f"Share {i} doesn't match this file — it was created for a "
+                        f"Share {i} doesn't match this file. It was created for a "
                         f"different encryption that needs {mn_k} people, but this file "
                         f"needs {k}. Check you have the right shares."
                     )
@@ -1589,7 +1609,7 @@ class DecryptorApp(tk.Toplevel):
                     sd = cc.decode_share(code)
                 except ValueError as ex:
                     raise ValueError(
-                        f"Share {i} can't be read — the code may be incomplete or damaged. "
+                        f"Share {i} can't be read: the code may be incomplete or damaged. "
                         f"Paste the whole QCSHARE- line again."
                     ) from ex
                 slots.append((i, sd, code))
@@ -1600,7 +1620,7 @@ class DecryptorApp(tk.Toplevel):
             key = (sd.get("index"), sd.get("value"))
             if key in seen:
                 raise ValueError(
-                    f"Shares {seen[key]} and {i} are the same share — you need {k} different shares."
+                    f"Shares {seen[key]} and {i} are the same share. You need {k} different shares."
                 )
             seen[key] = i
         return [code for _, _, code in slots[:k]]
@@ -1640,7 +1660,7 @@ class DecryptorApp(tk.Toplevel):
         ok = card(self._results, padx=SP["l"], pady=SP["m"])
         ok.outer.config(highlightbackground=C["success"])
         ok.outer.pack(fill="x", pady=(SP["l"],0))
-        tk.Label(ok, text=f"{ICON['ok']}  Key verified — your credentials are correct",
+        tk.Label(ok, text=f"{ICON['ok']}  Key verified. Your credentials are correct",
                  font=F["body_b"], bg=C["surface"], fg=C["success"]).pack(anchor="w")
         tk.Label(ok, text="Your password / shares decrypted the first block. "
                           "Nothing has been written to disk yet.",
@@ -1783,8 +1803,15 @@ class DecryptorApp(tk.Toplevel):
                            f"This archive expands to {fmt_size(total)} in {len(infos):,} entries. "
                            "Extract it anyway?", yes="Extract", no="Cancel"):
                 return
-        roots = {i.filename.replace("\\", "/").split("/")[0] for i in infos}
+        names = [i.filename.replace("\\", "/") for i in infos]
+        roots = {n.split("/")[0] for n in names}
         single_root = roots.pop() if len(roots) == 1 else None
+        # Only a directory can be stripped.  A lone top-level file has the
+        # same one-root shape, but it must land inside the new folder, not
+        # become an empty folder of its own name.
+        if single_root and any(n.rstrip("/") == single_root and not i.is_dir()
+                               for n, i in zip(names, infos)):
+            single_root = None
         top = single_root or os.path.splitext(os.path.basename(zpath))[0] or "extracted"
         dest, renamed = pkg.unique_path(out_dir, top)
 
@@ -1808,13 +1835,18 @@ class DecryptorApp(tk.Toplevel):
         created = False   # only a directory THIS run made is ever removed
         try:
             try:
-                os.makedirs(dest)
+                # 0700 / 0600 throughout: the archive came out of a 0600
+                # plaintext, and the process umask must not widen it.
+                os.makedirs(dest, mode=0o700)
             except FileExistsError:
                 raise RuntimeError(
                     f"A folder named {os.path.basename(dest)} appeared in "
-                    f"{os.path.dirname(dest)} just before extraction started — "
+                    f"{os.path.dirname(dest)} just before extraction started. "
                     "nothing was extracted.") from None
             created = True
+            # Extracted content is as foreign as the .qcx it came from; the
+            # stamp is what makes Gatekeeper look at an .app inside it.
+            pkg._mark_quarantined(dest)
             real_dest = os.path.realpath(dest)
             with zipfile.ZipFile(zpath) as zf:
                 infos = zf.infolist()
@@ -1823,26 +1855,32 @@ class DecryptorApp(tk.Toplevel):
                     if self._cancel:
                         raise cc.CancelledOperation()
                     rel = info.filename.replace("\\", "/")
-                    if strip_root and rel.startswith(strip_root):
-                        rel = rel[len(strip_root):]
                     parts = [p for p in rel.split("/") if p]
+                    # A whole component, never a string prefix: "docs-old/x"
+                    # must not lose "docs" and turn into "-old/x".
+                    if strip_root and parts and parts[0] == strip_root:
+                        parts = parts[1:]
                     target = os.path.join(dest, *parts) if parts else dest
                     if os.path.commonpath([real_dest, os.path.realpath(target)]) != real_dest:
                         raise ValueError(f"Archive entry escapes the destination: {info.filename}")
                     if info.is_dir() or not parts:
-                        os.makedirs(target, exist_ok=True)
+                        _makedirs_private(target)
                         continue
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with zf.open(info) as src, open(target, "wb") as dst:
+                    _makedirs_private(os.path.dirname(target))
+                    # O_EXCL: the tree is this run's own, so an existing name
+                    # can only be a duplicate entry — refused, not overwritten.
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with zf.open(info) as src, os.fdopen(fd, "wb") as dst:
                         while True:
                             chunk = src.read(1 << 20)
                             if not chunk: break
                             written += len(chunk)
                             if written > declared + (1 << 20):
-                                raise ValueError("Archive contents don't match its index — extraction stopped.")
+                                raise ValueError("Archive contents don't match its index. Extraction stopped.")
                             dst.write(chunk)
                             if self._cancel:
                                 raise cc.CancelledOperation()
+                    pkg._mark_quarantined(target)
                     self._prog_cb(f"Extracting folder... {int(i / n * 100)}%")
             self._after(lambda: self._extract_done(dest, renamed))
         except cc.CancelledOperation:
@@ -1877,12 +1915,12 @@ class DecryptorApp(tk.Toplevel):
 
     def _extract_failed(self, exc):
         self._extract_end(ok=False)
-        self._set_error("Extraction failed — nothing was kept.", friendly_error(exc))
+        self._set_error("Extraction failed. Nothing was kept.", friendly_error(exc))
         alert(self, "Extraction failed", friendly_error(exc))
 
     def _reveal(self, path):
         if not reveal_path(path):
-            self._set_status(f"Couldn't open the file manager — the file is at {path}")
+            self._set_status(f"Couldn't open the file manager. The file is at {path}")
 
     def _reset(self):
         self._payload  = None; self._meta = None; self._orig = None
@@ -1924,13 +1962,13 @@ class DecryptorApp(tk.Toplevel):
             self._cancel_btn.enable(False)
         except Exception:
             pass
-        self._set_status("Cancelling — finishing the current step…")
+        self._set_status("Cancelling. Finishing the current step…")
 
     def _cancelled(self):
         """Post-cancel UI reset."""
         if self._extracting:
             self._extract_end(ok=False)
-            self._set_status("Extraction cancelled — nothing was kept.")
+            self._set_status("Extraction cancelled. Nothing was kept.")
             return
         self._busy = False
         self._cancel = False
@@ -1940,7 +1978,7 @@ class DecryptorApp(tk.Toplevel):
         self._thaw()
         self._wiz.set_step(2)
         what = "Verification" if self._verifying else "Decryption"
-        self._set_status(f"{what} cancelled — nothing was written.")
+        self._set_status(f"{what} cancelled. Nothing was written.")
         notify(f"{what} cancelled", "Nothing was written.", sound=False)
         self._focus_credential()
 
@@ -1967,7 +2005,7 @@ class DecryptorApp(tk.Toplevel):
             text = friendly_error(exc)   # the key was right; this copy is damaged
         elif wrong_key and self._mode_val == "single":
             self._pw_failures += 1
-            text = ("Wrong password — check Caps Lock, use Show to see what you typed, "
+            text = ("Wrong password. Check Caps Lock, use Show to see what you typed, "
                     "and try again.")
             if self._pw_failures >= 3:
                 detail = NO_RECOVERY_NOTE

@@ -2,7 +2,7 @@
   "event": "done",
   "id": "v",
   "result": {
-    "format_version": 1,
+    "format_version": 2,
     "platform": "fixture",
     "python": "0.0.0",
     "version": "0.0.0-fixture"

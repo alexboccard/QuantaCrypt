@@ -1,12 +1,12 @@
 # QuantaCrypt
 
-Post-quantum file encryption for macOS. Protect files with a password or split the key across multiple people — built on quantum-resistant cryptography so your data stays safe even as computing advances.
+Post-quantum file encryption for macOS. Protect files with a password, or split the key across several people so that no one of them can open the file alone.
 
 ---
 
 ## Features
 
-- **Quantum-resistant encryption** — ML-KEM (Kyber-768) key encapsulation + AES-256-GCM streaming for files of any size (see [Security Overview](#security-overview) for the implementation's status)
+- **Quantum-resistant encryption** — ML-KEM-768 (FIPS 203) key encapsulation + AES-256-GCM streaming for files of any size (see [Security Overview](#security-overview) for the implementation's status)
 - **Password or split-key protection** — encrypt with a single password, or split the key across multiple people so no one person can unlock the file alone (k-of-n threshold)
 - **Plain-language interface** — no cryptographic jargon; progress messages, errors, and labels are written for everyday users
 - **50-word recovery phrases** — split-key shares encoded as memorable word phrases for safe offline storage
@@ -43,16 +43,16 @@ python -m quantacrypt
 1. Pick a file (or folder, or multiple files)
 2. Choose **Single Password** or **Split Between People**
 3. Set your password or configure how many people hold shares
-4. Click **Encrypt File →** — the output is a `.qcx` file
+4. Click **Encrypt File →**. The output is a `.qcx` file
 
 **Decrypting a file:**
 1. Open a `.qcx` file (or drag it onto the window)
 2. Enter your password or paste the required number of shares
-3. Click **Decrypt File →** — the original file is restored
+3. Click **Decrypt File →**. The original file is restored
 
 **Split-key mode** works like a vault with multiple keys: you give each person a unique share, and only when enough people combine their shares can the file be unlocked. Quick presets (2-of-3, 3-of-5, 3-of-7) make configuration easy.
 
-> **Note on folder encryption:** folders are first zipped to a hidden staging file (`.<output>.qc-staging-*.zip`, permissions 0600) in the same directory you chose for the encrypted output, then encrypted and deleted. If the app is killed mid-encryption, delete that leftover staging file — it contains your unencrypted data. It is intentionally placed next to your chosen output (not in the system temp directory) so it's visible and on the volume you picked.
+> **Note on folder encryption:** a folder is archived straight into the encrypted output. No plaintext copy of it is written anywhere, not even briefly, so a synced or removable destination never sees your files, and the only extra disk space needed is the output itself. Members that are already compressed (photos, video, archives) are stored as-is inside the archive rather than deflated again; text and documents are deflated.
 
 ---
 
@@ -166,7 +166,7 @@ On success it produces two artifacts in `dist/`:
 python -m pytest tests/ -v
 ```
 
-Coverage reports are generated automatically — a summary prints to the terminal and a detailed HTML report is written to `htmlcov/`.
+Coverage reports are generated automatically: a summary prints to the terminal and a detailed HTML report is written to `htmlcov/`.
 
 ```bash
 open htmlcov/index.html
@@ -211,9 +211,11 @@ until the native one reaches parity.
 [ MAGIC (6 bytes) + length (4 bytes) + JSON metadata tail ]
 ```
 
-**Public metadata** (viewable via Inspect, no password needed): format version, encryption mode, password-hardening salt or public key, payload offset, file fingerprint.
+**Public metadata** (viewable via Inspect, no password needed): format version, encryption mode, the key encapsulation used (`kem`), the Argon2id parameters the file was made with (`argon2`), password-hardening salt, KEM ciphertext and the encrypted KEM private key, payload offset, chunk count. Every one of these fields is covered by an HMAC keyed from the derived key, so an edit to any of them is detected before a byte of payload is read.
 
-**Encrypted metadata** (revealed only after decryption): original filename, file size, encryption timestamp, content SHA-256 hash (verified after decryption to confirm the output matches the original byte-for-byte).
+**Encrypted metadata** (revealed only after decryption): original filename, file size, encryption timestamp.
+
+Files are written as format version 2 (`FORMAT_VERSION` in `core/crypto.py`). Format 1 files, made by earlier releases with the round-3 Kyber-768 class, implicit Argon2id parameters and a whole-file SHA-256 in the encrypted envelope, still open: the reader selects the KEM and parameters the file names, and honours a recorded hash when there is one. Format 2 dropped that hash on purpose: each 4 MB chunk is an AES-GCM unit whose additional data binds its index and a last-chunk flag, and the chunk count is authenticated, so every byte, its order and the length are already proven, and the hash was 75% of encryption time on CPUs without SHA extensions.
 
 ---
 
@@ -221,7 +223,7 @@ until the native one reaches parity.
 
 Encrypted virtual drives that mount as real volumes via FUSE. Each file inside the volume is independently encrypted (Cryptomator-style architecture).
 
-Containers are format version 2 (`VOLUME_FORMAT_VERSION` in `core/volume.py`). Version 1 containers still open; the first save rewrites them as v2.
+Containers are format version 3 (`VOLUME_FORMAT_VERSION` in `core/volume.py`): the layout of version 2 plus a cleartext auth-params block that names its key encapsulation (`kem`) and, for password volumes, its Argon2id parameters (`argon2`). Version 1 containers still open and are rewritten as version 2 on their first save. Version 2 containers (Kyber-768, implicit parameters) open unchanged and keep their version through every compaction, so an older release can still mount them. Everything the app tells you about a volume before you unlock it comes from the cleartext block; on unlock that block is compared with the sealed copy inside the encrypted metadata, so an edited block is reported as tampering rather than as a wrong password.
 
 ```
 [ 512-byte header: magic + version + volume UUID + nonces                ]
@@ -235,9 +237,9 @@ Containers are format version 2 (`VOLUME_FORMAT_VERSION` in `core/volume.py`). V
       ... one record per write / delete / rename / mkdir / rmdir ...
 ```
 
-**Journal and replay:** a save appends records instead of rewriting the container, so its cost is proportional to the edit rather than to the volume. Opening a volume replays those records in order on top of the baseline directory index. Replay stops at the first record that is not complete and authentic, and the next append resumes from exactly that point — so a crash part-way through a save loses only the records that were never fully written, and the volume opens at its last consistent state. A record that is complete but fails authentication is not the crash shape (corruption or a deliberate rollback), and the volume is flagged as suspicious when it opens. Each record's authentication covers its own byte offset, so records cannot be reordered within the file. Once the journal grows large relative to the baseline and past an absolute floor, the next save compacts instead: it rewrites the container with the journal folded in and starts an empty one.
+**Journal and replay:** a save appends records instead of rewriting the container, so its cost is proportional to the edit rather than to the volume. Opening a volume replays those records in order on top of the baseline directory index. Replay stops at the first record that is not complete and authentic, and the next append resumes from exactly that point, so a crash part-way through a save loses only the records that were never fully written, and the volume opens at its last consistent state. A record that is complete but fails authentication is not the crash shape (corruption or a deliberate rollback), and the volume is flagged as suspicious when it opens. Each record's authentication covers its own byte offset, so records cannot be reordered within the file. Deleting or rewriting a file leaves its old bytes in place; once that dead space exceeds 30% of the live data and an 8 MB floor, or the journal holds more than 10,000 records, the next save compacts instead: it rewrites the container with the journal folded in and starts an empty one. A volume that is filled and then emptied therefore shrinks back to a few kilobytes on the save that empties it.
 
-The container grows dynamically as files are added — no pre-allocation needed. Key derivation uses the same Argon2id + Kyber-768 scheme as `.qcx` files. Both password and split-key (Shamir) authentication modes are supported.
+The container grows dynamically as files are added. No pre-allocation is needed. Key derivation uses the same Argon2id + ML-KEM-768 scheme as `.qcx` files. Both password and split-key (Shamir) authentication modes are supported.
 
 **Requirements:** A FUSE backend is needed to mount volumes. On macOS, install [macFUSE](https://osxfuse.github.io/) or FUSE-T via Homebrew. The Python `fusepy` package provides the bindings.
 
@@ -245,9 +247,9 @@ The container grows dynamically as files are added — no pre-allocation needed.
 
 ## Security Overview
 
-- **Key encapsulation:** ML-KEM / Kyber-768 (NIST post-quantum standard, FIPS 203)
+- **Key encapsulation:** ML-KEM-768 (FIPS 203) for every file and volume written by this release; files and volumes made before format 2 / 3 used the round-3 CRYSTALS-Kyber-768 submission and are read with it
 - **Symmetric encryption:** AES-256-GCM with 4 MB streaming chunks
-- **Password hardening:** Argon2id — `time_cost=4`, `memory_cost=64 MB`, `parallelism=1`, 32-byte salt, 64-byte output
+- **Password hardening:** Argon2id — `time_cost=4`, `memory_cost=64 MB`, `parallelism=1`, 32-byte salt, 64-byte output; the parameters are recorded in each container so they can be raised in a later release without stranding existing files (a reader is bounded to 32 passes and 1 GB, so a crafted file cannot ask for more)
 - **Split-key scheme:** Shamir secret sharing over the Mersenne prime M521
 - **Share encoding:** BIP-39 compatible 50-word mnemonic phrases
 - **Clipboard protection:** Auto-clears copied shares after 60 seconds
@@ -255,24 +257,42 @@ The container grows dynamically as files are added — no pre-allocation needed.
 ### What the post-quantum layer is, and what it rests on
 
 The ML-KEM implementation is [`kyber-py`](https://github.com/GiacomoPope/kyber-py)
-(1.2.0 in `requirements-lock.txt`), a pure-Python library. Its own README states:
+(1.2.0 in `requirements-lock.txt`), a pure-Python library — its `ML_KEM_768`
+class for new containers, its `Kyber768` class to read the older ones. Its own README states:
 *"Under no circumstances should this be used for cryptographic applications…
 This is an educational resource and has not been designed to be secure against
 any form of side-channel attack."* It is not constant-time.
 
-What is post-quantum here is the key *encapsulation*: the AES key for a file is a
-Kyber-768 shared secret XORed with the key derived from your password, so it is
+What is post-quantum here is the key *encapsulation*: the AES key for a file is an
+ML-KEM-768 shared secret XORed with the key derived from your password, so it is
 never the password-derived key alone. That shared secret is not an independent
-second factor, though — the Kyber private key is itself stored encrypted under the
+second factor, though: the KEM private key is itself stored encrypted under the
 password-derived key (under the Shamir-recovered master key in split-key mode), so
 anyone who can reach decapsulation already holds that key. The KEM is defence in
 depth over the password, and a side-channel weakness in decapsulation gains an
-attacker nothing they do not already have.
+attacker nothing they do not already have. The primitives the security actually
+rests on — AES-256, SHA-512, HMAC-SHA-256, Argon2id — are symmetric, and
+Grover's algorithm halves rather than breaks them.
 
 A file's security therefore rests on Argon2id over the password you chose — or, in
 split-key mode, on fewer than `k` shares ever coming together. Nothing in this
 project has been independently audited: not the KEM implementation, not the `.qcx`
 and `.qcv` container formats, not the code around them.
+
+### Verifying a download
+
+Every release carries a `SHA256SUMS` file and a signed build-provenance
+attestation. With the DMGs and `SHA256SUMS` in one folder:
+
+```bash
+shasum -a 256 -c SHA256SUMS                      # macOS (sha256sum -c on Linux)
+gh attestation verify QuantaCrypt-native-arm64.dmg --owner alexboccard
+```
+
+The second command proves, against Sigstore's transparency log, that the exact
+bytes you downloaded were produced by this repository's release workflow at a
+named commit. The apps themselves are ad-hoc signed: macOS will show the
+unidentified-developer prompt on first launch until notarization lands.
 
 ---
 

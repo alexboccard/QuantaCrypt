@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import UniformTypeIdentifiers
@@ -23,6 +24,29 @@ enum ShareFiles {
         let k: Int
         let n: Int
         let kind: Kind
+        /// `fingerprint(ofFileAt:)` of the protected file, when it could be
+        /// read. Printed so a share can be matched to its file by more than
+        /// a name that may since have been changed.
+        var fingerprint: String? = nil
+    }
+
+    /// The first 64 KiB of the protected file, hashed with SHA-256 and cut
+    /// to 12 hex characters.
+    ///
+    /// The Tk encryptor (`ui/encryptor.py`) prints exactly this —
+    /// `hashlib.sha256(fh.read(65536)).hexdigest()[:12]` — so a share file
+    /// written by either app names the same `.qcx` the same way. 64 KiB is
+    /// deliberate: it covers the header and key material without reading a
+    /// multi-gigabyte container to print one line. Nil when the file cannot
+    /// be read; the share text then omits the line, as the Tk app does.
+    static let fingerprintBytes = 65536
+    static let fingerprintLength = 12
+
+    static func fingerprint(ofFileAt path: String) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)),
+              let data = try? (handle.read(upToCount: fingerprintBytes) ?? Data()) else { return nil }
+        let hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return String(hex.prefix(fingerprintLength))
     }
 
     /// Where the files ended up and whether the run had to be renamed.
@@ -109,11 +133,13 @@ enum ShareFiles {
         case .qcxFile: ("decrypt", "Encrypted file:  ")
         case .qcvVolume: ("unlock", "Encrypted volume:")
         }
+        // Same label and layout as the Tk encryptor's line.
+        let fingerprintLine = context.fingerprint.map { "File fingerprint:  \($0)...\n" } ?? ""
         var text = """
         QuantaCrypt Share \(share.index) of \(context.n)
         \(rule)
         \(heading) \(context.protectedName)
-        Threshold:         Any \(context.k) of \(context.n) shares are needed to \(noun)
+        \(fingerprintLine)Threshold:         Any \(context.k) of \(context.n) shares are needed to \(noun)
         \(rule)
 
         This file contains one of the \(context.n) keys to \(context.protectedName). \
@@ -163,11 +189,12 @@ enum ShareFiles {
         case .qcxFile: "File:      "
         case .qcvVolume: "Volume:    "
         }
-        var text = "QuantaCrypt Key Shares\nThreshold: \(context.k) of \(context.n)\n\(label)\(context.protectedName)\n\(rule)\n\n"
+        let fingerprintLine = context.fingerprint.map { "Fingerprint (SHA-256 prefix): \($0)...\n" } ?? ""
+        var text = "QuantaCrypt Key Shares\nThreshold: \(context.k) of \(context.n)\n\(label)\(context.protectedName)\n\(fingerprintLine)\(rule)\n\n"
         for share in shares {
-            text += "Share \(share.index) — QCSHARE- code:\n\(share.code)\n\n"
+            text += "Share \(share.index), QCSHARE- code:\n\(share.code)\n\n"
             if let mnemonic = share.mnemonic {
-                text += "Share \(share.index) — 50-word mnemonic:\n\(mnemonic)\n\n"
+                text += "Share \(share.index), 50-word mnemonic:\n\(mnemonic)\n\n"
             }
             text += String(repeating: "-", count: 60) + "\n\n"
         }
@@ -198,7 +225,7 @@ enum ShareFiles {
         var message: String {
             switch self {
             case .tooLarge(let name, let size):
-                return "\(name) is \(Format.bytes(size)) — a share file is a few KB, so this isn't one."
+                return "\(name) is \(Format.bytes(size)). A share file is a few KB, so this isn't one."
             case .notText(let name):
                 return "\(name) isn't a text file."
             case .unreadable(let name):
@@ -259,7 +286,7 @@ enum ShareFiles {
         let codes = count == 1 ? "a QCSHARE- code that is cut short or wrapped"
                                : "\(count) QCSHARE- codes that are cut short or wrapped"
         let tail = switch recovered {
-        case 0: "Nothing in it could be used — copy the code again as one unbroken line."
+        case 0: "Nothing in it could be used. Copy the code again as one unbroken line."
         case 1: "One usable share was loaded from the rest of the file."
         default: "\(recovered) usable shares were loaded from the rest of the file."
         }

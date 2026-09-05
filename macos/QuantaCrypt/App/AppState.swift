@@ -42,6 +42,10 @@ final class AppState {
 
     var section: AppSection? = .encrypt
     var helperStatus: HelperStatus = .starting
+    /// Set when the app bundle — helper included — no longer verifies
+    /// against its own signature. Shown, never enforced: see
+    /// `HelperLocator.bundleIntegrityWarning`.
+    var integrityWarning: String?
 
     static let readmeURL = URL(string: "https://github.com/alexboccard/QuantaCrypt#readme")!
 
@@ -51,10 +55,14 @@ final class AppState {
         self.encrypt = EncryptModel(core: core)
         self.decrypt = DecryptModel(core: core, recents: recents)
         self.volumes = VolumesModel(core: core, recents: recents)
+        // "Check it opens" ends in Decrypt; the shares it proves are still
+        // sitting in Encrypt.
+        decrypt.onVerified = { [weak self] path in self?.encrypt.forgetShares(for: path) }
     }
 
     /// Launch the helper and read its version for the status item.
     func start() {
+        checkBundleIntegrity()
         Task {
             // Without this the status item keeps showing "ready" after the
             // helper has died — the one condition it exists to report.
@@ -65,10 +73,25 @@ final class AppState {
         }
     }
 
+    /// Validate the whole bundle off the main thread — it hashes the app
+    /// and the helper's payload — and surface a failure without blocking
+    /// anything.
+    func checkBundleIntegrity() {
+        Task {
+            let warning = await Task.detached(priority: .utility) {
+                HelperLocator.bundleIntegrityWarning()
+            }.value
+            if let warning {
+                Logger.client.error("bundle integrity check failed: \(warning, privacy: .public)")
+            }
+            integrityWarning = warning
+        }
+    }
+
     static let versionTimeout: Duration = .seconds(20)
     static let versionTimedOut = CoreError(
         code: .helperUnavailable,
-        message: "The encryption helper didn't answer. Try again — if it keeps happening, set its location in Settings or reinstall QuantaCrypt.",
+        message: "The encryption helper didn't answer. Try again. If it keeps happening, set its location in Settings or reinstall QuantaCrypt.",
         detail: "version handshake timed out after 20s")
 
     func refreshHelperStatus() async {

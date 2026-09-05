@@ -79,11 +79,13 @@ def _reveal(path, open_file=False):
         return reveal_path(path)
     try:
         if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
+            # "--": a self-typed output name like -foo.qcx is not a flag.
+            subprocess.Popen(["open", "--", path])
         elif sys.platform == "win32":
             os.startfile(path)  # type: ignore[attr-defined]
         else:
-            subprocess.Popen(["xdg-open", path])
+            # xdg-open rejects "--"; an absolute path cannot start with a dash.
+            subprocess.Popen(["xdg-open", os.path.abspath(path)])
         return True
     except Exception:
         return False
@@ -130,7 +132,7 @@ def _share_file_names(folder, stem, n):
             return names, suffix > 1
     raise FileExistsError(
         errno.EEXIST,
-        f"99 sets of share files named {stem}.share-… already exist here — "
+        f"99 sets of share files named {stem}.share-… already exist here. "
         "choose another folder", folder)
 
 
@@ -153,6 +155,10 @@ class ShareCard(tk.Frame):
                           relief="flat",bd=0,highlightthickness=0,wrap="word",
                           selectbackground=C["accent_dim"])
         bind_context_menu(self._txt)
+        # ⌘C and the context menu's Copy both raise <<Copy>>; routed here
+        # they get the concealed marker and the countdown like the button,
+        # instead of Tk's stock append that a clipboard manager keeps.
+        self._txt.bind("<<Copy>>", self._copy_event)
         self._txt.pack(fill="x",padx=SP["l"],pady=(0,SP["xs"]))
         # The Text sizes itself to its content (see _refresh); the outer
         # canvas owns the wheel, so it must never need to scroll internally.
@@ -205,10 +211,16 @@ class ShareCard(tk.Frame):
             self._copy_btn.set_text(f"{ICON['warn']} Failed")
             self.after(2000, lambda: self._copy_btn.set_text("Copy") if self.winfo_exists() else None)
 
+    def _copy_event(self, _event=None):
+        self._copy()
+        return "break"
+
     def mark_saved(self):
         """Visually indicate this share has been written to a file."""
         try:
-            self._clip_timer.cancel()
+            # Only the label goes: a share copied moments before the save is
+            # still on the clipboard and the wipe must stay armed for it.
+            self._clip_timer.detach_label()
             self._copy_btn.enable(False)
             self._copy_btn.set_text(f"{ICON['ok']} Saved")
             self.config(highlightbackground=C["success"])
@@ -281,7 +293,7 @@ class EncryptorApp(tk.Toplevel):
         # ⌘O / Ctrl+O opens the picker for the current source type
         def _open_shortcut():
             if self._busy:
-                self._flash_status("Busy — please wait for encryption to finish")
+                self._flash_status("Busy. Please wait for encryption to finish")
             elif self._src_type.get() == "batch":
                 self._on_batch_select()
             else:
@@ -290,7 +302,7 @@ class EncryptorApp(tk.Toplevel):
         # ⌘↵ / Ctrl+↵ starts encryption (shows busy message if already running)
         def _submit_shortcut():
             if self._busy:
-                self._flash_status("Busy — please wait for encryption to finish")
+                self._flash_status("Busy. Please wait for encryption to finish")
             else:
                 self._start()
         bind_shortcut(self, "Return", _submit_shortcut)
@@ -328,7 +340,7 @@ class EncryptorApp(tk.Toplevel):
         opts = {"parent": self} if isinstance(self, tk.Misc) else {}
         if not messagebox.askyesno(
                 "Shares not saved",
-                f"Save the shares first — without them, {shown} can never be "
+                f"Save the shares first. Without them, {shown} can never be "
                 f"opened again.\n\nLeave and discard the shares?",
                 icon="warning", default="no", **opts):
             return False
@@ -355,7 +367,7 @@ class EncryptorApp(tk.Toplevel):
 
     def _close(self):
         if self._busy:
-            self._flash_status("Encryption in progress — please wait until it finishes", 3000)
+            self._flash_status("Encryption in progress. Please wait until it finishes", 3000)
             return
         if not self._check_shares_saved(): return
         self.destroy()
@@ -512,7 +524,7 @@ class EncryptorApp(tk.Toplevel):
         self._out.bind("<KeyRelease>", lambda e: self._refresh_step())
         self._out.bind("<Return>", lambda e: self._start())
         self._out_hint = tk.Label(self._out_section,
-            text=".qcx is QuantaCrypt's encrypted format — safe to store or share",
+            text=".qcx is QuantaCrypt's encrypted format, safe to store or share",
             font=F["small"], bg=C["bg"], fg=C["text3"], anchor="w")
         self._out_hint.pack(fill="x", padx=P, pady=(SP["xs"], 0))
 
@@ -594,7 +606,7 @@ class EncryptorApp(tk.Toplevel):
                     dec_sz = "some bytes"
                 self._embed_hint.config(
                     text=f"The .qcx will be {dec_sz} larger. "
-                         f"Recipients on macOS can run it directly — no separate app needed.",
+                         f"Recipients on macOS can run it directly, with no separate app needed.",
                     fg=C["text3"])
             else:
                 self._embed_dec.set(False)
@@ -624,7 +636,7 @@ class EncryptorApp(tk.Toplevel):
                  "• You give each person a unique share (like a unique key)\n"
                  "• No single person can open the file alone\n"
                  "• Only when enough people combine their shares can the file be unlocked\n\n"
-                 "Example: Give 3 family members a share, require any 2 to unlock — "
+                 "Example: Give 3 family members a share, require any 2 to unlock. "
                  "great for wills, team backups, or shared secrets.",
             font=F["caption"],bg=C["surface"],fg=C["text2"],
             justify="left",wraplength=480,anchor="w").pack(padx=SP["m"],pady=SP["s"],fill="x")
@@ -771,7 +783,7 @@ class EncryptorApp(tk.Toplevel):
             if k > 20: k = 20; self._k.set(k); note = "Maximum is 20 people"
             if k > n:
                 k = n; self._k.set(k)
-                note = note or f"Required to unlock can't exceed total people — set to {n}"
+                note = note or f"Required to unlock can't exceed total people; set to {n}"
             if hasattr(self, "_shamir_summary"):
                 self._shamir_summary.config(
                     text=f"Any {k} of {n} people can unlock the file")
@@ -790,7 +802,7 @@ class EncryptorApp(tk.Toplevel):
             self._pw1.config(state="normal"); self._pw2.config(state="normal")
             self._sh_panel.pack_forget()
             self._secret_lbl.config(text="3  PASSWORD")
-            self._mode_hint.config(text="Choose a strong password. It's the only way to unlock the file — we never store it.")
+            self._mode_hint.config(text="Choose a strong password. It's the only way to unlock the file, and we never store it.")
         else:
             # Hide pw panel and disable its fields to remove them from Tab order
             self._pw_panel.pack_forget()
@@ -1028,7 +1040,7 @@ class EncryptorApp(tk.Toplevel):
     def _validate_batch(self):
         if not self._batch_paths: return "Select at least one file"
         missing = [p for p in self._batch_paths if not os.path.isfile(p)]
-        if missing: return f"{len(missing)} file(s) no longer exist — re-select"
+        if missing: return f"{len(missing)} file(s) no longer exist. Re-select"
         out_dir = getattr(self, "_batch_out_var", None) and self._batch_out_var.get().strip()
         if not out_dir: return "Specify an output folder"
         if not os.path.isdir(out_dir): return f"Output folder does not exist: {out_dir}"
@@ -1069,7 +1081,7 @@ class EncryptorApp(tk.Toplevel):
             base = os.path.splitext(path)[0]  # Strip source extension
             self._out.delete(0,"end"); self._out.insert(0, base + ".qcx")
             self._out_auto = True  # still auto-generated
-            self._out_hint.config(text="Auto-generated — click Browse… to choose a different location")
+            self._out_hint.config(text="Auto-generated. Click Browse… to choose a different location")
         self._set_status(""); self._refresh_step()
         self._on_embed_toggle()
         self.title(f"{os.path.basename(path)} — QuantaCrypt · Encrypt")
@@ -1084,21 +1096,21 @@ class EncryptorApp(tk.Toplevel):
         if p:
             self._out.delete(0,"end"); self._out.insert(0,p)
             self._out_auto = False  # Browsed path is user-supplied
-            self._out_hint.config(text=".qcx is QuantaCrypt's encrypted format — safe to store or share")
+            self._out_hint.config(text=".qcx is QuantaCrypt's encrypted format, safe to store or share")
             self._refresh_step()
 
     def _validate(self):
         if self._src_type.get() == "batch": return self._validate_batch()
         if not self._path: return "Select a file or folder first"
         if self._is_folder:
-            if not os.path.isdir(self._path): return "Folder no longer exists — please re-select"
+            if not os.path.isdir(self._path): return "Folder no longer exists. Please re-select"
         else:
             if not os.path.isfile(self._path): return "Select a file first"
         out=self._out.get().strip()
         if not out: return "Specify an output path"
         try:
             if not self._is_folder and os.path.exists(out) and os.path.samefile(self._path,out):
-                return "Output path is the same as the input — choose a different location"
+                return "Output path is the same as the input. Choose a different location"
         except OSError: pass
         if self._is_folder:
             # The plaintext staging zip is created in the output directory;
@@ -1164,7 +1176,7 @@ class EncryptorApp(tk.Toplevel):
             if k == n:
                 if not confirm(self, "All people required",
                                f"\"Required to unlock\" and \"total people\" are both {n}, so every "
-                               "single person must participate — if even one share is lost, the "
+                               "single person must participate. If even one share is lost, the "
                                "file can never be unlocked. For a safety margin, set \"required "
                                f"to unlock\" lower.\n\nContinue with {k}-of-{n}?",
                                yes=f"Continue with {k}-of-{n}", no="Go back", danger=True):
@@ -1373,7 +1385,7 @@ class EncryptorApp(tk.Toplevel):
         total = len(bp["paths"])
         if cancelled:
             skipped = total - n_ok - n_fail
-            self._set_status(f"Cancelled — {n_ok} of {total} files were encrypted; "
+            self._set_status(f"Cancelled. {n_ok} of {total} files were encrypted; "
                              f"{skipped} not started, no partial file was written.")
         else:
             self._set_status("")
@@ -1424,7 +1436,7 @@ class EncryptorApp(tk.Toplevel):
             w_hdr = tk.Frame(warn, bg=C["surface"]); w_hdr.pack(fill="x", padx=SP["l"], pady=(SP["s"],SP["xs"]))
             k = self._result_k or self._k.get()
             tk.Label(w_hdr,
-                     text=f"Save key shares — {len(files_with_shares)} file{'s' if len(files_with_shares)!=1 else ''} need share distribution",
+                     text=f"Save key shares: {len(files_with_shares)} file{'s' if len(files_with_shares)!=1 else ''} need share distribution",
                      font=F["body_b"], bg=C["surface"], fg=C["warning"]).pack(anchor="w")
             tk.Label(warn,
                      text="Each file has its own set of shares. Save individual share files "
@@ -1472,7 +1484,7 @@ class EncryptorApp(tk.Toplevel):
         """_reveal + a status line when the OS handler couldn't be launched."""
         if not _reveal(path, open_file=open_file):
             what = "open the file" if open_file else "open the file manager"
-            self._set_status(f"Couldn't {what} — the file is at {path}")
+            self._set_status(f"Couldn't {what}. The file is at {path}")
 
     def _run(self, p):
         """Worker thread.  core.package.encrypt_to_qcx does the work —
@@ -1552,7 +1564,7 @@ class EncryptorApp(tk.Toplevel):
                      bg=C["surface"],fg=C["text3"]).pack(anchor="w",padx=SP["l"],pady=(0,SP["xs"]))
         if embedded:
             embed_lines = [
-                "Includes the decryptor — recipients can run this file directly on the same OS,",
+                "Includes the decryptor, so recipients can run this file directly on the same OS,",
                 "or open it via quantacrypt on any platform.",
                 # Recipients need execute permission
                 f"Recipients may need to run  chmod +x {os.path.basename(out)}  before executing.",
@@ -1604,7 +1616,7 @@ class EncryptorApp(tk.Toplevel):
                    lambda: self._copy_all_shares(shares), primary=False, small=True)
         self._copy_all_btn.pack(side="left", padx=(SP["s"],0))
         # One sentence on what the three buttons mean for safety
-        tk.Label(warn, text="Saving to files is what protects you — the clipboard clears in 60 s.",
+        tk.Label(warn, text="Saving to files is what protects you; the clipboard clears in 60 s.",
                  font=F["caption"], bg=C["surface"], fg=C["text3"], wraplength=500,
                  anchor="w", justify="left").pack(fill="x", padx=SP["l"], pady=(0,SP["xs"]))
         # Clipboard countdown on its own row
@@ -1628,12 +1640,12 @@ class EncryptorApp(tk.Toplevel):
         can_test = bool(self._on_close)   # decryptor hand-off needs the launcher to return to
         checklist = [
             "1.  Save the shares (one file per person, or one combined file)",
-            "2.  Keep the encrypted .qcx file — it's safe to store anywhere",
+            "2.  Keep the encrypted .qcx file; it's safe to store anywhere",
             (f"3.  Test unlocking it with {k} shares before you hand them out"
              if can_test else
              f"3.  Test unlocking from the Home screen: Decrypt {ICON['arrow']} pick this file "
              f"{ICON['arrow']} enter {k} shares"),
-            "4.  Then give each person only their own share — never the others",
+            "4.  Then give each person only their own share, never the others",
         ]
         for line in checklist:
             tk.Label(steps, text=line, font=F["caption"],
@@ -1665,7 +1677,7 @@ class EncryptorApp(tk.Toplevel):
             DecryptorApp(self.master, payload=pkg, qcx_path=out,
                          on_close=self._on_close, center_at=(cx, cy))
         except Exception as exc:
-            self._set_error(f"Couldn't open the decryptor — {friendly_error(exc)}")
+            self._set_error(f"Couldn't open the decryptor: {friendly_error(exc)}")
             return
         self._shares_pending = set()
         self.destroy()
@@ -1743,7 +1755,7 @@ class EncryptorApp(tk.Toplevel):
             self._cancel_btn.enable(False)
         except Exception:
             pass
-        self._set_status("Cancelling — finishing the current chunk…")
+        self._set_status("Cancelling. Finishing the current chunk…")
 
     def _cancelled(self):
         """Post-cancel UI reset."""
@@ -1753,7 +1765,7 @@ class EncryptorApp(tk.Toplevel):
         self._cancel_row.pack_forget()
         self._thaw()
         self._wiz.set_step(4)
-        self._set_status("Encryption cancelled — no output was written.")
+        self._set_status("Encryption cancelled. No output was written.")
         self.after(20, self._btn.focus_set)
 
     def _fail(self, exc):
@@ -1767,7 +1779,7 @@ class EncryptorApp(tk.Toplevel):
         elif isinstance(exc, BaseException):
             msg = friendly_error(exc)
             if msg == raw or not msg:
-                msg = f"Something went wrong during encryption — {raw or type(exc).__name__}. " \
+                msg = f"Something went wrong during encryption: {raw or type(exc).__name__}. " \
                       "Try a different output location or restart the app."
         else:
             msg = raw or "Something went wrong during encryption. Try a different output location or restart the app."
@@ -1830,7 +1842,7 @@ class EncryptorApp(tk.Toplevel):
                     f"Threshold:         Any {k} of {n} shares are needed to decrypt\n"
                     f"{'='*60}\n\n"
                     f"This file contains one of the {n} keys to {qcx_name or 'the encrypted file'}. "
-                    f"Either format below works — use whichever is easier.\n\n"
+                    f"Either format below works. Use whichever is easier.\n\n"
                     f"KEEP THIS FILE PRIVATE. Do not share it with other shareholders.\n\n"
                     f"── QCSHARE- code (for copy-paste) ──────────────────────\n"
                     f"{s}\n\n"
@@ -1879,7 +1891,7 @@ class EncryptorApp(tk.Toplevel):
         if run_renamed or renamed:
             shown = [os.path.basename(p) for p in saved] if run_renamed else renamed
             note += ("\nShare files with that name already existed there, so these were saved as "
-                     + ", ".join(shown) + " — the earlier files were left untouched.")
+                     + ", ".join(shown) + ". The earlier files were left untouched.")
         EncryptorApp._show_saved_banner(
             self, target, f"{n} share files saved", os.path.basename(folder), note,
             saved[0] if saved else folder)
@@ -1931,9 +1943,9 @@ class EncryptorApp(tk.Toplevel):
         # the user in an unsaved-shares dialog they can never clear.
         text = f"QuantaCrypt Key Shares\nThreshold: {k} of {n}{qcx_ref}\n{'='*60}\n\n"
         for i,s in enumerate(shares,1):
-            text += f"Share {i} — QCSHARE- code:\n{s}\n\n"
+            text += f"Share {i}, QCSHARE- code:\n{s}\n\n"
             mn=mnemonics[i-1]
-            if mn: text += f"Share {i} — 50-word mnemonic:\n{mn}\n\n"
+            if mn: text += f"Share {i}, 50-word mnemonic:\n{mn}\n\n"
             text += "-"*60+"\n\n"
         try:
             # 0600 + O_EXCL — an existing file with that name is somebody's
@@ -1954,7 +1966,7 @@ class EncryptorApp(tk.Toplevel):
         note = "Recommended: test decryption with one share set before distributing."
         if renamed:
             note += (f"\nA file with that name already existed, so this one was saved as "
-                     f"{os.path.basename(p)} — the earlier file was left untouched.")
+                     f"{os.path.basename(p)}. The earlier file was left untouched.")
         self._show_saved_banner(
             getattr(self, "_shares_warn", None), "Shares saved", os.path.basename(p), note, p)
 

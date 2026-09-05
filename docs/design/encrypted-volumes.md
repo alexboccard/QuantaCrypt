@@ -76,3 +76,17 @@ Three new core modules:
 - 283 tests passing (volume crypto, FUSE ops, auth params, graceful shutdown, edge cases)
 - Coverage: 97% on `core/` modules
 - All crypto uses `secrets.token_bytes()` per project convention
+
+## 2026-09-04 addendum — format version 3
+
+Format 3 keeps the version-2 layout and adds two fields to the cleartext
+auth-params block and to the sealed metadata: `kem` (ML-KEM-768 for every
+new volume; absent means the round-3 Kyber-768 that versions 1 and 2 used)
+and, for password volumes, `argon2` (`{t, m, p}`, the parameters the volume
+was made with, so the shipped cost can be raised later without stranding
+existing volumes; a reader is bounded to t ≤ 32, m ≤ 1 GiB). `open()`
+compares every cleartext auth-params field with its sealed copy, so an
+edited block is reported as tampering, not as a wrong password. `compact()`
+preserves a container's version (a 2 stays a 2) because the new fields are
+creation-time facts a rewrite cannot add. Design record:
+`docs/design/audit-2026-09.md`, decision D7.

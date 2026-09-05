@@ -522,6 +522,7 @@ class TestLoadPkgFormat:
     def _make_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
+            "kem": cc.KEM_DEFAULT, "argon2": cc.argon2_params(),
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
             "kyber_sk_enc":"aa==","payload_nonce":"aa==","payload_chunk_count":1,
             "filename_nonce":"aa==","filename_enc":"aa==","hmac":"x",
@@ -654,6 +655,7 @@ class TestLoadPkgVersionCheck:
     def _min_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
+            "kem": cc.KEM_DEFAULT, "argon2": cc.argon2_params(),
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
             "kyber_sk_enc":"aa==","payload_nonce":"aa==","payload_chunk_count":1,
             "filename_nonce":"aa==","filename_enc":"aa==","hmac":"x",
@@ -753,7 +755,7 @@ class TestValidateLogic:
         if not out: return "Specify an output path"
         try:
             if os.path.exists(out) and os.path.samefile(path, out):
-                return "Output path is the same as the input — choose a different location"
+                return "Output path is the same as the input. Choose a different location"
         except OSError: pass
         if mode == "single":
             if not pw1: return "Password cannot be empty"

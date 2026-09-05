@@ -142,3 +142,40 @@ Deviations from the original proposal:
 Test coverage: `TestFormatV2Journal` exercises replay of each op type,
 auto-compact trigger, v1→v2 upgrade, truncated-journal tolerance, and
 corrupt-record skip. Core coverage held at ≥ 95 %.
+
+## 2026-09-04 addendum — compaction trigger, tombstones, compaction temp file
+
+Measured in the audit (`docs/design/audit-2026-09.md`): replay cost is per
+record (bodies are seeked over), so journal *size* predicted neither open
+latency nor wasted disk. Two consequences of the 30 %-of-baseline rule:
+
+- a volume that was filled and emptied kept its full size forever — the
+  delete records were tiny, so the ratio never fired (2,000 files deleted:
+  container grew by 174 KB and 138 MB of dead blobs stayed);
+- 25 MB of fresh, live writes on a 64 MB baseline forced a full rewrite for
+  no benefit.
+
+`save()` now compacts when the **dead bytes** (data region minus the live
+blobs actually on disk — deleted files, superseded versions, record headers)
+exceed 30 % of the live bytes and the 8 MB floor, or when the journal holds
+more than 10,000 records. Delete-all now compacts back to an empty container
+on the save that empties it; a rewrite-heavy workload compacts at the same
+point as before.
+
+Two further changes from the same audit:
+
+- **Tombstones before a write of the same path are dropped.** The editor
+  atomic-save pattern emitted `[delete /final][write /final]`; a disk-full
+  error while writing the body left the complete tombstone durable and the
+  next open showed the file missing with nothing suspicious to report
+  (reproduced). Replay's write sets the entry unconditionally, so the
+  tombstone was redundant; without it the same failure keeps the previous
+  content.
+- **`compact()` writes through `mkstemp`** (`.<name>.qc-compact-*`) and
+  copies the container's permission bits onto the replacement. The fixed
+  `<path>.tmp` opened with the umask widened a 0600 container to 0644 on its
+  first compaction, and was a symlink target.
+- **Blob reads use one `pread()` descriptor** for the container's life
+  (reopened after a compaction replaces the inode). Opening the file per 64 KB
+  chunk was 44 µs against 2.5 µs for the read itself; an LRU-miss FUSE read
+  went from 0.12 ms to 0.05 ms.

@@ -10,7 +10,7 @@ final class DecryptModel {
     static let inspectTimeout: Duration = .seconds(20)
     static let inspectTimedOut = CoreError(
         code: .helperUnavailable,
-        message: "The encryption helper didn't answer. Try again — if it keeps happening, restart the helper in Settings.",
+        message: "The encryption helper didn't answer. Try again. If it keeps happening, restart the helper in Settings.",
         detail: "inspect timed out after 20s")
 
     /// Re-run the inspection for the file already on screen.
@@ -44,6 +44,10 @@ final class DecryptModel {
     /// Set when the user arrives from "Check it opens" on the encrypt result,
     /// so Decrypt can say why it is showing them this file.
     var verifyPrompt = false
+    /// Called with the file's path when Verify proves the credential. The
+    /// encrypt model listens so it can drop the shares it kept for "Show
+    /// shares again" once they are known to work.
+    var onVerified: ((String) -> Void)?
     private var wrongPasswordCount = 0
     private var task: Task<Void, Never>?
 
@@ -180,7 +184,7 @@ final class DecryptModel {
                     Task { @MainActor [weak self] in self?.progress = p }
                 }
                 if verifyOnly {
-                    finishVerify()
+                    finishVerify(path: path)
                 } else {
                     finish(try raw.decoded(as: DecryptResult.self), path: path)
                 }
@@ -193,13 +197,14 @@ final class DecryptModel {
         }
     }
 
-    private func finishVerify() {
+    private func finishVerify(path: String) {
         isRunning = false
         isCancelling = false
         progress = nil
         verifiedNote = info?.isSplitKey == true
             ? "These shares unlock the file. Nothing was written."
             : "The password is correct. Nothing was written."
+        onVerified?(path)
     }
 
     private func finish(_ result: DecryptResult, path: String) {
@@ -243,7 +248,7 @@ final class DecryptModel {
             let n = info.total.map(String.init) ?? "its"
             return (CoreError(
                 code: error.code,
-                message: "These shares don't unlock this file. Any \(k) of the \(n) shares will work, so try swapping in a different share — QuantaCrypt can't tell which one is wrong.",
+                message: "These shares don't unlock this file. Any \(k) of the \(n) shares will work, so try swapping in a different share. QuantaCrypt can't tell which one is wrong.",
                 detail: error.detail), nil)
         }
         return (CoreError(code: error.code,

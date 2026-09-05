@@ -24,7 +24,7 @@ final class VolumesModel {
 
     static func timedOut(_ what: String, after seconds: Int) -> CoreError {
         CoreError(code: .helperUnavailable,
-                  message: "The encryption helper didn't answer. Try again — if it keeps happening, restart the helper in Settings.",
+                  message: "The encryption helper didn't answer. Try again. If it keeps happening, restart the helper in Settings.",
                   detail: "\(what) timed out after \(seconds)s")
     }
 
@@ -125,7 +125,7 @@ final class VolumesModel {
             if userInitiated {
                 fuseCheckNote = check.ok
                     ? "Disk mounting is ready."
-                    : (before == check ? "Checked just now — still missing: \(check.missingSummary)."
+                    : (before == check ? "Checked just now. Still missing: \(check.missingSummary)."
                                        : "Still missing: \(check.missingSummary).")
             }
         } catch let error as CoreError {
@@ -160,7 +160,7 @@ final class VolumesModel {
         let name = createName.trimmingCharacters(in: .whitespacesAndNewlines)
         if name.isEmpty { return "Give the volume a name." }
         if name.contains("/") { return "The name can't contain a slash." }
-        if Paths.exists(createPath) { return "\(Format.fileName(createPath)) already exists — choose another name or location." }
+        if Paths.exists(createPath) { return "\(Format.fileName(createPath)) already exists. Choose another name or location." }
         switch createMode {
         case .password:
             if createPassword.isEmpty { return "Enter a password." }
@@ -387,7 +387,7 @@ final class VolumesModel {
         case .unknown:
             return fuseError == nil
                 ? "Checking whether this Mac can open volumes as drives…"
-                : "Couldn't check whether this Mac can mount volumes — the helper isn't responding."
+                : "Couldn't check whether this Mac can mount volumes: the helper isn't responding."
         case .missing: return "Install disk mounting support first."
         }
     }
@@ -440,7 +440,7 @@ final class VolumesModel {
                              detail: error.detail)
         case .wrongCredentials:
             return CoreError(code: error.code,
-                             message: "These shares don't unlock this volume. Try swapping in a different share — QuantaCrypt can't tell which one is wrong.",
+                             message: "These shares don't unlock this volume. Try swapping in a different share. QuantaCrypt can't tell which one is wrong.",
                              detail: error.detail)
         case .permissionDenied:
             return CoreError(code: error.code,
@@ -468,6 +468,11 @@ final class VolumesModel {
         // the master key. Leaving them live in an @Observable model, rendered
         // in plain TextFields, outlasts the operation they were typed for.
         mountShares = mountShares.map { _ in ShareEntry() }
+        // The create result was kept for "Show shares again"; a volume that
+        // has now been unlocked with those shares has proven them, and the
+        // result row would otherwise carry the master key for the rest of
+        // the session. (`createVolume` clears it at the start of a new one.)
+        if createResult?.path == path { createResult = nil }
         recents.add(path, kind: .mounted)
         let volume = MountedVolume(mountPoint: result.mountPoint, volumePath: result.volumePath ?? path, stats: nil)
         if result.journalSuspicious {
@@ -506,7 +511,11 @@ final class VolumesModel {
             // that the list is wrong, never what went wrong.
             listFailures += 1
             listLoaded = true
-            Logger.client.error("volume_list failed (\(self.listFailures, privacy: .public) in a row): \(String(describing: error), privacy: .public)")
+            // The code is enough to tell a dead helper from a slow one; the
+            // description can quote the helper's message, which names mount
+            // points, so it is redacted unless the log is read with privacy.
+            let code = (error as? CoreError)?.code.rawValue ?? (error is TimeoutError ? "timeout" : "internal")
+            Logger.client.error("volume_list failed (\(self.listFailures, privacy: .public) in a row): \(code, privacy: .public) \(String(describing: error), privacy: .private)")
         }
     }
 

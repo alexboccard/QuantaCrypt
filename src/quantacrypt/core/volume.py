@@ -33,6 +33,7 @@ import secrets
 import stat
 import struct
 import tempfile
+import threading
 import time
 import uuid
 from typing import IO, Any, Callable
@@ -40,12 +41,14 @@ from typing import IO, Any, Callable
 from quantacrypt.core.crypto import (
     CancelledOperation,
     KEY_BYTES,
+    KEM_DEFAULT,
     reject_weak_secret,
-    ARGON2_TIME_COST,
-    ARGON2_MEMORY_COST,
     CHUNK_SIZE,
     SHAMIR_PRIME,
     argon2id_derive,
+    argon2_params,
+    validate_argon2_params,
+    validate_kem,
     kyber_keygen,
     kyber_encaps,
     kyber_decaps,
@@ -58,6 +61,7 @@ from quantacrypt.core.crypto import (
     shamir_recover,
     encode_share,
     decode_share,
+    _hmac_fields,
     _meta_hmac,
     _verify_meta_hmac,
     _chunk_nonce,
@@ -70,29 +74,44 @@ logger = logging.getLogger(__name__)
 # ── Volume constants ────────────────────────────────────────────────────────
 
 VOLUME_MAGIC = b"QCVOL\x01"
-VOLUME_FORMAT_VERSION = 2
+# 1: baseline only.  2: append-only journal after the baseline (the layout
+# every later version keeps).  3: the auth-params block names its KEM
+# (``kem``: ML-KEM-768 for new volumes) and, in password mode, records its
+# Argon2id parameters (``argon2``); a block without them is the Kyber-768 /
+# shipped-parameters container that versions 1 and 2 wrote.  compact() keeps
+# a container's version (a 2 stays a 2) so older builds can still open it.
+VOLUME_FORMAT_VERSION = 3
+#: The first version with the journal layout; anything below it is rewritten
+#: as a baseline on its first save.
+_JOURNAL_FORMAT_VERSION = 2
 HEADER_SIZE = 512
 
 # Volume uses smaller chunks than .qcx for better random-access performance.
 # 64 KB balances GCM overhead (~0.025%) against seek granularity.
 VOLUME_CHUNK_SIZE = 64 * 1024  # 64 KB
 
-# Format v2: append-only journal after the baseline blobs.  When the journal
-# exceeds this ratio of the baseline size, save() performs a full compact
-# instead of appending.  See docs/design/volumes-delta-save.md.
+# Journal compaction.  Replay cost is per record (bodies are seeked over),
+# and disk cost is the dead bytes that deletes and overwrites leave behind
+# — journal *size* was a proxy for neither, so a volume that was filled and
+# emptied kept its full size forever while a large journal of live writes
+# was rewritten for nothing.  save() compacts when dead bytes exceed this
+# ratio of the live bytes AND the floor, or when the record count exceeds
+# _JOURNAL_COMPACT_RECORDS.  See docs/design/volumes-delta-save.md.
 _JOURNAL_COMPACT_RATIO = 0.3
-
-# Minimum journal size before the ratio-based compact trigger fires, and
-# minimum total journal size for the empty-baseline guard.  Raised from
-# 1 MB to 8 MB so small / freshly-created volumes don't rewrite the whole
-# container every few edits.
-_JOURNAL_COMPACT_FLOOR = 8 << 20  # 8 MB
+_JOURNAL_COMPACT_FLOOR = 8 << 20  # 8 MB of dead space before a rewrite is worth it
+_JOURNAL_COMPACT_RECORDS = 10_000  # ~1 s of replay at open()
 
 # Guard rails for journal record sizes — prevent a malicious or truncated
 # file from directing us to allocate gigabytes before we detect corruption.
 # (These are "obviously too big" bounds, not tight limits.)
 _JOURNAL_MAX_HEADER_CT = 1 << 20  # 1 MB of encrypted header JSON is absurd
 _JOURNAL_MIN_HEADER_CT = 16       # at minimum, GCM tag
+
+# Same idea for the two length-prefixed blocks read before anything is
+# authenticated: the auth-params JSON is a few hundred bytes, and a
+# million-entry directory index is ~250 MB.
+_MAX_AUTH_PARAMS = 1 << 20   # 1 MiB
+_MAX_BLOCK = 1 << 30         # 1 GiB
 
 def _validate_vpath(vpath: str) -> None:
     """Reject non-absolute or traversal-containing virtual paths.
@@ -140,11 +159,12 @@ def write_header(
     volume_id: bytes,
     meta_nonce: bytes,
     dir_nonce: bytes,
+    version: int = VOLUME_FORMAT_VERSION,
 ) -> None:
     """Write a 512-byte .qcv header at the current file position."""
     header = bytearray(HEADER_SIZE)
     header[_OFF_MAGIC:_OFF_MAGIC + 6] = VOLUME_MAGIC
-    struct.pack_into(">I", header, _OFF_VERSION, VOLUME_FORMAT_VERSION)
+    struct.pack_into(">I", header, _OFF_VERSION, version)
     header[_OFF_VOL_ID:_OFF_VOL_ID + 16] = volume_id
     header[_OFF_META_NONCE:_OFF_META_NONCE + 12] = meta_nonce
     header[_OFF_DIR_NONCE:_OFF_DIR_NONCE + 12] = dir_nonce
@@ -217,10 +237,22 @@ def _read_auth_params(f: IO[bytes]) -> dict:
     if len(raw_len) < 4:
         raise ValueError("Unexpected end of volume file reading auth params length")
     payload_len = struct.unpack(">I", raw_len)[0]
+    if payload_len > _MAX_AUTH_PARAMS:
+        raise ValueError("Volume auth params block is implausibly large; the file may be corrupt")
     payload = f.read(payload_len)
     if len(payload) < payload_len:
         raise ValueError("Unexpected end of volume file reading auth params data")
-    return json.loads(payload)
+    try:
+        auth = json.loads(payload)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("Volume auth params are not valid JSON; the file may be corrupt") from exc
+    if not isinstance(auth, dict):
+        raise ValueError("Volume auth params are not an object; the file may be corrupt")
+    # Validated here, before any key derivation reads them.
+    validate_kem(auth.get("kem"))
+    if "argon2" in auth:
+        validate_argon2_params(auth["argon2"])
+    return auth
 
 
 def read_volume_auth_params(path: str) -> tuple[dict, dict]:
@@ -250,6 +282,8 @@ def _read_encrypted_block(f: IO[bytes]) -> bytes:
     if len(raw_len) < 4:
         raise ValueError("Unexpected end of volume file reading block length")
     ct_len = struct.unpack(">I", raw_len)[0]
+    if ct_len > _MAX_BLOCK:
+        raise ValueError("Volume block is implausibly large; the file may be corrupt")
     ct = f.read(ct_len)
     if len(ct) < ct_len:
         raise ValueError("Unexpected end of volume file reading block data")
@@ -455,14 +489,14 @@ def decrypt_file_data(
     for i in range(chunk_count):
         is_last = (i == chunk_count - 1)
         if pos + 8 > len(blob):
-            raise ValueError("File data truncated — missing chunk header")
+            raise ValueError("File data truncated: missing chunk header")
         seq = struct.unpack_from(">I", blob, pos)[0]
         if seq != i:
             raise ValueError(f"Chunk sequence mismatch at {i} (got {seq})")
         ct_len = struct.unpack_from(">I", blob, pos + 4)[0]
         pos += 8
         if pos + ct_len > len(blob):
-            raise ValueError("File data truncated — incomplete chunk")
+            raise ValueError("File data truncated: incomplete chunk")
         ct = blob[pos:pos + ct_len]
         pos += ct_len
 
@@ -472,8 +506,8 @@ def decrypt_file_data(
             plain = cipher.decrypt(nonce, ct, aad)
         except Exception:
             raise ValueError(
-                f"Authentication failed on chunk {i} — "
-                "data may be corrupt or the wrong key was used"
+                f"Authentication failed on chunk {i}: "
+                "the data may be corrupt or the wrong key was used"
             )
         plaintext_parts.append(plain)
 
@@ -483,17 +517,29 @@ def decrypt_file_data(
 # ── Key derivation for volumes ──────────────────────────────────────────────
 # Reuses the exact same scheme as .qcx files.
 
+def _auth_bytes(meta: dict, key: str) -> bytes:
+    v = meta[key]
+    if not isinstance(v, str):
+        raise ValueError(f"Volume auth field {key!r} is not text; the file may be corrupt")
+    try:
+        return base64.b64decode(v, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Volume auth field {key!r} is not valid; the file may be corrupt") from exc
+
+
 def derive_volume_key_single(password: str, meta: dict) -> bytes:
     """Derive the final key for a password-protected volume.
 
     Expects meta to contain: argon_salt, kyber_kem_ct, kyber_sk_enc_nonce,
-    kyber_sk_enc (all base64-encoded).
+    kyber_sk_enc (all base64-encoded), plus — from format 3 — ``kem`` and
+    ``argon2``; absent, the legacy KEM and the shipped parameters apply.
     """
-    def d64(k): return base64.b64decode(meta[k])
+    def d64(k): return _auth_bytes(meta, k)
 
-    argon_key = argon2id_derive(password.encode(), d64("argon_salt"))
+    kem = validate_kem(meta.get("kem"))
+    argon_key = argon2id_derive(password.encode(), d64("argon_salt"), meta.get("argon2"))
     sk = aes_gcm_decrypt(argon_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
-    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"))
+    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"), kem)
     return xor_bytes(argon_key, kem_ss)
 
 
@@ -501,14 +547,15 @@ def derive_volume_key_shamir(share_strings: list[str], meta: dict) -> bytes:
     """Derive the final key for a Shamir-protected volume.
 
     Expects meta to contain: kyber_kem_ct, kyber_sk_enc_nonce, kyber_sk_enc
-    (all base64-encoded).
+    (all base64-encoded), plus ``kem`` from format 3.
     """
-    def d64(k): return base64.b64decode(meta[k])
+    def d64(k): return _auth_bytes(meta, k)
 
+    kem = validate_kem(meta.get("kem"))
     share_dicts = [decode_share(s) for s in share_strings]
     master_key = shamir_recover(share_dicts)
     sk = aes_gcm_decrypt(master_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
-    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"))
+    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"), kem)
     return xor_bytes(master_key, kem_ss)
 
 
@@ -583,16 +630,17 @@ def create_volume_single(
 
     _p("Deriving 512-bit password key (Argon2id)...")
     argon_salt = secrets.token_bytes(32)
-    argon_key = argon2id_derive(password.encode(), argon_salt)
+    argon2 = argon2_params()
+    argon_key = argon2id_derive(password.encode(), argon_salt, argon2)
 
-    _p("Generating Kyber-768 keypair...")
-    pk, sk = kyber_keygen()
+    _p("Generating ML-KEM-768 keypair...")
+    pk, sk = kyber_keygen(KEM_DEFAULT)
 
     _p("Encapsulating + HKDF-SHA-512 expanding to 512 bits...")
-    kem_ct, kem_ss = kyber_encaps(pk)
+    kem_ct, kem_ss = kyber_encaps(pk, KEM_DEFAULT)
     final_key = xor_bytes(argon_key, kem_ss)
 
-    _p("Encrypting Kyber private key...")
+    _p("Encrypting KEM private key...")
     sk_nonce, sk_ct = aes_gcm_encrypt(argon_key, sk)
 
     # Build metadata
@@ -600,13 +648,17 @@ def create_volume_single(
     volume_id = uuid.uuid4().bytes
 
     auth_fields = {
+        "kem":                KEM_DEFAULT,
+        "argon2":             argon2,
         "argon_salt":         b64(argon_salt),
         "kyber_kem_ct":       b64(kem_ct),
         "kyber_sk_enc_nonce": b64(sk_nonce),
         "kyber_sk_enc":       b64(sk_ct),
     }
 
-    # Auth params stored unencrypted so mounting can derive the key
+    # Auth params stored unencrypted so mounting can derive the key.  open()
+    # checks this block against the sealed copy in the metadata, so
+    # tampering with it can only produce a wrong key, never a wrong story.
     auth_params = {
         "mode": "single",
         **auth_fields,
@@ -620,7 +672,7 @@ def create_volume_single(
         "created_at": int(time.time()),
         **auth_fields,
     }
-    metadata["hmac"] = _meta_hmac(final_key, auth_fields)
+    metadata["hmac"] = _meta_hmac(final_key, _hmac_fields(metadata))
 
     # Empty directory
     dir_index: dict[str, Any] = {}
@@ -656,14 +708,14 @@ def create_volume_shamir(
     _p("Generating 512-bit random master key...")
     master_key = secrets.token_bytes(KEY_BYTES)
 
-    _p("Generating Kyber-768 keypair...")
-    pk, sk = kyber_keygen()
+    _p("Generating ML-KEM-768 keypair...")
+    pk, sk = kyber_keygen(KEM_DEFAULT)
 
     _p("Encapsulating + HKDF-SHA-512 expanding to 512 bits...")
-    kem_ct, kem_ss = kyber_encaps(pk)
+    kem_ct, kem_ss = kyber_encaps(pk, KEM_DEFAULT)
     final_key = xor_bytes(master_key, kem_ss)
 
-    _p("Encrypting Kyber private key under master key...")
+    _p("Encrypting KEM private key under master key...")
     sk_nonce, sk_ct = aes_gcm_encrypt(master_key, sk)
 
     _p(f"Splitting 512-bit key into {n} shares (threshold {k})...")
@@ -674,6 +726,7 @@ def create_volume_shamir(
     volume_id = uuid.uuid4().bytes
 
     auth_fields = {
+        "kem":                KEM_DEFAULT,
         "kyber_kem_ct":       b64(kem_ct),
         "kyber_sk_enc_nonce": b64(sk_nonce),
         "kyber_sk_enc":       b64(sk_ct),
@@ -699,7 +752,7 @@ def create_volume_shamir(
     }
     # HMAC under final_key (not master_key) so that VolumeContainer.open()
     # can verify it without having to plumb master_key through the mount API.
-    metadata["hmac"] = _meta_hmac(final_key, auth_fields)
+    metadata["hmac"] = _meta_hmac(final_key, _hmac_fields(metadata))
 
     dir_index: dict[str, Any] = {}
 
@@ -763,6 +816,46 @@ class VolumeContainer:
         self._persisted_paths: set[str] = set()
         self._pending_ops: list[dict] = []
         self._dirty = False
+        # Records currently in the journal — replay cost is per record, so
+        # this is one of save()'s two compaction triggers.
+        self._journal_records: int = 0
+        # A read descriptor held for the container's life.  Blob reads are
+        # pread() at absolute offsets, so it needs no position and is safe
+        # to share between FUSE workers; opening the file per 64 KB chunk
+        # cost more than the read itself (44 µs vs 2.5 µs, measured).
+        # compact() replaces the inode, so it drops the descriptor.
+        self._reader_fd: int | None = None
+        self._reader_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Release the read descriptor.  Safe to call more than once."""
+        with self._reader_lock:
+            fd, self._reader_fd = self._reader_fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self):
+        self.close()
+
+    def _pread(self, offset: int, length: int) -> bytes:
+        """Read *length* bytes at absolute *offset* of the container."""
+        with self._reader_lock:
+            if self._reader_fd is None:
+                self._reader_fd = os.open(self.path, os.O_RDONLY)
+            fd = self._reader_fd
+        parts: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            chunk = os.pread(fd, remaining, offset)
+            if not chunk:
+                break
+            parts.append(chunk)
+            offset += len(chunk)
+            remaining -= len(chunk)
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def open(self) -> None:
         """Read and decrypt the volume header, metadata, and directory.
@@ -793,8 +886,8 @@ class VolumeContainer:
             )
         except Exception as exc:
             raise ValueError(
-                "Could not decrypt volume metadata — "
-                "the password or key may be incorrect, "
+                "Could not decrypt volume metadata. "
+                "The password or key may be incorrect, "
                 "or the volume file is corrupt"
             ) from exc
 
@@ -804,14 +897,26 @@ class VolumeContainer:
         # shamir without additional plumbing.
         _verify_meta_hmac(self.final_key, self.metadata)
 
+        # The cleartext auth-params block is what mount and inspect read
+        # before any credential exists (mode, threshold, KEM, parameters).
+        # Every one of its fields also lives in the GCM-sealed metadata;
+        # a mismatch means the cleartext copy was edited — a wrong key
+        # would already have failed above, so this can only be tampering.
+        for k, v in self.auth_params.items():
+            if k in self.metadata and self.metadata[k] != v:
+                raise ValueError(
+                    f"Volume auth params field {k!r} does not match the sealed "
+                    "metadata: the volume file has been tampered with"
+                )
+
         try:
             self.dir_index = decrypt_directory(
                 self.final_key, self.header["dir_nonce"], dir_ct
             )
         except Exception as exc:
             raise ValueError(
-                "Could not decrypt volume directory index — "
-                "the volume file may be corrupt"
+                "Could not decrypt volume directory index. "
+                "The volume file may be corrupt"
             ) from exc
 
         # Validate directory index keys: reject absolute-escape, traversal,
@@ -823,7 +928,7 @@ class VolumeContainer:
                 _validate_vpath(vpath)
             except ValueError as exc:
                 raise ValueError(
-                    f"{exc} — the volume file may be corrupt or tampered with"
+                    f"{exc} (the volume file may be corrupt or tampered with)"
                 ) from exc
 
         # Bounds-check each baseline file entry against the baseline size.
@@ -845,14 +950,14 @@ class VolumeContainer:
             raise ValueError(
                 f"Volume file truncated within baseline data "
                 f"(expected at least {self._journal_start} bytes, "
-                f"got {self._file_size}) — the volume file may be corrupt"
+                f"got {self._file_size}). The volume file may be corrupt"
             )
         # A v1 container must have nothing beyond the baseline; a v2
         # container may legitimately have a journal there.
         if self.header.get("version", 1) < 2 and self._file_size > self._journal_start:
             raise ValueError(
-                "Trailing bytes after baseline data in v1 volume "
-                "— the volume file may be truncated or corrupt"
+                "Trailing bytes after baseline data in v1 volume. "
+                "The volume file may be truncated or corrupt"
             )
         remaining_size = self._baseline_size
         for vpath, entry in self.dir_index.items():
@@ -863,8 +968,8 @@ class VolumeContainer:
             if offset + length > remaining_size:
                 raise ValueError(
                     f"File data for {vpath} extends past end of volume "
-                    f"(offset {offset} + length {length} > {remaining_size}) "
-                    "— the volume file may be truncated or corrupt"
+                    f"(offset {offset} + length {length} > {remaining_size}). "
+                    "The volume file may be truncated or corrupt"
                 )
 
         # Replay the append-only journal (v2+).  Each record updates the
@@ -874,7 +979,9 @@ class VolumeContainer:
         # save): we stop replay at the last valid record and the volume
         # remains consistent.
         self._journal_end = self._journal_start
-        if self.header.get("version", 1) >= 2 and self._file_size > self._journal_start:
+        self._journal_records = 0
+        if (self.header.get("version", 1) >= _JOURNAL_FORMAT_VERSION
+                and self._file_size > self._journal_start):
             self._replay_journal()
 
         # Everything materialised so far exists on disk; coalescing needs
@@ -919,7 +1026,7 @@ class VolumeContainer:
         except OSError as e:
             logger.warning(
                 "Volume %s: could not preserve the unreadable journal tail "
-                "(%s) — it will be lost on the next save",
+                "(%s); it will be lost on the next save",
                 self.path, e,
             )
 
@@ -939,12 +1046,13 @@ class VolumeContainer:
             self._journal_start, self._file_size,
         )
         self._journal_end = valid_end
+        self._journal_records = len(records)
         self.journal_suspicious = suspicious
         if suspicious:
             logger.warning(
                 "Volume %s: journal replay stopped at offset %d with %d "
                 "unreadable bytes remaining that do not look like a crash-"
-                "truncated tail — possible corruption or tampering; state "
+                "truncated tail: possible corruption or tampering; state "
                 "reverted to the last valid record",
                 self.path, valid_end, self._file_size - valid_end,
             )
@@ -1039,9 +1147,7 @@ class VolumeContainer:
         if length == 0:
             return b""
         offset = entry.get("data_offset", 0)
-        with open(self.path, "rb") as f:
-            f.seek(self._data_offset + offset)
-            blob = f.read(length)
+        blob = self._pread(self._data_offset + offset, length)
         if len(blob) < length:
             raise ValueError(
                 f"File data for {vpath} is truncated on disk "
@@ -1107,7 +1213,7 @@ class VolumeContainer:
             raise ValueError(
                 f"chunk_count for {vpath} ({chunk_count}) exceeds what {size} "
                 f"bytes at chunk_size {chunk_size} would produce "
-                f"(max {max_expected_chunks}) — directory entry may be corrupt"
+                f"(max {max_expected_chunks}). The directory entry may be corrupt"
             )
 
         if chunk_count == 0:
@@ -1121,7 +1227,7 @@ class VolumeContainer:
         if data_length != len(blob):
             raise ValueError(
                 f"data_length for {vpath} ({data_length}) does not match "
-                f"blob length ({len(blob)}) — directory entry may be corrupt"
+                f"blob length ({len(blob)}). The directory entry may be corrupt"
             )
         if not blob:
             raise ValueError(f"File data missing for {vpath}")
@@ -1138,7 +1244,7 @@ class VolumeContainer:
                 raise ValueError(
                     f"Content hash mismatch for {vpath}: "
                     f"expected {entry['content_hash'][:16]}…, "
-                    f"got {actual_hash[:16]}…  — file may be corrupt"
+                    f"got {actual_hash[:16]}… (the file may be corrupt)"
                 )
 
         return plaintext
@@ -1150,9 +1256,8 @@ class VolumeContainer:
         if vpath in self._file_data:
             chunk = self._file_data[vpath][start:start + length]
         else:
-            with open(self.path, "rb") as f:
-                f.seek(self._data_offset + entry.get("data_offset", 0) + start)
-                chunk = f.read(length)
+            chunk = self._pread(
+                self._data_offset + entry.get("data_offset", 0) + start, length)
         if len(chunk) < length:
             raise ValueError(
                 f"File data for {vpath} is truncated on disk "
@@ -1200,7 +1305,7 @@ class VolumeContainer:
             raise ValueError(
                 f"chunk_count for {vpath} ({chunk_count}) exceeds what "
                 f"{fsize} bytes at chunk_size {chunk_size} would produce "
-                f"(max {max_expected_chunks}) — directory entry may be corrupt"
+                f"(max {max_expected_chunks}). The directory entry may be corrupt"
             )
 
         if chunk_count == 0 or size == 0 or offset >= fsize:
@@ -1221,7 +1326,7 @@ class VolumeContainer:
             clen = stride if i < chunk_count - 1 else data_length - cstart
             if clen < 8 + 16 or cstart + clen > data_length:
                 raise ValueError(
-                    f"File data for {vpath} is truncated — chunk {i} "
+                    f"File data for {vpath} is truncated: chunk {i} "
                     f"does not fit in data_length {data_length}"
                 )
             chunk = self._get_blob_range(vpath, entry, cstart, clen)
@@ -1241,8 +1346,8 @@ class VolumeContainer:
                 parts.append(cipher.decrypt(nonce, chunk[8:], aad))
             except Exception:
                 raise ValueError(
-                    f"Authentication failed on chunk {i} — "
-                    "data may be corrupt or the wrong key was used"
+                    f"Authentication failed on chunk {i}: "
+                    "the data may be corrupt or the wrong key was used"
                 )
             del chunk
 
@@ -1506,47 +1611,47 @@ class VolumeContainer:
         if not self._pending_ops and not self._dirty:
             return
 
-        # v1 containers always upgrade via compact.  This keeps the on-disk
-        # version in sync with the actual layout (no mixed v1-header + v2-
-        # journal containers in the wild).
-        if self.header.get("version", 1) < VOLUME_FORMAT_VERSION:
+        # Pre-journal containers always upgrade via compact.  This keeps the
+        # on-disk version in sync with the actual layout (no mixed v1-header
+        # + v2-journal containers in the wild).
+        if self.header.get("version", 1) < _JOURNAL_FORMAT_VERSION:
             self.compact()
             return
 
-        # Heuristic: if the existing journal + our pending ops would push
-        # the journal past _JOURNAL_COMPACT_RATIO of the baseline, compact
-        # now so open() stays fast.  Estimate from the coalesced list —
-        # superseded writes and cancelled deletes never hit the journal,
-        # so counting them would bias toward needless compacts.
-        existing_journal = max(0, self._journal_end - self._journal_start)
         coalesced = self._coalesce_pending_ops()
-        pending_body_bytes = sum(
-            len(self._file_data.get(op["vpath"], b""))
-            for op in coalesced
-            if op["type"] == "write"
-        )
-        # Rough: each record header is ~250 bytes encrypted (small JSON + 12B
-        # nonce + 4B length + 16B tag).  Overestimating here only biases us
-        # toward compacting more eagerly, which is fine.
-        pending_overhead = len(coalesced) * 300
-        total_journal = existing_journal + pending_overhead + pending_body_bytes
-        # Only compact if the ratio AND the absolute floor are both exceeded
-        # — otherwise small volumes would rewrite themselves on almost every
-        # save, which defeats the delta-save win.
-        ratio_exceeded = (
-            self._baseline_size > 0
-            and total_journal > self._baseline_size * _JOURNAL_COMPACT_RATIO
-        )
-        if ratio_exceeded and total_journal > _JOURNAL_COMPACT_FLOOR:
+        dead, live = self._dead_and_live_bytes()
+        # Both bounds, so small volumes do not rewrite themselves on every
+        # save — which would defeat the delta-save win — and so a volume
+        # that was filled and then emptied does reclaim its space.
+        if dead > _JOURNAL_COMPACT_FLOOR and dead > live * _JOURNAL_COMPACT_RATIO:
             self.compact()
             return
-        # Empty baseline: compact only when the journal itself is large
-        # enough to care about (same floor).
-        if self._baseline_size == 0 and total_journal > _JOURNAL_COMPACT_FLOOR:
+        if self._journal_records + len(coalesced) > _JOURNAL_COMPACT_RECORDS:
             self.compact()
             return
 
         self._append_journal(coalesced)
+
+    def _dead_and_live_bytes(self) -> tuple[int, int]:
+        """``(dead, live)`` data bytes as of now, pending changes included.
+
+        *live* is every file entry's blob length.  *dead* is what the data
+        region holds beyond the live blobs that are actually on disk —
+        i.e. blobs of deleted files and the previous versions of files that
+        have been rewritten (their current blob is still in ``_file_data``,
+        so it is not counted as on-disk live).
+        """
+        live = 0
+        live_on_disk = 0
+        for vpath, entry in self.dir_index.items():
+            if entry.get("type") == "dir":
+                continue
+            n = entry.get("data_length", 0)
+            live += n
+            if vpath not in self._file_data:
+                live_on_disk += n
+        on_disk = max(0, self._journal_end - self._data_offset)
+        return max(0, on_disk - live_on_disk), live
 
     def _coalesce_pending_ops(self) -> list[dict]:
         """Collapse redundant ops before emitting to the journal.
@@ -1722,7 +1827,35 @@ class VolumeContainer:
                 a = ops[sidx]
                 final = attr_final_path.get(sidx)
                 coalesced.append({**a, "vpath": final} if final else a)
-        return coalesced
+        return self._drop_overwritten_tombstones(coalesced)
+
+    @staticmethod
+    def _drop_overwritten_tombstones(ops: list[dict]) -> list[dict]:
+        """Remove a ``delete X`` that a later record in the same batch
+        overwrites (a ``write X``, or a rename onto X).
+
+        Replay's write sets the entry unconditionally and its rename moves
+        the whole entry, so the tombstone is redundant — and on a partial
+        append it is harmful: the editor atomic-save pattern emitted
+        ``[delete /final][write /final]``, and a disk-full error while
+        writing the body left the complete tombstone durable while the
+        write was not.  A fresh open then showed ``/final`` missing, with
+        nothing suspicious to report (measured).  Without the tombstone the
+        same failure leaves the previous content in place.
+        """
+        materialised: set[str] = set()
+        kept: list[dict] = []
+        for op in reversed(ops):
+            t = op["type"]
+            if t == "delete" and op["vpath"] in materialised:
+                continue
+            if t == "write":
+                materialised.add(op["vpath"])
+            elif t == "rename" and isinstance(op.get("new_vpath"), str):
+                materialised.add(op["new_vpath"])
+            kept.append(op)
+        kept.reverse()
+        return kept
 
     def _append_journal(self, ops: list[dict] | None = None) -> None:
         """Append pending ops as journal records at the valid journal end (v2).
@@ -1752,6 +1885,7 @@ class VolumeContainer:
                     if not body and op.get("chunk_count", 0) > 0:
                         continue
                 body_offset = _write_journal_record(f, self.final_key, op, body)
+                self._journal_records += 1
                 if op["type"] == "write" and op["vpath"] in self.dir_index:
                     entry = self.dir_index[op["vpath"]]
                     # Journal-region body offset is absolute; store relative
@@ -1810,19 +1944,29 @@ class VolumeContainer:
 
         # Re-encrypt metadata and directory (cheap; ~KB of JSON).  The
         # format_version bump happens in the copy that gets encrypted, so
-        # the persisted metadata agrees with the v2 header immediately
-        # after a v1→v2 upgrade — not one compact later.
-        new_metadata = {**self.metadata, "format_version": VOLUME_FORMAT_VERSION}
+        # the persisted metadata agrees with the header immediately after a
+        # v1→v2 upgrade — not one compact later.  A container already on
+        # the journal layout keeps its version: nothing a compact writes
+        # needs a newer reader, and an older build can then still open it.
+        version = max(_JOURNAL_FORMAT_VERSION, self.header.get("version", 1))
+        new_metadata = {**self.metadata, "format_version": version}
         meta_nonce, meta_ct = encrypt_metadata(self.final_key, new_metadata)
         dir_nonce, dir_ct = encrypt_directory(self.final_key, new_dir_index)
 
-        # Pass 2: stream to .tmp.  On disk-full / I/O error the temp file
-        # is cleaned up so we never leave a partial .tmp beside the original.
-        tmp_path = self.path + ".tmp"
+        # Pass 2: stream to a 0600 temp beside the container (a fixed
+        # ``.tmp`` name opened with the umask made the first compaction
+        # widen a 0600 container to 0644, and is a symlink target).  On
+        # disk-full / I/O error the temp file is removed.
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(self.path)}.qc-compact-",
+            dir=os.path.dirname(os.path.abspath(self.path)) or None,
+        )
+        os.close(fd)
         _COPY_CHUNK = 1 << 20  # 1 MB sliding window for unmodified blobs
         try:
             with open(tmp_path, "wb") as tmp_f:
-                write_header(tmp_f, self.header["volume_id"], meta_nonce, dir_nonce)
+                write_header(tmp_f, self.header["volume_id"], meta_nonce, dir_nonce,
+                             version=version)
                 _write_auth_params(tmp_f, self.auth_params)
                 _write_encrypted_block(tmp_f, meta_ct)
                 _write_encrypted_block(tmp_f, dir_ct)
@@ -1859,6 +2003,12 @@ class VolumeContainer:
                                 remaining -= len(chunk)
                 tmp_f.flush()
                 os.fsync(tmp_f.fileno())
+            # The replacement inherits the container's own permission bits
+            # (a user may have loosened or tightened them since creation).
+            try:
+                os.chmod(tmp_path, stat.S_IMODE(os.stat(self.path).st_mode))
+            except OSError:
+                pass
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -1868,6 +2018,8 @@ class VolumeContainer:
 
         os.replace(tmp_path, self.path)
         _fsync_dir(self.path)
+        # The old inode is gone; blob reads must open the new one.
+        self.close()
 
         # ── Commit point ──  The new container is on disk; only now do we
         # swap the in-memory state over to describe it.  _file_data is
@@ -1887,7 +2039,8 @@ class VolumeContainer:
         self.header["dir_nonce"] = dir_nonce
         # Keep the header version in sync with what compact actually wrote
         # (v1 containers are upgraded to v2 on first save via this path).
-        self.header["version"] = VOLUME_FORMAT_VERSION
+        self.header["version"] = version
+        self._journal_records = 0
         self._pending_ops.clear()
         self._file_data.clear()
         self._dirty = False

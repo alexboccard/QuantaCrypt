@@ -36,6 +36,25 @@ final class HelperLocatorTests: XCTestCase {
     /// Stand-in for a real code hash: only its equality matters here.
     private static let pinnedHash = Data([0xC0, 0xDE, 0xF0, 0x0D])
 
+    /// A signature check that reports `target` unsigned and everything else
+    /// pinned. The scratch bundle's helper is a script, and since the bundled
+    /// helper is measured like any other, a stub that calls *everything*
+    /// unsigned would refuse it too and fall through to the dev venv.
+    private static func unsigned(only target: URL) -> @Sendable (URL) -> HelperLocator.SignatureStatus {
+        let path = target.standardizedFileURL.path
+        return { url in
+            url.standardizedFileURL.path == path ? .unsigned("no signature") : .satisfiesPin(cdHash: pinnedHash)
+        }
+    }
+
+    /// The real Security check for `target` alone; the rest pinned, as above.
+    private static func measuring(only target: URL) -> @Sendable (URL) -> HelperLocator.SignatureStatus {
+        let path = target.standardizedFileURL.path
+        return { url in
+            url.standardizedFileURL.path == path ? HelperLocator.signatureStatus(of: url) : .satisfiesPin(cdHash: pinnedHash)
+        }
+    }
+
     private func resolve(override: String?,
                          environment: [String: String] = [:],
                          signature: @escaping @Sendable (URL) -> HelperLocator.SignatureStatus
@@ -51,9 +70,13 @@ final class HelperLocatorTests: XCTestCase {
     private func signHelper(_ url: URL, contents: String) throws {
         try contents.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try codesign(["--identifier", "qc-core", url.path])
+    }
+
+    private func codesign(_ arguments: [String]) throws {
         let codesign = Process()
         codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        codesign.arguments = ["--force", "--sign", "-", "--identifier", "qc-core", url.path]
+        codesign.arguments = ["--force", "--sign", "-"] + arguments
         codesign.standardOutput = FileHandle.nullDevice
         codesign.standardError = FileHandle.nullDevice
         try codesign.run()
@@ -61,6 +84,30 @@ final class HelperLocatorTests: XCTestCase {
         if codesign.terminationStatus != 0 {
             throw XCTSkip("codesign is unavailable, so the pin cannot be exercised end to end")
         }
+    }
+
+    /// The smallest thing `codesign` accepts as a bundle: an Info.plist and
+    /// a main executable (a script will do).
+    private func writeBundleSkeleton(at bundle: URL, identifier: String, executable: String) throws {
+        let macOS = bundle.appending(path: "Contents/MacOS")
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleIdentifier": identifier, "CFBundleExecutable": executable,
+                                    "CFBundlePackageType": "APPL"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: bundle.appending(path: "Contents/Info.plist"))
+        try write(executable: macOS.appending(path: executable))
+    }
+
+    /// An app bundle with a helper bundle nested where `build.py` puts it,
+    /// both ad-hoc signed inside-out the way `_codesign_app_bundle` does.
+    private func makeSignedAppBundle() throws -> (app: URL, helper: URL) {
+        let app = scratch.appending(path: "Signed.app")
+        let helper = app.appending(path: "Contents/Helpers/qc-core.app")
+        try writeBundleSkeleton(at: app, identifier: "com.alexboccard.quantacrypt", executable: "Signed")
+        try writeBundleSkeleton(at: helper, identifier: "com.alexboccard.quantacrypt.core", executable: "qc-core")
+        try codesign([helper.path])
+        try codesign([app.path])
+        return (app, helper)
     }
 
     // MARK: Resolution order
@@ -108,7 +155,7 @@ final class HelperLocatorTests: XCTestCase {
     func testAnUnsignedOverrideIsRefusedEvenWhenApproved() throws {
         let planted = try outsideHelper("unsigned")
         let resolution = resolve(override: planted.path,
-                                 signature: { _ in .unsigned("no signature") },
+                                 signature: Self.unsigned(only: planted),
                                  approved: { _, _ in true })
         XCTAssertEqual(resolution.launch?.executable.path, bundledHelper.path)
         XCTAssertEqual(resolution.refusal?.approvable, false,
@@ -116,10 +163,75 @@ final class HelperLocatorTests: XCTestCase {
     }
 
     func testAnOverridePointingIntoTheAppBundleNeedsNoApproval() {
-        let resolution = resolve(override: bundledHelper.path, signature: { _ in .unsigned("not reached") })
+        // Signed, if not as qc-core: inside the bundle only a signature is
+        // required, because the click exists for paths the user chose.
+        let resolution = resolve(override: bundledHelper.path,
+                                 signature: { _ in .signedButUnpinned("signed by someone else") })
         XCTAssertEqual(resolution.launch?.executable.path, bundledHelper.path)
         XCTAssertEqual(resolution.launch?.origin, "settings")
-        XCTAssertNil(resolution.refusal, "the app's own signature already covers its payload")
+        XCTAssertNil(resolution.refusal, "a signed helper inside the bundle needs no click")
+    }
+
+    // MARK: The bundle is not a trust boundary at runtime (S-03)
+
+    /// The comment used to say the app's seal made a swapped helper
+    /// impossible. Nothing checks that seal at exec time, so the bundled
+    /// helper is measured like any other; an unsigned one is refused, with
+    /// no button, because nothing could be re-checked before `exec`.
+    func testAnUnsignedBundledHelperIsRefused() {
+        let resolution = resolve(override: nil, signature: { _ in .unsigned("no signature") })
+        XCTAssertNotEqual(resolution.launch?.origin, "bundle",
+                          "an unmeasurable helper must not receive passwords and shares")
+        XCTAssertNotEqual(resolution.launch?.executable.path, bundledHelper.path)
+        XCTAssertEqual(resolution.refusal?.approvable, false)
+        XCTAssertTrue(resolution.refusal?.reason.contains("bundled with QuantaCrypt") == true)
+        XCTAssertTrue(resolution.refusal?.reason.contains("Reinstall") == true)
+    }
+
+    func testAnUnsignedOverrideInsideTheBundleIsRefusedToo() {
+        let resolution = resolve(override: bundledHelper.path, signature: { _ in .unsigned("no signature") })
+        XCTAssertNotEqual(resolution.launch?.origin, "settings")
+        XCTAssertEqual(resolution.refusal?.approvable, false, "inside the bundle is not a substitute for a signature")
+    }
+
+    /// `ProcessTransport` re-measures whatever hash rides on the launch
+    /// immediately before `exec`; the bundled helper used to carry none.
+    func testABundledHelperCarriesItsCodeHashForTheExecCheck() {
+        let resolution = resolve(override: nil)
+        XCTAssertEqual(resolution.launch?.origin, "bundle")
+        XCTAssertEqual(resolution.launch?.approvedCDHash, Self.pinnedHash)
+    }
+
+    /// The launch-time check that gives the old comment's premise some
+    /// teeth: a helper swapped inside the bundle and ad-hoc re-signed — so
+    /// its own signature is valid, which is all the kernel looks at — fails
+    /// the strict, nested validation of the app.
+    func testBundleIntegrityCatchesASwappedHelperEvenWhenItIsReSigned() throws {
+        let (app, helper) = try makeSignedAppBundle()
+        let bundle = try XCTUnwrap(Bundle(path: app.path))
+        XCTAssertNil(HelperLocator.bundleIntegrityWarning(for: bundle), "an intact bundle must not warn")
+
+        let helperExecutable = helper.appending(path: "Contents/MacOS/qc-core")
+        try "#!/bin/sh\nexec /usr/bin/true\n".write(to: helperExecutable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperExecutable.path)
+        try codesign([helper.path])
+        XCTAssertEqual(HelperLocator.signatureStatus(of: helperExecutable).cdHash?.isEmpty, false,
+                       "the swapped helper's own signature is valid — that is the attack")
+
+        let warning = try XCTUnwrap(HelperLocator.bundleIntegrityWarning(for: bundle))
+        XCTAssertTrue(warning.contains("may have been altered"), warning)
+        XCTAssertTrue(warning.contains("Reinstall"), warning)
+    }
+
+    /// Never fatal: a build with signing disabled has no seal and must
+    /// still launch. It says so instead of pretending to have checked.
+    func testAnUnsignedBundleWarnsRatherThanFailing() throws {
+        let app = scratch.appending(path: "Unsigned.app")
+        try writeBundleSkeleton(at: app, identifier: "com.alexboccard.quantacrypt", executable: "Unsigned")
+        let bundle = try XCTUnwrap(Bundle(path: app.path))
+        let warning = try XCTUnwrap(HelperLocator.bundleIntegrityWarning(for: bundle))
+        XCTAssertTrue(warning.contains("isn't code-signed"), warning)
+        XCTAssertFalse(warning.contains("may have been altered"), "unsigned is not evidence of tampering: \(warning)")
     }
 
     /// A binary that is signed, but not as *this* helper, cannot be approved
@@ -157,7 +269,8 @@ final class HelperLocatorTests: XCTestCase {
         XCTAssertTrue(HelperLocator.isApproved(planted.standardizedFileURL.path, cdHash: first))
         XCTAssertFalse(HelperLocator.isApproved(scratch.appending(path: "other").path, cdHash: first))
 
-        let allowed = HelperLocator.resolve(override: planted.path, environment: [:], bundle: appBundle)
+        let allowed = HelperLocator.resolve(override: planted.path, environment: [:], bundle: appBundle,
+                                            signature: Self.measuring(only: planted))
         XCTAssertEqual(allowed.launch?.origin, "settings")
         XCTAssertEqual(allowed.launch?.approvedCDHash, first)
 
@@ -166,7 +279,8 @@ final class HelperLocatorTests: XCTestCase {
             return XCTFail("re-signing different bytes must change the code hash")
         }
         XCTAssertFalse(HelperLocator.isApproved(planted.standardizedFileURL.path, cdHash: second))
-        let refused = HelperLocator.resolve(override: planted.path, environment: [:], bundle: appBundle)
+        let refused = HelperLocator.resolve(override: planted.path, environment: [:], bundle: appBundle,
+                                            signature: Self.measuring(only: planted))
         XCTAssertEqual(refused.launch?.executable.path, bundledHelper.path,
                        "the replacement must not inherit the approval")
         XCTAssertEqual(refused.refusal?.approvable, true)

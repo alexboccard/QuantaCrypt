@@ -117,6 +117,48 @@ final class ShareFilesTests: XCTestCase {
         XCTAssertEqual(ShareFiles.parse(combined), [Self.code(1), Self.code(2), Self.code(3)])
     }
 
+    // MARK: Fingerprint (F-032 / S-05)
+
+    /// The literal values are what `ui/encryptor.py` prints:
+    /// `hashlib.sha256(fh.read(65536)).hexdigest()[:12]`. Both apps' share
+    /// files must name the same `.qcx` the same way.
+    func testFingerprintMatchesThePythonEncryptor() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let small = dir.appending(path: "small.qcx")
+        try Data("abc".utf8).write(to: small)
+        // python3 -c 'import hashlib; print(hashlib.sha256(b"abc").hexdigest()[:12])'
+        XCTAssertEqual(ShareFiles.fingerprint(ofFileAt: small.path), "ba7816bf8f01")
+
+        // Only the first 64 KiB count, so a multi-gigabyte container costs
+        // one read; the full-file digest would start with b80935d45c7f.
+        let large = dir.appending(path: "large.qcx")
+        try Data(repeating: 0x41, count: 70_000).write(to: large)
+        // python3 -c 'import hashlib; print(hashlib.sha256((b"A"*70000)[:65536]).hexdigest()[:12])'
+        XCTAssertEqual(ShareFiles.fingerprint(ofFileAt: large.path), "156c38442089")
+
+        XCTAssertNil(ShareFiles.fingerprint(ofFileAt: dir.appending(path: "missing.qcx").path))
+    }
+
+    func testShareTextsCarryTheFingerprintLine() {
+        var fingerprinted = context
+        fingerprinted.fingerprint = "ba7816bf8f01"
+        let individual = ShareFiles.individualText(shares[0], context: fingerprinted)
+        XCTAssertTrue(individual.contains("Encrypted file:   report.pdf.qcx\nFile fingerprint:  ba7816bf8f01...\nThreshold:"),
+                      individual)
+        XCTAssertEqual(ShareFiles.parse(individual), [Self.code(1)], "the hex line must not read as a share")
+
+        let combined = ShareFiles.combinedText(shares, context: fingerprinted)
+        XCTAssertTrue(combined.contains("File:      report.pdf.qcx\nFingerprint (SHA-256 prefix): ba7816bf8f01...\n"),
+                      combined)
+        XCTAssertEqual(ShareFiles.parse(combined), [Self.code(1), Self.code(2), Self.code(3)])
+
+        // A file that could not be read gets no line, as in the Tk app.
+        XCTAssertFalse(ShareFiles.individualText(shares[0], context: context).contains("ingerprint"))
+        XCTAssertFalse(ShareFiles.combinedText(shares, context: context).contains("ingerprint"))
+    }
+
     func testSavedNoteMentionsRename() {
         let files = [URL(fileURLWithPath: "/tmp/x/report.pdf_2.share-1-of-3.txt")]
         let renamed = ShareFiles.Outcome(files: files, renamedStem: "report.pdf_2")
@@ -175,16 +217,16 @@ final class ShareFilesTests: XCTestCase {
         let text = """
         QuantaCrypt Key Shares
 
-        Share 1 — QCSHARE- code:
+        Share 1, QCSHARE- code:
         \(Self.code(1))
 
-        Share 1 — 50-word mnemonic:
+        Share 1, 50-word mnemonic:
         \(phrase)
 
-        Share 2 — QCSHARE- code:
+        Share 2, QCSHARE- code:
         \(Self.code(2))
 
-        Share 2 — 50-word mnemonic:
+        Share 2, 50-word mnemonic:
         \(phrase)
 
         Share 3 (typed from the paper backup):
@@ -210,16 +252,16 @@ final class ShareFilesTests: XCTestCase {
         let text = """
         QuantaCrypt Key Shares
 
-        Share 1 — QCSHARE- code:
+        Share 1, QCSHARE- code:
         \(wrapped(1))
 
-        Share 1 — 50-word mnemonic:
+        Share 1, 50-word mnemonic:
         \(first)
 
-        Share 2 — QCSHARE- code:
+        Share 2, QCSHARE- code:
         \(wrapped(2))
 
-        Share 2 — 50-word mnemonic:
+        Share 2, 50-word mnemonic:
         \(second)
         """
         let result = ShareFiles.parsed(text)
@@ -234,10 +276,10 @@ final class ShareFilesTests: XCTestCase {
     func testIntactCodesStillPairWithTheirMnemonics() {
         let phrase = Array(repeating: "apple", count: 50).joined(separator: " ")
         let text = """
-        Share 1 — QCSHARE- code:
+        Share 1, QCSHARE- code:
         \(Self.code(1))
 
-        Share 1 — 50-word mnemonic:
+        Share 1, 50-word mnemonic:
         \(phrase)
         """
         XCTAssertEqual(ShareFiles.parsed(text), ShareFiles.Parsed(shares: [Self.code(1)], damagedCodes: 0))
@@ -268,7 +310,7 @@ final class ShareFilesTests: XCTestCase {
         let (loaded, problems) = ShareFiles.load([url])
         XCTAssertEqual(loaded, [], "an undecodable fragment must not fill a share field")
         XCTAssertEqual(problems.first, "broken.txt holds 2 QCSHARE- codes that are cut short or wrapped. "
-                       + "Nothing in it could be used — copy the code again as one unbroken line.")
+                       + "Nothing in it could be used. Copy the code again as one unbroken line.")
     }
 
     // MARK: Pasteboard (F-017)
@@ -308,6 +350,19 @@ final class ShareFilesTests: XCTestCase {
             the share lands in whatever clipboard-history database is running and stays there. \
             The per-share Copy buttons go through Clipboard.copy; use those.
             """)
+    }
+
+    /// Same shape as the test above, for the same reason. `.privacySensitive()`
+    /// is the one-modifier step SwiftUI offers; it is not window-level
+    /// capture exclusion, and the comment beside it says so.
+    func testTheSharesSheetMarksTheSharesPrivacySensitive() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "QuantaCrypt/Shared/SharesSheet.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+        XCTAssertTrue(text.contains(".privacySensitive()"),
+                      "the share cards are the one place the split key is rendered in full")
     }
 
     func testPasswordStrengthOrdering() {

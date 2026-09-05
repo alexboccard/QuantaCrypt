@@ -8,6 +8,10 @@ struct SettingsView: View {
     /// Bumped when the user approves a helper. Approvals live in a static
     /// store, so nothing else would tell this view to re-resolve.
     @State private var approvals = 0
+    /// Resolved off the main actor: every candidate — the bundled helper
+    /// included — is code-signature-checked, which is ~100 ms for the real
+    /// helper, and the path field re-renders this form on every keystroke.
+    @State private var resolution = HelperLocator.Resolution(launch: nil, searched: [])
 
     var body: some View {
         Form {
@@ -91,19 +95,22 @@ struct SettingsView: View {
         // the path row instead of letting the window grow.
         .frame(minWidth: 560)
         .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var resolution: HelperLocator.Resolution {
-        _ = approvals
-        return HelperLocator.resolve(override: helperPath)
+        // Re-runs (and cancels the previous run) whenever the id changes.
+        .task(id: "\(approvals)|\(helperPath)") {
+            let override = helperPath
+            let resolved = await Task.detached(priority: .userInitiated) {
+                HelperLocator.resolve(override: override)
+            }.value
+            guard !Task.isCancelled else { return }
+            resolution = resolved
+        }
     }
 
     private var resolvedDescription: String {
-        let resolution = self.resolution
         if let launch = resolution.launch {
             let args = launch.arguments.isEmpty ? "" : " " + launch.arguments.joined(separator: " ")
             return "\(launch.displayPath)\(args) (\(launch.origin))"
         }
-        return "Not found — searched \(resolution.searched.count) locations."
+        return "Not found after searching \(resolution.searched.count) locations."
     }
 }

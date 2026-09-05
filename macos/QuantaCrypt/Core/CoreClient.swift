@@ -140,7 +140,7 @@ actor CoreClient {
         Logger.client.warning("request \(id, privacy: .public) ignored cancel for \(self.cancelGrace.components.seconds, privacy: .public)s; failing locally")
         continuation.yield(.error(CoreError(
             code: .cancelled,
-            message: "Cancelled — the helper did not confirm, so check the destination before assuming nothing was written.",
+            message: "Cancelled, but the helper did not confirm. Check the destination before assuming nothing was written.",
             detail: "no cancelled event within \(cancelGrace.components.seconds)s")))
         continuation.finish()
     }

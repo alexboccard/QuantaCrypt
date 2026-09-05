@@ -827,7 +827,7 @@ class TestFileInspection:
         from quantacrypt.ui.decryptor import load_pkg
         pkg = load_pkg(str(qcx))
         assert pkg["meta"]["mode"] == "single"
-        assert pkg["meta"]["version"] == 1
+        assert pkg["meta"]["version"] == cc.FORMAT_VERSION
 
     def test_inspect_rejects_invalid_file(self, tmp_path):
         from quantacrypt.ui.decryptor import load_pkg
@@ -1090,7 +1090,7 @@ class TestInspectFeature:
             # to exercise the shamir copy without a second real encryption.
             app._meta = {"mode": "shamir", "threshold": 2, "total": 3, "version": 1}
             shamir = self._popup_texts(app)
-            assert any("any 2 of 3 shares" in t for t in shamir), shamir
+            assert any("Any 2 of 3 shares" in t for t in shamir), shamir
         finally:
             app.destroy()
 

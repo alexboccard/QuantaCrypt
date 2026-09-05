@@ -41,6 +41,13 @@ struct SharesSheet: View {
                     }
                 }
                 .padding(20)
+                // Marks the codes and phrases as private data so the system
+                // redacts them wherever it renders this view with the
+                // `.privacy` redaction reason. It does not take the window
+                // out of screen recording or screen sharing — that needs
+                // `NSWindow.sharingType = .none` on the hosting window, which
+                // SwiftUI does not expose from a sheet.
+                .privacySensitive()
             }
 
             Divider()

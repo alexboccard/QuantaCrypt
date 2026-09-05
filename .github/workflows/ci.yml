@@ -25,9 +25,9 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -45,10 +45,16 @@ jobs:
 
       # Hash-pinned lock (uv.lock → requirements-lock.txt, all extras) so a
       # release is what was reviewed, not what PyPI serves that day.
-      - name: Install dependencies (hash-pinned)
+      # The lock pins what is installed; pip's build isolation would still
+      # fetch an unpinned setuptools to build fusepy's sdist and this
+      # project.  Install the backend from the lock first, then build with
+      # no isolation so nothing outside the lock ever runs.
+      - name: Install dependencies (hash-pinned, no build isolation)
         run: |
-          pip install --require-hashes -r requirements-lock.txt
-          pip install --no-deps -e .
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          pip install --no-deps --no-build-isolation -e .
 
       # pip-audit itself comes from the hash-pinned lock (dev extra).
       - name: Audit dependencies for known advisories
@@ -104,22 +110,26 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
 
-      - name: Install dependencies (hash-pinned)
+      - name: Install dependencies (hash-pinned, no build isolation)
         run: |
-          pip install --require-hashes -r requirements-lock.txt
-          pip install --no-deps -e .
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+          pip install --no-deps --no-build-isolation -e .
 
       - name: Build qc-core helper (smoke-tested by the build script)
         run: python scripts/build.py --helper --skip-tests
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      # Pinned by release and SHA-256 (scripts/install_xcodegen.sh), not
+      # resolved from homebrew-core on the day.
+      - name: Install XcodeGen (pinned, SHA-256 verified)
+        run: bash scripts/install_xcodegen.sh
 
       # project.yml lists the .icns files as resources and they are gitignored
       # build artifacts, so a clean checkout must render them or xcodebuild

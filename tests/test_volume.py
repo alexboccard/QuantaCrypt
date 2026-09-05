@@ -2086,41 +2086,71 @@ class TestFormatV2Journal:
         assert "/docs/" in vc2.dir_index
         assert vc2.dir_index["/docs/"].get("type") == "dir"
 
-    def test_auto_compact_when_journal_exceeds_ratio(self, tmp_dir):
-        """Heuristic: once the journal grows past 30% of the baseline AND
-        exceeds the absolute floor, save() performs a full compact instead
-        of appending."""
+    def test_auto_compact_when_dead_space_exceeds_ratio(self, tmp_dir):
+        """save() compacts once the bytes that deletes and overwrites left
+        behind exceed 30% of the live bytes AND the 8 MB floor.  Live
+        writes alone never trigger it: a journal of live blobs costs
+        nothing to keep (replay is per record, bodies are seeked over)."""
         path, key = self._open(tmp_dir, "autocompact.qcv")
         vc = vol.VolumeContainer(path, key)
         vc.open()
-        # 64 MB baseline → 30% ratio threshold ≈ 19.6 MB; floor is 8 MB.
-        # Use a deterministic, compressible pattern so the encrypted blob
-        # is close to the plaintext size plus per-chunk GCM overhead.
         baseline_bytes = 64 << 20
         vc.write_file("/baseline.bin", b"B" * baseline_bytes)
         vc.compact()
         baseline_size = vc._baseline_size
 
-        # First small write (~1 MB) appends — well under both the ratio
-        # and the 8 MB floor.
-        vc.write_file("/x.bin", b"X" * (1 << 20))
-        vc.save()
-        journal_after_append = os.path.getsize(path) - vc._journal_start
-        assert 0 < journal_after_append < (8 << 20)
-
-        # Next write (~25 MB) pushes the journal past both the ratio
-        # threshold and the 8 MB floor, so save() rolls into a compact.
+        # 25 MB of NEW data appends: it is live, so nothing is dead.
         vc.write_file("/y.bin", b"Y" * (25 << 20))
         vc.save()
+        assert os.path.getsize(path) - vc._journal_start > (25 << 20)
+        assert vc._baseline_size == baseline_size
 
+        # Overwriting a 1 MB file three times leaves 3 MB dead: under the
+        # 8 MB floor, so it still appends.
+        for i in range(4):
+            vc.write_file("/x.bin", bytes([i]) * (1 << 20))
+            vc.save()
+        dead, live = vc._dead_and_live_bytes()
+        assert (3 << 20) < dead < (8 << 20)
+        assert vc._baseline_size == baseline_size
+
+        # Deleting /y.bin makes ~28 MB dead: over the floor and over 30% of
+        # the ~65 MB live, so this save rolls into a compact.
+        vc.delete("/y.bin")
+        vc.save()
         assert vc._pending_ops == []
-        # After compact, the journal is empty again.
+        assert os.path.getsize(path) == vc._journal_start   # journal empty
+        assert vc._dead_and_live_bytes()[0] == 0
+        assert vc._baseline_size > baseline_size             # absorbed /x.bin
+        assert vc._baseline_size < baseline_size + (2 << 20)  # but not /y.bin
+
+    def test_auto_compact_when_the_journal_has_too_many_records(self, tmp_dir, monkeypatch):
+        """Replay cost is per record, so the record count is the other
+        trigger — independent of how many bytes the records carry."""
+        monkeypatch.setattr(vol, "_JOURNAL_COMPACT_RECORDS", 20)
+        path, key = self._open(tmp_dir, "records.qcv")
+        vc = vol.VolumeContainer(path, key)
+        vc.open()
+        for i in range(20):
+            vc.write_file(f"/f{i}.txt", b"x")
+            vc.save()
+        assert vc._journal_records == 20
+        assert os.path.getsize(path) > vc._journal_start
+        vc.write_file("/f20.txt", b"x")
+        vc.save()
+        assert vc._journal_records == 0
         assert os.path.getsize(path) == vc._journal_start
-        assert vc._baseline_size > baseline_size  # absorbed /x.bin and /y.bin
+        vc2 = vol.VolumeContainer(path, key)
+        vc2.open()
+        assert len(vc2.dir_index) == 21
 
     def test_v1_container_upgrades_on_save(self, tmp_dir):
         """Hand-roll a v1 container bytewise, open it, save, and verify the
-        on-disk header is bumped to VOLUME_FORMAT_VERSION."""
+        on-disk header is bumped to the journal layout's version.  Not to
+        VOLUME_FORMAT_VERSION: the KEM/parameter fields that version 3
+        names are creation-time facts a compact cannot add, and keeping a
+        container at the lowest version that describes it lets older builds
+        keep opening it."""
         path, key = self._open(tmp_dir, "v1.qcv")
         # Patch the header VERSION field from 2 back to 1 on disk to
         # simulate a container created by an older build.
@@ -2138,7 +2168,7 @@ class TestFormatV2Journal:
         with open(path, "rb") as f:
             f.seek(6)
             version = struct.unpack(">I", f.read(4))[0]
-        assert version == vol.VOLUME_FORMAT_VERSION
+        assert version == vol._JOURNAL_FORMAT_VERSION == 2
 
     def test_v1_container_rejects_trailing_bytes(self, tmp_dir):
         """A v1 container with bytes past the baseline is corrupt."""
@@ -2233,21 +2263,26 @@ class TestFormatV2Journal:
         assert set(vc2.dir_index) == {"/base1.txt", "/base2.txt"}
         assert vc2.read_file("/base1.txt") == b"one" * 100
 
-    def test_small_baseline_compact_when_journal_big(self, tmp_dir):
-        """Volumes with an empty/tiny baseline still auto-compact once the
-        journal exceeds the 8 MB floor — covers the "avoid unbounded-ratio
-        divide" branch in save()."""
+    def test_an_emptied_volume_shrinks(self, tmp_dir):
+        """Fill, then delete everything: with no live bytes at all, the dead
+        blobs exceed the floor and save() compacts back to an empty
+        container.  Before the dead-space rule a volume kept its full size
+        forever after a delete-all, with no compact action in either UI."""
         path, key = self._open(tmp_dir, "tiny.qcv")
+        empty_size = os.path.getsize(path)
         vc = vol.VolumeContainer(path, key)
         vc.open()
         assert vc._baseline_size == 0
-        # A single 10 MB write trips the empty-baseline compact guard
-        # (8 MB floor).
+        # A 10 MB write is live data: it appends, whatever the baseline.
         vc.write_file("/big.bin", b"Q" * (10 << 20))
         vc.save()
-        # After compact, the volume is one big baseline with no journal.
+        assert os.path.getsize(path) - vc._journal_start > (10 << 20)
+        assert vc._baseline_size == 0
+        vc.delete("/big.bin")
+        vc.save()
         assert os.path.getsize(path) == vc._journal_start
-        assert vc._baseline_size > (8 << 20)
+        assert os.path.getsize(path) < empty_size + 2048
+        assert vol.VolumeContainer(path, key).open() is None
 
     def test_write_then_rename_persists_data(self, tmp_dir):
         """Atomic-save pattern: write /tmp + rename /tmp -> /final + save

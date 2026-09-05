@@ -56,7 +56,7 @@ struct PasswordStrength: Equatable, Sendable {
             advice = "Add more words, numbers or symbols."
         } else if bits < 60 {
             level = .fair
-            advice = "Longer is stronger — a few unrelated words work well."
+            advice = "Longer is stronger. A few unrelated words work well."
         } else if bits < 80 {
             level = .good
         } else {

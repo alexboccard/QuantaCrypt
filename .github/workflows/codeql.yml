@@ -53,11 +53,11 @@ jobs:
             runner: macos-26
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # Everything the Swift build needs, done before init so only the
       # xcodebuild itself runs under the CodeQL tracer.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         if: matrix.build-mode == 'manual'
         with:
           python-version: "3.13"
@@ -66,16 +66,20 @@ jobs:
         if: matrix.build-mode == 'manual'
         run: |
           # Pillow, for the icon rendering below. Hash-pinned like every other
-          # install in this repo.
-          pip install --require-hashes -r requirements-lock.txt
+          # install in this repo, with the build backend from the lock too.
+          python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
+          pip install --no-build-isolation --require-hashes -r requirements-lock.txt
           # The .icns files are gitignored artifacts that project.yml lists as
           # resources, so xcodebuild fails at CpResource without them.
           python scripts/build.py --icons --skip-tests
-          brew install xcodegen
+          # XcodeGen pinned by release and SHA-256, not brew's tree of the day.
+          bash scripts/install_xcodegen.sh
+          export PATH="$HOME/.local/bin:$PATH"
           cd macos && xcodegen generate
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -91,6 +95,6 @@ jobs:
             CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO build
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: "/language:${{ matrix.language }}"

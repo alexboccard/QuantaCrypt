@@ -907,6 +907,28 @@ class TestRecentList:
         assert app._recent_frame.winfo_children() == []
         assert "QuantaCrypt" in _widget_texts(app)
 
+    def test_a_null_path_in_the_store_is_skipped_and_the_rest_shown(
+            self, make_launcher, prefs_dir):
+        """``{"path": null}`` used to be a TypeError inside the constructor —
+        the app could not start until the JSON was hand-edited."""
+        self._write_recent(prefs_dir, [{"path": None, "ts": 0}, {"path": [1]},
+                                       self._entry(prefs_dir)])
+        app = make_launcher()
+        texts = _widget_texts(app._recent_frame)
+        assert "doc.qcx" in texts
+        assert "QuantaCrypt" in _widget_texts(app)
+
+    def test_a_recent_store_that_raises_does_not_stop_the_launcher(
+            self, make_launcher, monkeypatch):
+        """Whatever the store does, the window opens: the same guard the
+        wizard-close path already had."""
+        from quantacrypt.ui.shared import RecentFiles
+        monkeypatch.setattr(RecentFiles, "load", classmethod(
+            lambda cls: (_ for _ in ()).throw(RuntimeError("store exploded"))))
+        app = make_launcher()
+        assert app.winfo_exists()
+        assert "QuantaCrypt" in _widget_texts(app)
+
     def test_a_very_long_filename_is_rendered_in_full(self, make_launcher,
                                                       prefs_dir):
         """Long names come from real users (scanned documents, exports); the
@@ -1233,7 +1255,7 @@ class TestInspectDialog:
         app = make_launcher()
         app._inspect_file()
         win = _inspect_window(app)
-        assert "Split key — any 3 of 5 shares open it" in _widget_texts(win)
+        assert "Split key: any 3 of 5 shares open it" in _widget_texts(win)
         win.destroy()
 
     def test_a_self_executing_file_is_flagged_as_portable(self, make_launcher,
@@ -1339,9 +1361,11 @@ class TestInspectDialog:
 class _FakeResponse:
     def __init__(self, body):
         self._body = body
+        self.asked = []          # the byte bounds each read() was given
 
-    def read(self):
-        return self._body
+    def read(self, n=-1):
+        self.asked.append(n)
+        return self._body if n is None or n < 0 else self._body[:n]
 
     def __enter__(self):
         return self
@@ -1351,11 +1375,14 @@ class _FakeResponse:
 
 
 class _RecordingParent:
-    """Stands in for the launcher window: records what the worker schedules."""
+    """Stands in for the launcher window: records what the worker schedules.
+    ``fire()`` runs it, the way the Tk loop would; ``exists`` is what
+    ``safe_after`` asks before letting the hop through."""
 
     def __init__(self, fail=False):
         self.calls = []
         self.attempts = 0
+        self.exists = True
         self._fail = fail
 
     def after(self, delay, fn, *args):
@@ -1363,6 +1390,13 @@ class _RecordingParent:
         if self._fail:
             raise tk.TclError("application has been destroyed")
         self.calls.append((delay, fn, args))
+
+    def winfo_exists(self):
+        return self.exists
+
+    def fire(self):
+        for _delay, fn, args in self.calls:
+            fn(*args)
 
 
 class _SyncThread:
@@ -1390,6 +1424,15 @@ def prefs_only(tmp_path, monkeypatch):
     from quantacrypt.ui.shared import AppPrefs
     monkeypatch.setattr(AppPrefs, "_PATH", str(tmp_path / "prefs.json"))
     return AppPrefs
+
+
+@pytest.fixture
+def shown(monkeypatch):
+    """What ``_show_banner`` was asked to render, once the scheduled hop runs."""
+    calls = []
+    monkeypatch.setattr(updater, "_show_banner",
+                        lambda *args: calls.append(args))
+    return calls
 
 
 class TestParseVersion:
@@ -1452,6 +1495,22 @@ class TestFetchLatest:
         # A launch must never stall on a slow network.
         assert seen["timeout"] == updater._TIMEOUT == 5
 
+    def test_the_body_read_is_bounded(self, monkeypatch):
+        """A release document is a few KB; a daemon thread must not buffer
+        whatever a compromised endpoint decides to send."""
+        resp = _FakeResponse(json.dumps({"tag_name": "v9.9.9"}).encode())
+        monkeypatch.setattr(updater.urllib.request, "urlopen",
+                            lambda req, timeout=None: resp)
+        assert updater._fetch_latest() == {"tag_name": "v9.9.9"}
+        assert resp.asked == [updater._MAX_BODY]
+        assert updater._MAX_BODY <= 1 << 20
+
+    def test_a_body_past_the_bound_is_not_a_release(self, monkeypatch):
+        big = b'{"tag_name": "v9.9.9", "body": "' + b"x" * (2 << 20) + b'"}'
+        monkeypatch.setattr(updater.urllib.request, "urlopen",
+                            lambda req, timeout=None: _FakeResponse(big))
+        assert updater._fetch_latest() is None, "truncated JSON fails closed"
+
     def test_a_network_error_is_swallowed(self, monkeypatch):
         def _urlopen(req, timeout=None):
             raise urllib.error.URLError("offline")
@@ -1481,12 +1540,38 @@ class TestCheckForUpdate:
         return parent
 
     def test_a_newer_release_schedules_the_banner(self, monkeypatch, sync_worker,
-                                                  prefs_only):
+                                                  prefs_only, shown):
         parent = self._run(monkeypatch, {"tag_name": "v1.9.0",
                                          "html_url": "https://x.test/rel"})
-        (delay, fn, args), = parent.calls
-        assert (delay, fn) == (0, updater._show_banner)
-        assert args == (parent, "1.9.0", "1.3.0", "v1.9.0", "https://x.test/rel")
+        (delay, _fn, _args), = parent.calls
+        assert delay == 0
+        parent.fire()
+        assert shown == [(parent, "1.9.0", "1.3.0", "v1.9.0", "https://x.test/rel")]
+
+    def test_a_launcher_closed_before_the_hop_fires_gets_no_banner(
+            self, monkeypatch, sync_worker, prefs_only, shown):
+        """The window can go between the worker scheduling the banner and
+        the Tk loop running it; the hop is skipped, not raised into stderr."""
+        parent = self._run(monkeypatch, {"tag_name": "v1.9.0", "html_url": "u"})
+        assert len(parent.calls) == 1
+        parent.exists = False
+        parent.fire()
+        assert shown == []
+
+    def test_an_absurdly_long_tag_is_refused(self, monkeypatch, sync_worker,
+                                             prefs_only):
+        """The version parse only needs the leading digits, so a megabyte
+        tag would pass it and land in a label and in prefs.json."""
+        parent = self._run(monkeypatch, {"tag_name": "v9.9.9-" + "x" * 100,
+                                         "html_url": "u"})
+        assert parent.calls == []
+
+    def test_a_tag_at_the_length_limit_is_still_shown(self, monkeypatch,
+                                                      sync_worker, prefs_only):
+        tag = "v9.9.9-" + "x" * (updater._MAX_TAG - len("v9.9.9-"))
+        assert len(tag) == updater._MAX_TAG
+        parent = self._run(monkeypatch, {"tag_name": tag, "html_url": "u"})
+        assert len(parent.calls) == 1
 
     def test_the_same_version_schedules_nothing(self, monkeypatch, sync_worker,
                                                 prefs_only):
@@ -1545,15 +1630,18 @@ class TestCheckForUpdate:
         assert parent.calls == []
 
     def test_a_missing_html_url_still_schedules_with_an_empty_link(
-            self, monkeypatch, sync_worker, prefs_only):
+            self, monkeypatch, sync_worker, prefs_only, shown):
         parent = self._run(monkeypatch, {"tag_name": "v2.0.0"})
-        assert parent.calls[0][2][-1] == ""
+        parent.fire()
+        assert shown[0][-1] == ""
 
     def test_a_v_prefix_is_stripped_from_both_versions(self, monkeypatch,
-                                                       sync_worker, prefs_only):
+                                                       sync_worker, prefs_only,
+                                                       shown):
         parent = self._run(monkeypatch, {"tag_name": "v2.0.0", "html_url": "u"},
                            current="v1.3.0")
-        assert parent.calls[0][2][1:3] == ("2.0.0", "1.3.0")
+        parent.fire()
+        assert shown[0][1:3] == ("2.0.0", "1.3.0")
 
     def test_a_non_string_tag_is_absorbed(self, monkeypatch, sync_worker,
                                           prefs_only):
@@ -1618,7 +1706,7 @@ class TestUpdateBanner:
         app = make_launcher()
         updater._show_banner(app, "1.9.0", "1.3.0", "v1.9.0", "https://x.test/r")
         banner, = app._banner_slot.winfo_children()
-        assert "Update available — v1.9.0 (you have v1.3.0)" in _widget_texts(banner)
+        assert "Update available: v1.9.0 (you have v1.3.0)" in _widget_texts(banner)
 
     def test_dismissing_remembers_the_tag_and_removes_the_banner(
             self, make_launcher, prefs_dir):
@@ -1636,11 +1724,33 @@ class TestUpdateBanner:
         opened = []
         monkeypatch.setattr(updater.webbrowser, "open", opened.append)
         app = make_launcher(withdraw=False)
-        updater._show_banner(app, "1.9.0", "1.3.0", "v1.9.0", "https://x.test/r")
+        url = "https://github.com/alexboccard/QuantaCrypt/releases/tag/v1.9.0"
+        updater._show_banner(app, "1.9.0", "1.3.0", "v1.9.0", url)
         _show_offscreen(app)
         banner, = app._banner_slot.winfo_children()
         _press(_button(banner, "See what's new"))
-        assert opened == ["https://x.test/r"]
+        assert opened == [url]
+
+    @pytest.mark.parametrize("url", [
+        "https://x.test/r",
+        "http://github.com/alexboccard/QuantaCrypt/releases",        # not TLS
+        "https://github.com/alexboccard/QuantaCrypt-evil/releases",  # sibling repo
+        "https://github.com/someone-else/QuantaCrypt/releases",
+        "javascript:alert(1)",
+        "", None, 42,
+    ])
+    def test_a_link_that_is_not_this_project_on_github_opens_the_releases_page(
+            self, make_launcher, monkeypatch, url):
+        """``html_url`` is whatever the connection delivered; the only page
+        the button may ever open is one under this repository."""
+        opened = []
+        monkeypatch.setattr(updater.webbrowser, "open", opened.append)
+        app = make_launcher(withdraw=False)
+        updater._show_banner(app, "1.9.0", "1.3.0", "v1.9.0", url)
+        _show_offscreen(app)
+        banner, = app._banner_slot.winfo_children()
+        _press(_button(banner, "See what's new"))
+        assert opened == ["https://github.com/alexboccard/QuantaCrypt/releases"]
 
     def test_without_a_slot_it_packs_after_the_second_child(self, tk_root):
         """The fallback keeps the banner below the title block rather than
@@ -1655,7 +1765,7 @@ class TestUpdateBanner:
         assert len(after) == 4
         assert after[:2] == before[:2]
         assert after[2] not in before, "the banner sits third, after the header"
-        assert "Update available — v2.0.0 (you have v1.0.0)" in \
+        assert "Update available: v2.0.0 (you have v1.0.0)" in \
             _widget_texts(after[2])
         assert after[3] is before[2], "the tail is pushed down, not replaced"
         parent.destroy()
@@ -1668,7 +1778,7 @@ class TestUpdateBanner:
         updater._show_banner(parent, "2.0.0", "1.0.0", "v2.0.0", "u")
         slaves = parent.pack_slaves()
         assert len(slaves) == 2 and slaves[0] is only
-        assert "Update available — v2.0.0 (you have v1.0.0)" in \
+        assert "Update available: v2.0.0 (you have v1.0.0)" in \
             _widget_texts(slaves[1])
         parent.destroy()
 

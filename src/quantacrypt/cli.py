@@ -13,6 +13,14 @@ import signal
 import sys
 
 
+def _reconfigure(stream, **kwargs) -> None:
+    """``TextIOWrapper.reconfigure`` where the stream has one; a pipe stood
+    in by something else (tests, an embedding host) is left as it is."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(**kwargs)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="qc-core", description=__doc__.split("\n")[0])
     ap.add_argument("--version", action="store_true", help="print version and exit")
@@ -26,8 +34,13 @@ def main(argv: list[str] | None = None) -> int:
     from quantacrypt.core.service import Service, ServiceStop
 
     # Line-buffered, UTF-8 stdio regardless of locale; nothing but protocol
-    # lines may reach stdout, so logging goes to stderr.
-    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore[union-attr]
+    # lines may reach stdout, so logging goes to stderr.  stdin too: the
+    # PyInstaller bootloader starts the interpreter in isolated mode and
+    # never reads PYTHONIOENCODING, so the frozen helper's stdin followed
+    # the C locale and a non-ASCII password arrived surrogate-escaped and
+    # failed as "damaged file" (review F-041).
+    _reconfigure(sys.stdin, encoding="utf-8", errors="strict")
+    _reconfigure(sys.stdout, encoding="utf-8", line_buffering=True)
     import logging
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="qc-core %(levelname)s %(name)s: %(message)s")

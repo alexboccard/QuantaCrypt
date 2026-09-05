@@ -261,3 +261,152 @@ def test_ci_runs_the_split_gate_and_the_per_file_coverage_floor():
     assert "scripts/check_coverage.py --min 95" in text
     assert "uv lock --check" in text
     assert re.search(r"(?m)^permissions:\n  contents: read$", text)
+
+
+# ── 2026-09 audit: entitlements, debuggability, pinned build inputs ─────────
+
+def test_ad_hoc_signing_adds_no_entitlements_or_timestamp(app_bundle, monkeypatch):
+    monkeypatch.delenv("CODESIGN_IDENTITY", raising=False)
+    calls = _fake_codesign(monkeypatch)
+    build_script._codesign_app_bundle(str(app_bundle), name="quantacrypt")
+    for c in calls:
+        assert "--entitlements" not in c and "--timestamp" not in c and "runtime" not in c
+
+
+def test_a_developer_id_signs_the_executable_and_bundle_with_entitlements(app_bundle, monkeypatch):
+    """The hardened runtime refuses libfuse (another Team ID) and cffi's
+    executable memory unless the two entitlements are granted; notarization
+    needs the secure timestamp.  Nested dylibs carry neither."""
+    monkeypatch.setenv("CODESIGN_IDENTITY", "Developer ID Application: Someone (TEAM)")
+    calls = _fake_codesign(monkeypatch)
+    build_script._codesign_app_bundle(str(app_bundle), name="quantacrypt")
+    signs = [c for c in calls if not _is_verify(c)]
+    exe = str(app_bundle / "Contents" / "MacOS" / "quantacrypt")
+    for c in signs:
+        assert "--timestamp" in c and "runtime" in c
+        entitled = "--entitlements" in c
+        if c[-1] in (exe, str(app_bundle)):
+            assert entitled and c[c.index("--entitlements") + 1] == build_script.ENTITLEMENTS
+        else:
+            assert not entitled, c
+
+
+def test_the_entitlements_file_grants_exactly_what_pyinstaller_needs():
+    import plistlib
+    with open(build_script.ENTITLEMENTS, "rb") as f:
+        ent = plistlib.load(f)
+    assert ent == {
+        "com.apple.security.cs.disable-library-validation": True,
+        "com.apple.security.cs.allow-unsigned-executable-memory": True,
+    }
+
+
+def test_the_native_build_never_injects_get_task_allow():
+    cmd = build_script._native_xcodebuild_cmd("-", "arm64", "/dd")
+    assert "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO" in cmd
+    assert cmd[-1] == "build" and "CODE_SIGNING_ALLOWED=YES" in cmd
+    signed = build_script._native_xcodebuild_cmd("Developer ID Application: X", None, "/dd")
+    assert "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO" in signed
+    assert "CODE_SIGNING_ALLOWED=YES" not in signed and "ARCHS=arm64" not in signed
+
+
+def test_a_debuggable_bundle_stops_the_build(monkeypatch, capsys):
+    def run(cmd, **kw):
+        return SimpleNamespace(returncode=0, stderr="",
+                               stdout="[Key] com.apple.security.get-task-allow\n[Value] [Bool] true\n")
+    monkeypatch.setattr(build_script, "subprocess", SimpleNamespace(run=run))
+    with pytest.raises(SystemExit) as e:
+        build_script._assert_not_debuggable("/some/app.app")
+    assert e.value.code == 1
+    assert "get-task-allow" in capsys.readouterr().out
+
+
+def test_a_non_debuggable_bundle_passes(monkeypatch):
+    def run(cmd, **kw):
+        return SimpleNamespace(returncode=0, stderr="", stdout="[Dict]\n")
+    monkeypatch.setattr(build_script, "subprocess", SimpleNamespace(run=run))
+    build_script._assert_not_debuggable("/some/app.app")
+
+
+lock_subset = _load("qc_lock_subset", os.path.join(SCRIPTS, "lock_subset.py"))
+
+
+def test_lock_subset_extracts_a_hash_pinned_block(tmp_path, capsys):
+    lock = tmp_path / "lock.txt"
+    lock.write_text(
+        "# generated\n"
+        "argon2-cffi==25.1.0 \\\n"
+        "    --hash=sha256:aaaa \\\n"
+        "    --hash=sha256:bbbb\n"
+        "setuptools==84.0.0 \\\n"
+        "    --hash=sha256:cccc\n"
+        "wheel==0.45.0 ; python_version < '3.99' \\\n"
+        "    --hash=sha256:dddd\n", encoding="utf-8")
+    assert lock_subset.main(["--lock", str(lock), "Setuptools", "wheel"]) == 0
+    out = capsys.readouterr().out
+    assert out == ("setuptools==84.0.0 \\\n    --hash=sha256:cccc\n"
+                   "wheel==0.45.0 ; python_version < '3.99' \\\n    --hash=sha256:dddd\n")
+
+
+def test_lock_subset_fails_on_a_package_the_lock_does_not_pin(tmp_path, capsys):
+    lock = tmp_path / "lock.txt"
+    lock.write_text("setuptools==84.0.0 \\\n    --hash=sha256:cccc\n", encoding="utf-8")
+    assert lock_subset.main(["--lock", str(lock), "setuptools", "not-there"]) == 1
+    assert "not-there" in capsys.readouterr().err
+
+
+def test_the_real_lock_pins_the_build_backend(capsys):
+    """CI installs setuptools from this block before building with no
+    isolation; the block has to exist and carry hashes."""
+    assert lock_subset.main(["--lock", os.path.join(ROOT, "requirements-lock.txt"), "setuptools"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("setuptools==") and "--hash=sha256:" in out
+
+
+def test_every_workflow_action_is_pinned_to_a_commit_sha():
+    for name in ("ci.yml", "release.yml", "codeql.yml"):
+        for m in re.finditer(r"uses:\s*(\S+)@(\S+)(.*)", _workflow(name)):
+            ref, comment = m.group(2), m.group(3)
+            assert re.fullmatch(r"[0-9a-f]{40}", ref), f"{name}: {m.group(1)}@{ref} is not a SHA"
+            assert re.search(r"#\s*v\d", comment), f"{name}: {m.group(1)} pin lacks a version comment"
+
+
+def test_no_workflow_installs_from_a_mutable_source():
+    for name in ("ci.yml", "release.yml", "codeql.yml"):
+        # Comments may name the anti-patterns; commands may not.
+        text = "\n".join(l for l in _workflow(name).splitlines()
+                         if not l.strip().startswith("#"))
+        assert "brew install" not in text, f"{name}: brew resolves whatever the tap serves that day"
+        assert "--upgrade pip" not in text
+        assert re.search(r"pip install .*(-r requirements-lock\.txt|\.)$", text, re.M)
+        for line in text.splitlines():
+            if "pip install" in line and "-r " in line and "--require-hashes" not in line:
+                raise AssertionError(f"{name}: unpinned install: {line.strip()}")
+
+
+def test_the_release_publishes_checksums_and_provenance():
+    text = _workflow("release.yml")
+    release = _job(text, "release")
+    assert "SHA256SUMS" in release
+    assert "attest-build-provenance" in release
+    assert "id-token: write" in release and "attestations: write" in release
+    native = _job(text, "build-native")
+    assert "get-task-allow" in native, "the artefact check for debuggability"
+    bump = _job(text, "bump-version")
+    assert "persist-credentials: false" in bump
+
+
+def test_the_x86_and_arm_builds_share_one_interpreter_version():
+    text = _workflow("release.yml")
+    ver = re.search(r'PYTHON_VERSION: "(\d+\.\d+\.\d+)"', text).group(1)
+    assert f"python-{ver}-macos11.pkg" in text
+    assert "python-version: ${{ env.PYTHON_VERSION }}" in text
+    assert re.search(r'PYTHON_PKG_SHA256: "[0-9a-f]{64}"', text)
+
+
+def test_install_xcodegen_pins_a_release_and_its_digest():
+    with open(os.path.join(SCRIPTS, "install_xcodegen.sh"), encoding="utf-8") as f:
+        text = f.read()
+    assert re.search(r'^XCODEGEN_VERSION="\d+\.\d+\.\d+"$', text, re.M)
+    assert re.search(r'^XCODEGEN_SHA256="[0-9a-f]{64}"$', text, re.M)
+    assert "shasum -a 256 -c" in text and "set -euo pipefail" in text

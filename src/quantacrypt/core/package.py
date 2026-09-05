@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import zlib
 from typing import Callable, Iterable
 
 from quantacrypt.core import crypto as cc
@@ -34,11 +35,31 @@ _MAX_TAIL = 1 << 20  # 1 MB tail search window for the metadata envelope
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
 
+def _is_int(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _field_bytes(meta: dict, key: str) -> bytes:
+    """Base64-decode a metadata field, reporting a wrong type as a format
+    error rather than the TypeError b64decode raises for a list or a number."""
+    v = meta[key]
+    if not isinstance(v, str):
+        raise ValueError(f"File metadata field {key!r} is not text; the file may be corrupt")
+    try:
+        return _b64.b64decode(v, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"File metadata field {key!r} is not valid; the file may be corrupt") from exc
+
+
 def load_pkg(path: str) -> dict:
     """Parse a .qcx file's metadata envelope without reading the payload.
 
     Raises ``ValueError`` with a user-readable reason for anything that is
-    not a supported QuantaCrypt file.
+    not a supported QuantaCrypt file.  The envelope is attacker-controlled
+    cleartext, so every field the decrypt path does arithmetic on is
+    type-checked here: a string ``version`` or a float ``threshold`` used to
+    surface as a TypeError, which the helper reports as an internal error
+    and the argv launcher swallowed.
     """
     file_size = os.path.getsize(path)
     tail_size = min(file_size, _MAX_TAIL)
@@ -54,13 +75,18 @@ def load_pkg(path: str) -> dict:
     n = struct.unpack(">I", tail[o:o + 4])[0]
     if o + 4 + n > len(tail):
         raise ValueError("File appears truncated or corrupt")
-    pkg = json.loads(tail[o + 4:o + 4 + n])
+    try:
+        pkg = json.loads(tail[o + 4:o + 4 + n])
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("File metadata is not valid JSON; the file may be corrupt") from exc
     if not isinstance(pkg, dict):
-        raise ValueError("File metadata envelope is not a valid dictionary — file may be corrupt")
+        raise ValueError("File metadata envelope is not a valid dictionary; the file may be corrupt")
     meta = pkg.get("meta", {})
     if not isinstance(meta, dict):
-        raise ValueError("File metadata is not a valid dictionary — file may be corrupt")
+        raise ValueError("File metadata is not a valid dictionary; the file may be corrupt")
     ver = meta.get("version", 1)
+    if not _is_int(ver):
+        raise ValueError("File format version is not a number; the file may be corrupt")
     if ver > MAX_FORMAT_VERSION:
         raise ValueError(
             f"This file was created with a newer version of QuantaCrypt (format v{ver}). "
@@ -73,15 +99,31 @@ def load_pkg(path: str) -> dict:
             f"then re-encrypt with this version."
         )
     if "mode" not in meta:
-        raise ValueError("File metadata is missing required field 'mode' — file may be corrupt")
+        raise ValueError("File metadata is missing required field 'mode'; the file may be corrupt")
     if meta["mode"] not in ("single", "shamir"):
-        raise ValueError(f"Unknown encryption mode {meta['mode']!r} — file may be corrupt or from an unsupported version")
+        raise ValueError(f"Unknown encryption mode {meta['mode']!r}. The file may be corrupt or from an unsupported version")
     if meta["mode"] == "shamir":
         for field in ("threshold", "total"):
             if field not in meta:
-                raise ValueError(f"Shamir file metadata is missing required field '{field}' — file may be corrupt")
+                raise ValueError(f"Shamir file metadata is missing required field '{field}'; the file may be corrupt")
+            if not _is_int(meta[field]):
+                raise ValueError(f"Shamir file metadata field '{field}' is not a number; the file may be corrupt")
         if not (2 <= meta["threshold"] <= meta["total"] <= 255):
             raise ValueError(f"Invalid Shamir parameters: threshold={meta.get('threshold')}, total={meta.get('total')}")
+    for field in ("payload_chunk_count", "payload_offset", "chunk_size"):
+        if field in meta and (not _is_int(meta[field]) or meta[field] < 0):
+            raise ValueError(f"File metadata field '{field}' is not a valid count; the file may be corrupt")
+    # Format 2 names its KEM and (password mode) its Argon2 parameters;
+    # both are validated before anything is derived from them.
+    if ver >= 2:
+        if "kem" not in meta:
+            raise ValueError("File metadata does not name its key encapsulation; the file may be corrupt")
+        if meta["mode"] == "single" and "argon2" not in meta:
+            raise ValueError("File metadata does not record its password-hardening parameters; the file may be corrupt")
+    if "kem" in meta:
+        cc.validate_kem(meta["kem"])
+    if "argon2" in meta:
+        cc.validate_argon2_params(meta["argon2"])
     return pkg
 
 
@@ -118,7 +160,7 @@ def normalize_shares(shares: Iterable[str]) -> list[str]:
             else:
                 code = cc.encode_share(cc.mnemonic_to_share(" ".join(s.split())))
         except Exception as exc:
-            raise InvalidInput(f"Share {i} can't be read — {exc}") from exc
+            raise InvalidInput(f"Share {i} can't be read: {exc}") from exc
         if code in seen:
             continue
         seen.add(code)
@@ -204,21 +246,26 @@ def derive_final_key(meta: dict, *, password: str | None = None,
             raise CancelledOperation("Cancelled")
 
     def d64(k):
-        return _b64.b64decode(meta[k])
+        return _field_bytes(meta, k)
+
+    # Format 1 carries neither field: the legacy KEM and the shipped Argon2
+    # parameters are implied.  Format 2 names both, validated by load_pkg.
+    kem = cc.validate_kem(meta.get("kem"))
+    argon2 = meta.get("argon2")
 
     if meta["mode"] == "single":
         if not password:
             raise InvalidInput("A password is required to open this file")
         _p("Deriving 512-bit password key (Argon2id)...")
         pw_bytes = password.encode()
-        argon_key = cc.argon2id_derive(pw_bytes, d64("argon_salt"))
+        argon_key = cc.argon2id_derive(pw_bytes, d64("argon_salt"), argon2)
         del pw_bytes
         _check()
         _p("Decrypting Kyber private key...")
         sk = cc.aes_gcm_decrypt(argon_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
         _check()
         _p("Decapsulating shared secret...")
-        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"))
+        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"), kem)
         final_key = cc.xor_bytes(argon_key, kem_ss)
         hmac_key = final_key
     else:
@@ -235,7 +282,7 @@ def derive_final_key(meta: dict, *, password: str | None = None,
         sk = cc.aes_gcm_decrypt(master_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
         _check()
         _p("Decapsulating shared secret...")
-        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"))
+        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"), kem)
         final_key = cc.xor_bytes(master_key, kem_ss)
         hmac_key = master_key
     _check()
@@ -265,14 +312,14 @@ def verify_first_chunk(qcx_path: str, meta: dict, final_key: bytes) -> None:
             raise ValueError("File appears truncated")
         seq = struct.unpack(">I", seq_raw)[0]
         if seq != 0:
-            raise ValueError(f"First chunk has unexpected sequence number {seq} — file may be corrupt")
+            raise ValueError(f"First chunk has unexpected sequence number {seq}. The file may be corrupt")
         len_raw = f.read(4)
         if len(len_raw) < 4:
             raise ValueError("File appears truncated")
         ct_len = struct.unpack(">I", len_raw)[0]
         if ct_len > cc.CHUNK_SIZE + 16:
             raise ValueError(
-                f"Chunk declares an implausible size ({ct_len} bytes) — file may be corrupt")
+                f"Chunk declares an implausible size ({ct_len} bytes). The file may be corrupt")
         ct = f.read(ct_len)
     nonce = cc._chunk_nonce(base_nonce, 0)
     aad = cc._chunk_aad(0, meta["payload_chunk_count"] == 1)
@@ -280,8 +327,8 @@ def verify_first_chunk(qcx_path: str, meta: dict, final_key: bytes) -> None:
         cipher.decrypt(nonce, ct, aad)
     except Exception as exc:  # InvalidTag: the key is proven, so the data is bad
         raise CorruptPayload(
-            "The file's contents are damaged or were altered after encryption — "
-            "the password is right, but this copy can't be restored. Try another "
+            "The file's contents are damaged or were altered after encryption. "
+            "The password is right, but this copy can't be restored. Try another "
             "copy or a backup.") from exc
 
 
@@ -338,11 +385,15 @@ def _mark_quarantined(path: str) -> None:
     value = f"{_QUARANTINE_FLAGS};{stamp};QuantaCrypt;".encode()
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        libc.setxattr(
-            os.fsencode(path), b"com.apple.quarantine",
-            value, len(value), 0, 0,
-        )
-    except (OSError, AttributeError, ValueError):
+        setxattr = libc.setxattr
+        # Declared, not inferred: without argtypes ctypes passes the size_t
+        # as a C int and the call only works because libffi happens to
+        # sign-extend it on arm64.
+        setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+        setxattr.restype = ctypes.c_int
+        setxattr(os.fsencode(path), b"com.apple.quarantine", value, len(value), 0, 0)
+    except (OSError, AttributeError, ValueError, TypeError):
         pass
 
 
@@ -410,11 +461,44 @@ def folder_stats(folder: str) -> tuple[int, int]:
     return count, total
 
 
-def zip_folder(folder: str, dst_path: str, progress_cb: Progress = None,
-               cancel_check: CancelCheck = None) -> list[str]:
-    """Zip folder into dst_path with paths relative to folder's parent so the
-    top-level directory name survives inside the archive.  The archive being
-    written is skipped if the walk reaches it (output inside source).
+#: Members below this size are always deflated: the sample would be the whole
+#: file and zip headers dominate anyway.
+_ZIP_SAMPLE_MIN = 4096
+_ZIP_SAMPLE = 64 << 10
+
+
+def _compress_type(path: str) -> int:
+    """Deflate members that compress, store the ones that do not.
+
+    zlib level 6 on already-compressed data (photos, video, archives, most
+    office documents) gains nothing and ran at 30–80 MB/s, which made it the
+    bottleneck of folder encryption.  A 64 KiB sample through level 1 is a
+    cheap, reliable predictor: if it saves less than 5 % the member is stored.
+    """
+    try:
+        if os.path.getsize(path) < _ZIP_SAMPLE_MIN:
+            return zipfile.ZIP_DEFLATED
+        with open(path, "rb") as f:
+            sample = f.read(_ZIP_SAMPLE)
+    except OSError:
+        return zipfile.ZIP_DEFLATED
+    if len(zlib.compress(sample, 1)) > len(sample) * 0.95:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
+def zip_folder(folder: str, dst, progress_cb: Progress = None,
+               cancel_check: CancelCheck = None, *,
+               skip_path: str | None = None) -> list[str]:
+    """Zip folder into *dst* — a path, or a binary sink with ``write()`` —
+    with paths relative to folder's parent so the top-level directory name
+    survives inside the archive.  The archive being written (or *skip_path*,
+    for a sink) is skipped if the walk reaches it (output inside source).
+
+    Given a sink with no ``seek``, zipfile writes data descriptors instead
+    of seeking back to patch each local header, which is what lets
+    ``encrypt_to_qcx`` archive a folder straight into the cipher with no
+    plaintext staging file on disk.
 
     Returns the folder-relative paths of the symlinks that were skipped.
 
@@ -430,11 +514,14 @@ def zip_folder(folder: str, dst_path: str, progress_cb: Progress = None,
     folders survive the round trip.
     """
     parent = os.path.dirname(os.path.abspath(folder))
-    dst_abs = os.path.abspath(dst_path)
+    if isinstance(dst, (str, bytes, os.PathLike)):
+        dst_abs = os.path.abspath(dst)
+    else:
+        dst_abs = os.path.abspath(skip_path) if skip_path else None
     total_files, _ = folder_stats(folder)
     done = 0
     skipped: list[str] = []
-    with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
         for dirpath, dirnames, filenames in os.walk(folder):
             dirnames.sort()
             filenames.sort()
@@ -457,15 +544,16 @@ def zip_folder(folder: str, dst_path: str, progress_cb: Progress = None,
                 if os.path.islink(full):
                     skipped.append(os.path.relpath(full, folder))
                     continue
-                zf.write(full, os.path.relpath(full, parent))
+                zf.write(full, os.path.relpath(full, parent),
+                         compress_type=_compress_type(full))
                 done += 1
                 if progress_cb and total_files:
                     pct = done / total_files
                     progress_cb(f"Compressing folder… {int(pct * 100)}% ({done}/{total_files} files)")
     if skipped and progress_cb:
         progress_cb(
-            f"Skipped {len(skipped)} symlink{'' if len(skipped) == 1 else 's'} "
-            "— links are not followed, so their targets stay out of the archive."
+            f"Skipped {len(skipped)} symlink{'' if len(skipped) == 1 else 's'}. "
+            "Links are not followed, so their targets stay out of the archive."
         )
     return skipped
 
@@ -477,9 +565,11 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
                    n: int | None = None, progress: Progress = None,
                    cancel_check: CancelCheck = None,
                    embed_binary: str | None = None) -> dict:
-    """Encrypt a file or folder to ``output`` (.qcx).  Atomic: writes to
-    ``output + '.tmp'`` and renames.  Folders are zipped first to a 0600
-    staging file beside the output.  Returns a JSON-able summary."""
+    """Encrypt a file or folder to ``output`` (.qcx).  Atomic: writes to a
+    0600 temp beside the output and renames.  A folder is archived straight
+    into the cipher — no plaintext staging file ever touches the disk, and
+    the transient space needed is the ciphertext alone.  Returns a JSON-able
+    summary."""
     if mode not in ("password", "single", "shamir"):
         raise InvalidRequest(f"Unknown mode {mode!r}")
     single = mode in ("password", "single")
@@ -502,21 +592,19 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
     if is_folder and out_abs.startswith(src_abs + os.sep):
         raise InvalidInput("The output file can't be inside the folder being encrypted")
 
-    staging = None
     skipped_links: list[str] = []
     fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(out_abs)}.qc-enc-",
                                dir=os.path.dirname(out_abs) or None)
     os.close(fd)
     try:
         if is_folder:
-            fd, staging = tempfile.mkstemp(
-                prefix=f".{os.path.basename(out_abs)}.qc-staging-", suffix=".zip",
-                dir=os.path.dirname(out_abs) or None)
-            os.close(fd)
-            skipped_links = zip_folder(source, staging, progress_cb=progress,
-                                       cancel_check=cancel_check)
-            src_path = staging
             orig = os.path.basename(src_abs.rstrip(os.sep)) + ".zip"
+
+            def src_path(sink):
+                """Archive the folder into the cipher's sink."""
+                skipped_links.extend(zip_folder(
+                    source, sink, progress_cb=progress,
+                    cancel_check=cancel_check, skip_path=tmp))
         else:
             src_path = source
             orig = os.path.basename(source)
@@ -539,7 +627,9 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
                 meta, shares = cc.encrypt_shamir_streaming(
                     src_path, f, n, k, filename=orig,
                     progress_cb=progress, cancel_check=cancel_check)
-            meta["payload_offset"] = payload_offset
+            # Format 2 records (and authenticates) the offset itself; a
+            # format-1 writer would not have.
+            meta.setdefault("payload_offset", payload_offset)
             if progress:
                 progress("Writing binary... 100%")
             blob = json.dumps({"meta": meta}, separators=(",", ":")).encode()
@@ -561,12 +651,6 @@ def encrypt_to_qcx(source: str, output: str, *, mode: str,
         except OSError:
             pass
         raise
-    finally:
-        if staging:
-            try:
-                os.remove(staging)
-            except OSError:
-                pass
     return {
         "output": out_abs,
         "size": os.path.getsize(out_abs),
@@ -614,7 +698,7 @@ def decrypt_qcx(path: str, output_dir: str, *, password: str | None = None,
                     # HMAC), so a chunk that fails to authenticate is damage.
                     raise CorruptPayload(
                         "The file's contents are damaged or were altered after "
-                        "encryption — the password is right, but this copy can't "
+                        "encryption. The password is right, but this copy can't "
                         "be restored. Try another copy or a backup.") from exc
                 raise
         name = safe_output_name(fname)

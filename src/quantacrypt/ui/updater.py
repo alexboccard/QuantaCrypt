@@ -20,12 +20,24 @@ import urllib.request
 import webbrowser
 from typing import Optional, Tuple
 
-from quantacrypt.ui.shared import C, F, SP, ICON, FlatButton, AppPrefs
+from quantacrypt.ui.shared import C, F, SP, ICON, FlatButton, AppPrefs, safe_after
 
 _REPO = "alexboccard/QuantaCrypt"
 _API_URL = f"https://api.github.com/repos/{_REPO}/releases/latest"
+_RELEASES_URL = f"https://github.com/{_REPO}/releases"
 _TIMEOUT = 5  # seconds
+_MAX_BODY = 1 << 20   # a release document is a few KB; anything more is not one
+_MAX_TAG = 64         # longest tag ever shown or remembered
 _PREF_DISMISSED = "dismissed_update"
+
+
+def _release_page(url) -> str:
+    """``html_url`` from the response, or the releases page when it points
+    anywhere but this project on GitHub — the JSON is only as trustworthy
+    as the connection that carried it."""
+    if isinstance(url, str) and url.startswith(f"https://github.com/{_REPO}/"):
+        return url
+    return _RELEASES_URL
 
 
 def _parse_version(tag: str) -> Tuple[int, ...]:
@@ -51,7 +63,7 @@ def _fetch_latest() -> Optional[dict]:
                      "User-Agent": "QuantaCrypt-UpdateCheck"},
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            return json.loads(resp.read())
+            return json.loads(resp.read(_MAX_BODY))
     except Exception:
         return None
 
@@ -72,7 +84,7 @@ def check_for_update(parent: "tk.Toplevel", current_version: str) -> None:
         tag = data.get("tag_name", "")
         html_url = data.get("html_url", "")
 
-        if not tag:
+        if not tag or not isinstance(tag, str) or len(tag) > _MAX_TAG:
             return
 
         try:
@@ -90,12 +102,10 @@ def check_for_update(parent: "tk.Toplevel", current_version: str) -> None:
         display_ver = tag.lstrip("vV")
         current_disp = current_version.lstrip("vV")
 
-        # Schedule the UI update on the main thread
-        try:
-            parent.after(0, _show_banner, parent, display_ver, current_disp,
-                         tag, html_url)
-        except Exception:
-            pass  # widget may have been destroyed
+        # Schedule the UI update on the main thread; safe_after also skips
+        # the hop when the launcher is destroyed before it fires.
+        safe_after(parent, lambda: _show_banner(parent, display_ver, current_disp,
+                                                tag, html_url))
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -124,7 +134,7 @@ def _show_banner(parent: "tk.Toplevel", version: str, current: str,
     inner = tk.Frame(banner, bg=C["surface"])
     inner.pack(fill="x", padx=SP["m"], pady=SP["s"])
 
-    tk.Label(inner, text=f"Update available — v{version} (you have v{current})",
+    tk.Label(inner, text=f"Update available: v{version} (you have v{current})",
              font=F["caption"], bg=C["surface"], fg=C["text2"]).pack(side="left")
 
     def _dismiss():
@@ -133,5 +143,5 @@ def _show_banner(parent: "tk.Toplevel", version: str, current: str,
 
     FlatButton(inner, ICON["close"], _dismiss, primary=False, small=True).pack(
         side="right")
-    FlatButton(inner, "See what's new", lambda: webbrowser.open(url),
+    FlatButton(inner, "See what's new", lambda: webbrowser.open(_release_page(url)),
                primary=False, small=True).pack(side="right", padx=(0, SP["s"]))

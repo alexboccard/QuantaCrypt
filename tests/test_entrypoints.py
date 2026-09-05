@@ -891,7 +891,8 @@ class TestRealPackageParsingAtLaunch:
 
     def test_a_real_envelope_reaches_the_decryptor(self, app, ui, monkeypatch, tmp_path):
         target = self._envelope(tmp_path / "real.qcx",
-                                {"mode": "single", "version": cc.MAX_FORMAT_VERSION})
+                                {"mode": "single", "version": cc.MAX_FORMAT_VERSION,
+                                 "kem": cc.KEM_DEFAULT, "argon2": cc.argon2_params()})
         monkeypatch.setattr(sys, "argv", ["quantacrypt", target])
         qmain.main()
         assert len(ui.decryptors) == 1
@@ -918,20 +919,20 @@ class TestRealPackageParsingAtLaunch:
         assert "newer version" in ui.errors[0].message
         assert app.destroyed is True
 
-    def test_a_non_integer_format_version_crashes_the_launch(self, app, ui,
-                                                             monkeypatch, tmp_path):
-        """BUG (documented, not fixed): load_pkg compares meta['version'] with
-        `>` before checking its type, so a corrupt envelope carrying a string
-        raises TypeError.  main() only catches (ValueError, OSError), so
-        opening such a file aborts the launch with a traceback instead of the
-        "Cannot open file" dialog every other corruption gets."""
+    def test_a_non_integer_format_version_is_reported_not_crashed(self, app, ui,
+                                                                  monkeypatch, tmp_path):
+        """load_pkg used to compare meta['version'] with `>` before checking
+        its type, so a corrupt envelope carrying a string raised TypeError
+        past main()'s handler and the launch died with a traceback.  Every
+        ill-typed field is a format error now, and main() reports anything
+        the parser raises."""
         target = self._envelope(tmp_path / "corrupt.qcx",
                                 {"mode": "single", "version": "2"})
         monkeypatch.setattr(sys, "argv", ["quantacrypt", target])
-        with pytest.raises(TypeError):
-            qmain.main()
-        assert ui.errors == []
-        assert app.destroyed is False, "the root is left alive with no window"
+        qmain.main()
+        assert [e.title for e in ui.errors] == ["Cannot open file"]
+        assert "not a number" in ui.errors[0].message
+        assert app.destroyed is True
 
 
 class TestFrozenModuleSetup:
@@ -1093,6 +1094,16 @@ class TestQcCoreSession:
         helper.run(_lines({"id": "1", "op": "ping"}))
         assert helper.out.encoding == "utf-8"
         assert helper.out.line_buffering is True
+
+    def test_stdin_is_reconfigured_to_strict_utf8(self, helper, monkeypatch):
+        """The frozen helper's bootloader starts Python in isolated mode and
+        never reads PYTHONIOENCODING, so stdin followed the C locale and a
+        non-ASCII password arrived surrogate-escaped (review F-041)."""
+        raw = io.BytesIO(json.dumps({"id": "1", "op": "ping"}).encode() + b"\n")
+        stdin = io.TextIOWrapper(raw, encoding="latin-1", errors="surrogateescape")
+        assert helper.run(stdin) == 0
+        assert stdin.encoding == "utf-8" and stdin.errors == "strict"
+        assert [e["id"] for e in helper.events()] == ["1"]
 
     def test_non_ascii_request_ids_survive_the_round_trip(self, helper):
         rid = "vøl—ümé-→-测试"

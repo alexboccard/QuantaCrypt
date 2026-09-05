@@ -21,9 +21,10 @@ struct HelperLaunch: Sendable, Equatable {
     let arguments: [String]
     /// Which resolution rule produced this launch, for the status line.
     let origin: String
-    /// The code hash this binary had when it was resolved, for a helper
-    /// outside the app bundle. Nil inside the bundle, whose payload the app's
-    /// own signature already covers.
+    /// The code hash this binary had when it was resolved, re-measured
+    /// immediately before `exec`. Bundled and approved helpers both carry
+    /// one; nil only for a launch whose signature was never pinned (the
+    /// DEBUG-only development helpers, which are Python scripts).
     let approvedCDHash: Data?
 
     init(executable: URL, arguments: [String], origin: String, approvedCDHash: Data? = nil) {
@@ -41,6 +42,53 @@ extension Logger {
     static let client = Logger(subsystem: "com.alexboccard.quantacrypt", category: "core-client")
 }
 
+/// Splits a byte stream into newline-terminated lines, holding at most
+/// `limit` bytes of an unfinished line.
+///
+/// The helper is our own binary and every line it writes is one JSON
+/// event, so a line that runs past 16 MiB without a newline is not a big
+/// result — it is a helper that has stopped speaking the protocol, and the
+/// old reader would have kept appending to `buffer` for as long as it kept
+/// talking.
+struct LineFramer: Sendable {
+    static let maxLineBytes = 16 << 20
+
+    let limit: Int
+    private var buffer = Data()
+
+    init(limit: Int = LineFramer.maxLineBytes) {
+        self.limit = limit
+    }
+
+    /// Feed `chunk`; returns every line completed by it, in order. Throws
+    /// once the unfinished line exceeds `limit`, after which the caller
+    /// should stop reading — nothing further can be framed.
+    mutating func append(_ chunk: Data) throws -> [String] {
+        buffer.append(chunk)
+        var lines: [String] = []
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            lines.append(String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self))
+            buffer.removeSubrange(buffer.startIndex...nl)
+        }
+        guard buffer.count <= limit else {
+            let over = buffer.count
+            buffer.removeAll()
+            throw CoreError(
+                code: .protocolError,
+                message: "The encryption helper sent more than \(limit >> 20) MB without finishing a line, so QuantaCrypt stopped it. Try the action again; it restarts automatically.",
+                detail: "stdout line reached \(over) bytes without a newline (limit \(limit))")
+        }
+        return lines
+    }
+
+    /// The unterminated tail at EOF, if any.
+    mutating func flush() -> String? {
+        guard !buffer.isEmpty else { return nil }
+        defer { buffer.removeAll() }
+        return String(decoding: buffer, as: UTF8.self)
+    }
+}
+
 /// Spawns `qc-core` with `Process` and pipes. Stdout lines are the protocol;
 /// stderr is forwarded to the unified log (it never carries params).
 actor ProcessTransport: CoreTransport {
@@ -50,6 +98,33 @@ actor ProcessTransport: CoreTransport {
 
     init(launch: HelperLaunch) {
         self.launch = launch
+    }
+
+    // MARK: Environment
+
+    /// The variables a helper launch inherits from the app. Nothing else
+    /// crosses.
+    ///
+    /// Every password and share goes to the helper's stdin, and the
+    /// environment is where a same-user process can decide what code that
+    /// helper runs before it reads a byte: `DYLD_INSERT_LIBRARIES` picks a
+    /// dylib for the loader, `PYTHONPATH` and `PYTHONSTARTUP` pick code for
+    /// the interpreter, `FUSE_LIBRARY_PATH` picks the FUSE backend. The
+    /// hardened runtime drops `DYLD_*` from this app's *own* process, but
+    /// whatever shaped the environment the app was launched with — a
+    /// LaunchAgent, `launchctl setenv`, a shell — used to reach the helper
+    /// unchanged, because the launch copied `environ` wholesale. So the
+    /// helper gets a search path, a home, a temp dir, a locale and an
+    /// identity, plus the two Python settings the protocol depends on.
+    static let inheritedEnvironmentKeys: Set<String> = [
+        "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
+    ]
+
+    static func helperEnvironment(inheriting parent: [String: String]) -> [String: String] {
+        var env = parent.filter { inheritedEnvironmentKeys.contains($0.key) }
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
     }
 
     func start() async throws -> AsyncThrowingStream<String, any Error> {
@@ -62,10 +137,7 @@ actor ProcessTransport: CoreTransport {
         let process = Process()
         process.executableURL = launch.executable
         process.arguments = launch.arguments
-        var env = ProcessInfo.processInfo.environment
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
-        process.environment = env
+        process.environment = Self.helperEnvironment(inheriting: ProcessInfo.processInfo.environment)
 
         let stdin = Pipe()
         let stdout = Pipe()
@@ -85,12 +157,14 @@ actor ProcessTransport: CoreTransport {
         // is the worst failure mode this client can have.
         // Tracebacks and unmount failures are the only trace of why a
         // volume was torn down uncleanly, so they must survive the default
-        // log level. Stderr never carries params, hence `.public`.
+        // log level and stay `.public`. Everything else on stderr is the
+        // helper's INFO logging, which names volume paths and mount points;
+        // that is `.private` so it is redacted in a log a user hands over.
         Self.readLines(from: stderr.fileHandleForReading, name: "stderr") { line in
             if line.contains("Traceback") || line.contains("Error") {
                 Logger.helper.error("\(line, privacy: .public)")
             } else {
-                Logger.helper.info("\(line, privacy: .public)")
+                Logger.helper.info("\(line, privacy: .private)")
             }
         } onEnd: { _ in }
 
@@ -100,12 +174,18 @@ actor ProcessTransport: CoreTransport {
                 continuation.yield(line)
             } onEnd: { error in
                 continuation.finish(throwing: error)
+                // A reader that gave up on the protocol has a helper still
+                // running on the other end; stop it so the next request
+                // launches a fresh one rather than talking past this one.
+                if error != nil {
+                    Task { await self.terminate(timeout: .seconds(1)) }
+                }
             }
             continuation.onTermination = { _ in try? outHandle.close() }
         }
     }
 
-    /// Re-measure an out-of-bundle helper immediately before `exec`.
+    /// Re-measure the helper immediately before `exec`.
     ///
     /// `HelperLocator.resolve()` runs once per launch and the approval it
     /// consults is per session, so between the check and `Process.run()` the
@@ -131,18 +211,20 @@ actor ProcessTransport: CoreTransport {
                                   onLine: @escaping @Sendable (String) -> Void,
                                   onEnd: @escaping @Sendable ((any Error)?) -> Void) {
         let thread = Thread {
-            var buffer = Data()
+            var framer = LineFramer()
             while true {
                 let chunk = handle.availableData   // blocks until data or EOF
                 if chunk.isEmpty { break }
-                buffer.append(chunk)
-                while let nl = buffer.firstIndex(of: 0x0A) {
-                    let lineData = buffer.subdata(in: buffer.startIndex..<nl)
-                    buffer.removeSubrange(buffer.startIndex...nl)
-                    onLine(String(decoding: lineData, as: UTF8.self))
+                do {
+                    for line in try framer.append(chunk) { onLine(line) }
+                } catch {
+                    Logger.helper.error("\(name, privacy: .public) exceeded the line limit; closing the pipe")
+                    try? handle.close()
+                    onEnd(error)
+                    return
                 }
             }
-            if !buffer.isEmpty { onLine(String(decoding: buffer, as: UTF8.self)) }
+            if let tail = framer.flush() { onLine(tail) }
             Logger.helper.debug("\(name, privacy: .public) reached EOF")
             onEnd(nil)
         }

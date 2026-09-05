@@ -96,6 +96,16 @@ def _toplevel(app, title):
     return None
 
 
+def _text_widgets(widget, out=None):
+    import tkinter as tk
+    out = [] if out is None else out
+    if isinstance(widget, tk.Text):
+        out.append(widget)
+    for child in widget.winfo_children():
+        _text_widgets(child, out)
+    return out
+
+
 def _shares_2_of_3():
     import secrets
     raw = cc.shamir_split(secrets.token_bytes(cc.KEY_BYTES), 3, 2)
@@ -1071,7 +1081,7 @@ class TestCreateRun:
         release.set()
         assert _pump_until(app, lambda: not app._busy)
 
-        assert app._err.cget("text") == "Creation cancelled — nothing was kept."
+        assert app._err.cget("text") == "Creation cancelled. Nothing was kept."
         assert open(pw_volume, "rb").read() == before
         assert not os.path.exists(pw_volume + ".part")
         assert app.focus_lastfor() is app._loc_entry
@@ -1120,7 +1130,7 @@ class TestCreateRun:
         app._do_create()
         assert _pump_until(app, lambda: not app._busy)
         assert not path.exists()
-        assert app._err.cget("text") == "Creation cancelled — nothing was kept."
+        assert app._err.cget("text") == "Creation cancelled. Nothing was kept."
 
     def test_a_failure_after_the_cancel_flag_is_reported_as_a_cancel(
             self, env, monkeypatch):
@@ -1139,7 +1149,7 @@ class TestCreateRun:
         _set_password(app, PW)
         app._do_create()
         assert _pump_until(app, lambda: not app._busy)
-        assert app._err.cget("text") == "Creation cancelled — nothing was kept."
+        assert app._err.cget("text") == "Creation cancelled. Nothing was kept."
         assert not path.exists()
 
     def test_cancel_does_nothing_when_no_creation_is_running(self, env):
@@ -1165,8 +1175,8 @@ class TestCreateRun:
         _set_password(app, PW)
         app._do_create()
         assert _pump_until(app, lambda: not app._busy)
-        assert app._err.cget("text") == ("Couldn't create the volume — File not "
-                                         "found — it may have been moved or deleted.")
+        assert app._err.cget("text") == ("Couldn't create the volume: File not "
+                                         "found. It may have been moved or deleted.")
         assert app.focus_lastfor() is app._loc_entry
         assert not path.exists()
 
@@ -1212,10 +1222,22 @@ class TestCreateRun:
         assert not app.winfo_exists()
         assert env.confirms == [], "no 'Mount it now?' offer on a dead window"
 
+    def test_a_null_path_in_the_recent_volumes_store_does_not_stop_the_window(
+            self, env):
+        """The store prefills the mount panel from the constructor; an
+        ill-typed entry must read as "nothing recent", not a TypeError that
+        turns every Volumes click into "Cannot open window"."""
+        import json
+        (env.tmp_path / "recent-volumes.json").write_text(
+            json.dumps([{"path": None}, {"path": 0}, {"path": {"x": 1}}]))
+        app = env.make()
+        assert app.winfo_exists()
+        assert app._mount_path_var.get() == ""
+
     def test_a_plain_string_error_is_shown_as_written(self, env):
         app = env.make()
         app._on_create_error("the disk went away")
-        assert app._err.cget("text") == "Couldn't create the volume — the disk went away"
+        assert app._err.cget("text") == "Couldn't create the volume: the disk went away"
 
     def test_the_end_of_run_handlers_tolerate_a_bar_that_was_never_built(self, env):
         """Both run from ``after`` hops that can outlive the run that made the
@@ -1223,9 +1245,9 @@ class TestCreateRun:
         app = env.make()
         assert app._progress is None
         app._on_create_cancelled()
-        assert app._err.cget("text") == "Creation cancelled — nothing was kept."
+        assert app._err.cget("text") == "Creation cancelled. Nothing was kept."
         app._on_create_error(ValueError("nope"))
-        assert app._err.cget("text") == "Couldn't create the volume — nope"
+        assert app._err.cget("text") == "Couldn't create the volume: nope"
 
 
 # ── Recovery-shares dialog ───────────────────────────────────────────────────
@@ -1271,7 +1293,7 @@ class TestSharesDialog:
         # With no filename to name, the leave-guard says "the volume".
         env.reply(False)
         _button(win, "I've saved all shares")._fire()
-        assert "without them, the volume can never be opened again" in \
+        assert "Without them, the volume can never be opened again" in \
             env.confirm_msgs[-1]
         assert win.winfo_exists() and app._pending_shares == shares
 
@@ -1283,6 +1305,25 @@ class TestSharesDialog:
         assert btn.cget("text") == "✓ Copied"
         # The label goes back to "Copy" on its own.
         assert _pump_until(app, lambda: btn.cget("text") == "Copy", 4)
+
+    def test_command_c_on_a_share_text_is_a_concealed_timed_copy(self, env, nomodal):
+        """Select-all + ⌘C on the share (or the context menu's Copy, which
+        raises the same <<Copy>>) must arm the countdown like the button —
+        Tk's stock handler would hand a clipboard manager the share for ever."""
+        app, win, shares = self._open(env)
+        txt = _text_widgets(win)[0]
+        assert txt.get("1.0", "end").strip() == shares[0]
+        win.clipboard_clear()
+        txt.tag_add("sel", "1.0", "end")
+        txt.event_generate("<<Copy>>")
+        app.update()
+        assert win.clipboard_get() == shares[0]
+        assert any(t.startswith("Clipboard clears in") for t in _widget_texts(win))
+        assert _button(win, "✓ Copied") is not None
+        # And the leave-guard knows a copy happened.
+        env.reply(False)
+        _button(win, "I've saved all shares")._fire()
+        assert "Copying isn't enough" in env.confirm_msgs[-1]
 
     def test_a_refused_clipboard_is_reported_on_the_button(self, env, nomodal):
         import tkinter as tk
@@ -1304,7 +1345,7 @@ class TestSharesDialog:
         assert target.exists()
         assert oct(target.stat().st_mode & 0o777) == "0o600"
         body = target.read_text()
-        assert body.startswith("QuantaCrypt recovery shares — 2 of 3 needed")
+        assert body.startswith("QuantaCrypt recovery shares: 2 of 3 needed")
         assert pkg.normalize_shares(_parse_share_text(body)) == shares
         note = [t for t in _widget_texts(win) if t.startswith("✓ Saved all 3 shares")]
         assert note and "vault.shares.txt" in note[0]
@@ -1460,7 +1501,7 @@ class TestSetupScreen:
         app = _setup_app(env)
         _button(app._setup_frame, "Check again")._fire()
         assert app._recheck_lbl.cget("text") == (
-            "Checked just now — still missing: Mounting helper, Disk mounting support.")
+            "Checked just now. Still missing: Mounting helper, Disk mounting support.")
         assert app._setup_frame.winfo_ismapped()
 
     def test_rechecking_after_a_partial_install_updates_only_that_row(self, env):
@@ -1471,7 +1512,7 @@ class TestSetupScreen:
         assert app._comp_widgets["fusepy"]["icon_lbl"].cget("text") == "✓"
         assert app._comp_widgets["fusepy"]["detail_lbl"].cget("text") == "fusepy is installed"
         assert app._comp_widgets["fuse_backend"]["icon_lbl"].cget("text") == "✗"
-        assert app._recheck_lbl.cget("text").endswith("still missing: Disk mounting support.")
+        assert app._recheck_lbl.cget("text").endswith("Still missing: Disk mounting support.")
         assert not app._fuse_ok
 
     def test_a_component_with_no_row_is_skipped(self, env):
@@ -1587,7 +1628,7 @@ class TestSetupScreen:
         monkeypatch.setattr(env.vm.webbrowser, "open", lambda url: opened.append(url))
         app = _setup_app(env)
         assert app._comp_widgets["fusepy"]["detail_lbl"].cget("text") == (
-            "The helper ships inside the app — this copy is damaged. "
+            "The helper ships inside the app. This copy is damaged. "
             "Download QuantaCrypt again to fix it.")
         assert _text_contents(app._comp_widgets["fusepy"]["cmd_box"]) == [""]
         _button(app._setup_frame, "Get QuantaCrypt again")._fire()
@@ -1626,7 +1667,7 @@ class TestSetupScreen:
                             lambda cmd: (_ for _ in ()).throw(OSError("no osascript")))
         _button(app._setup_frame, "Open in Terminal")._fire()
         assert app._comp_widgets["fuse_backend"]["detail_lbl"].cget("text") == (
-            "Couldn't open Terminal — copy the command above and run it yourself.")
+            "Couldn't open Terminal. Copy the command above and run it yourself.")
         assert "fuse_backend" not in app._tickers
 
     def test_without_homebrew_the_row_offers_the_installers(self, env, monkeypatch):
@@ -1729,7 +1770,7 @@ class TestVolumeSelection:
         app.update()
         assert app._mount_auth_var.get() == "shamir"
         assert app._vol_info_lbl.cget("text").startswith(
-            "Split-key volume — needs 3 of 5 shares  ·  file on disk ")
+            "Split-key volume: needs 3 of 5 shares  ·  file on disk ")
         assert app._mount_shares_frame.winfo_ismapped()
 
     def test_a_missing_file_is_only_complained_about_once_the_field_is_left(
@@ -2067,7 +2108,7 @@ class TestMountRun:
         app._do_mount()
         assert _pump_until(app, lambda: not app._busy)
         assert app._mount_err.cget("text") == (
-            "Couldn't mount — The password or shares are incorrect, or the file "
+            "Couldn't mount: The password or shares are incorrect, or the file "
             "has been modified since it was encrypted.")
         assert env.mounted == {} and not os.path.exists(mp)
         assert app.focus_lastfor() is app._mount_pw_entry
@@ -2174,7 +2215,7 @@ class TestMountRun:
         app._do_mount()
         assert _pump_until(app, lambda: not app._busy)
         assert app._mount_err.cget("text") == (
-            f"Couldn't create the mount point folder at {mp} — pick a folder "
+            f"Couldn't create the mount point folder at {mp}: pick a folder "
             "you're allowed to write to.")
         assert app.focus_lastfor() is app._mount_point_entry
 
@@ -2186,7 +2227,7 @@ class TestMountRun:
         app._do_mount()
         assert _pump_until(app, lambda: not app._busy)
         assert app._mount_err.cget("text") == (
-            "Couldn't mount — Access denied — check you have permission to "
+            "Couldn't mount: Access denied. Check you have permission to "
             "read / write this file, and that it isn't open in another app.")
 
     def test_any_other_mount_failure_is_shown_verbatim(self, env, pw_volume):
@@ -2196,7 +2237,7 @@ class TestMountRun:
         app._do_mount()
         assert _pump_until(app, lambda: not app._busy)
         assert app._mount_err.cget("text") == \
-            "Couldn't mount — Volume is already mounted at /elsewhere"
+            "Couldn't mount: Volume is already mounted at /elsewhere"
 
     def test_a_suspicious_journal_warns_instead_of_celebrating(self, env, pw_volume):
         env.mount_suspicious = True
@@ -2314,7 +2355,7 @@ class TestUnmount:
         assert [t for t, _ in env.alerts] == ["Couldn't unmount vault.qcv"]
         assert "Resource busy" in env.alerts[0][1]
         assert app._mount_status.cget("text") == "Couldn't unmount vault.qcv"
-        assert "✗ Couldn't unmount — something is still using it." in \
+        assert "✗ Couldn't unmount. Something is still using it." in \
             _widget_texts(app._mounted_list_frame)
         assert mp in env.mounted
         assert app._unmounting == set(), "a retry must be possible"
@@ -2340,7 +2381,7 @@ class TestUnmount:
         monkeypatch.setattr(env.vm, "reveal_path", lambda p: False)
         _button(app._mounted_list_frame, REVEAL_LABEL)._fire()
         app.update()
-        assert f"Couldn't open the file manager — it's at {mp}" in \
+        assert f"Couldn't open the file manager. It's at {mp}" in \
             _widget_texts(app._mounted_list_frame)
 
 

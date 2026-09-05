@@ -34,6 +34,11 @@ from quantacrypt.core.volume import VOLUME_CHUNK_SIZE, VolumeContainer
 
 # ── FUSE availability check ─────────────────────────────────────────────────
 
+#: Where a FUSE backend's libfuse legitimately lives on macOS.
+_FUSE_LIBRARY_ROOTS = ("/usr/local/lib", "/opt/homebrew/lib",
+                       "/Library/Frameworks", "/Library/Filesystems")
+
+
 def _prepare_fuse_environment() -> None:
     """Point fusepy at FUSE-T's libfuse when nothing else would be found.
 
@@ -45,8 +50,20 @@ def _prepare_fuse_environment() -> None:
     only intervene when it is absent.
     """
     import sys
-    if sys.platform != "darwin" or os.environ.get("FUSE_LIBRARY_PATH"):
+    if sys.platform != "darwin":
         return
+    preset = os.environ.get("FUSE_LIBRARY_PATH")
+    if preset:
+        # fusepy hands this straight to ctypes.CDLL, in the process that
+        # holds every mounted volume's key.  A same-user process that can
+        # shape this app's environment (launchctl setenv, a LaunchAgent)
+        # would otherwise choose the library.  Honour it only when it names
+        # a file under one of the places a FUSE backend is installed.
+        if any(os.path.realpath(preset).startswith(root + os.sep)
+               for root in _FUSE_LIBRARY_ROOTS) and os.path.isfile(preset):
+            return
+        logger.warning("Ignoring FUSE_LIBRARY_PATH=%r: not a FUSE backend location", preset)
+        del os.environ["FUSE_LIBRARY_PATH"]
     if os.path.isdir("/Library/Filesystems/macfuse.fs"):
         return
     for cand in ("/opt/homebrew/lib/libfuse-t.dylib",
@@ -171,6 +188,10 @@ class LRUCache:
         if key in self._cache:
             self._current_bytes -= self._sizes[key]
             del self._cache[key]
+        if len(data) > self._max_bytes:
+            # It could never stay: inserting it would evict every other
+            # entry and then itself.
+            return
 
         self._cache[key] = data
         self._sizes[key] = len(data)
@@ -820,7 +841,7 @@ class QuantaCryptFUSE(_FuseOperations):
             # SIGKILL would; hanging here would lose every other volume too.
             logger.warning(
                 "Emergency save: could not acquire the lock for %s within "
-                "%.1fs — skipping (a filesystem operation is still running)",
+                "%.1fs; skipping (a filesystem operation is still running)",
                 self.volume.path, lock_timeout,
             )
             return
@@ -1125,7 +1146,15 @@ def mount_volume(
         vc = VolumeContainer(volume_path, final_key)
         vc.open()
 
-        # Create mount point if needed
+        # Create mount point if needed.  An existing, non-empty directory
+        # is refused: mounting over it hides its contents until unmount,
+        # and a mistyped path silently landing on a real folder was the
+        # documented way to lose track of files (review F-035).
+        if os.path.isdir(mount_point) and os.listdir(mount_point):
+            raise ValueError(
+                f"Mount point {mount_point!r} is not empty. Choose an empty "
+                "or new folder so nothing is hidden under the mounted volume."
+            )
         os.makedirs(mount_point, exist_ok=True)
 
         fuse_obj = QuantaCryptFUSE(vc, cache_mb=cache_mb)
@@ -1236,8 +1265,8 @@ def unmount_volume(mount_point: str) -> None:
         info = _mounted_volumes.get(mount_point)
         if info is None:
             raise ValueError(
-                f"No QuantaCrypt volume is tracked at {mount_point!r} — "
-                "refusing to run unmount against a path we do not own"
+                f"No QuantaCrypt volume is tracked at {mount_point!r}, "
+                "so unmount will not run against a path we do not own"
             )
 
         # Save state *before* anything else so that if save_all_dirty()
@@ -1271,8 +1300,8 @@ def unmount_volume(mount_point: str) -> None:
                                     timeout=_UNMOUNT_TIMEOUT)
         except subprocess.TimeoutExpired:
             raise RuntimeError(
-                f"Unmount of {mount_point} timed out after {_UNMOUNT_TIMEOUT}s — "
-                "the volume may be in use by another application"
+                f"Unmount of {mount_point} timed out after {_UNMOUNT_TIMEOUT}s. "
+                "The volume may be in use by another application"
             ) from None
         if result.returncode != 0:
             # The volume is still mounted and serving — keep it tracked so
@@ -1281,8 +1310,8 @@ def unmount_volume(mount_point: str) -> None:
             detail = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(
                 f"Unmount of {mount_point} failed"
-                f"{': ' + detail if detail else ''} — "
-                "the volume may be in use by another application"
+                f"{': ' + detail if detail else ''}. "
+                "The volume may be in use by another application"
             )
 
         # Shutdown of this mount is now certain: apply the deferred

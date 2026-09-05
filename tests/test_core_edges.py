@@ -828,6 +828,13 @@ class TestSetattrCoalescingAcrossRenames:
         assert _reopen(path, key).dir_index == {}
 
 
+def _compact_temps(path):
+    """The mkstemp scratch files compact() writes beside *path*."""
+    d, base = os.path.split(path)
+    return [os.path.join(d, n) for n in os.listdir(d)
+            if n.startswith(f".{base}.qc-compact-")]
+
+
 class TestCompactFailureLeavesNoDebris:
     """compact() needs ~2x the container size; the likely failure is disk
     full, and a failed compact must leave both disk and memory usable."""
@@ -842,7 +849,7 @@ class TestCompactFailureLeavesNoDebris:
             f.truncate(vc._data_offset + 10)
         with pytest.raises(ValueError, match="truncated while copying"):
             vc.compact()
-        assert not os.path.exists(path + ".tmp")
+        assert not _compact_temps(path)
 
     def test_a_failed_temp_cleanup_does_not_mask_the_real_error(
             self, volume, monkeypatch):
@@ -861,8 +868,22 @@ class TestCompactFailureLeavesNoDebris:
         monkeypatch.undo()
         # The temp survives precisely because the cleanup failed — that is
         # the branch under test.
-        assert os.path.exists(path + ".tmp")
-        os.remove(path + ".tmp")
+        temps = _compact_temps(path)
+        assert len(temps) == 1
+        os.remove(temps[0])
+
+    def test_a_compacted_container_keeps_its_permission_bits(self, volume):
+        """compact() used to open ``<path>.tmp`` with the umask, so the
+        first compaction widened a 0600 container to 0644."""
+        path, key, vc = volume
+        os.chmod(path, 0o600)
+        vc.write_file("/a.bin", b"x" * 5000)
+        vc.compact()
+        assert oct(os.stat(path).st_mode)[-3:] == "600"
+        os.chmod(path, 0o640)
+        vc.write_file("/b.bin", b"y" * 5000)
+        vc.compact()
+        assert oct(os.stat(path).st_mode)[-3:] == "640"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -926,13 +947,33 @@ class TestFuseEnvironmentPreparation:
         fo._prepare_fuse_environment()
         assert "FUSE_LIBRARY_PATH" not in os.environ
 
-    def test_an_existing_setting_is_never_overwritten(self, monkeypatch):
+    def test_an_existing_setting_in_a_backend_location_is_kept(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
-        monkeypatch.setenv("FUSE_LIBRARY_PATH", "/custom/libfuse.dylib")
+        monkeypatch.setenv("FUSE_LIBRARY_PATH", "/usr/local/lib/libfuse-custom.dylib")
         monkeypatch.setattr(os.path, "isdir", lambda p: False)
         monkeypatch.setattr(os.path, "isfile", lambda p: True)
         fo._prepare_fuse_environment()
-        assert os.environ["FUSE_LIBRARY_PATH"] == "/custom/libfuse.dylib"
+        assert os.environ["FUSE_LIBRARY_PATH"] == "/usr/local/lib/libfuse-custom.dylib"
+
+    def test_a_preset_outside_every_backend_location_is_dropped(self, monkeypatch):
+        """fusepy hands the variable to ctypes.CDLL inside the process that
+        holds every mounted volume's key, so a value planted in the app's
+        environment must not pick the library.  The FUSE-T fallback then
+        applies as if nothing had been set."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("FUSE_LIBRARY_PATH", "/tmp/evil/libfuse.dylib")
+        monkeypatch.setattr(os.path, "isdir", lambda p: False)
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+        fo._prepare_fuse_environment()
+        assert os.environ["FUSE_LIBRARY_PATH"] == "/opt/homebrew/lib/libfuse-t.dylib"
+
+    def test_a_preset_that_is_not_a_file_is_dropped(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("FUSE_LIBRARY_PATH", "/usr/local/lib/missing.dylib")
+        monkeypatch.setattr(os.path, "isdir", lambda p: False)
+        monkeypatch.setattr(os.path, "isfile", lambda p: False)
+        fo._prepare_fuse_environment()
+        assert "FUSE_LIBRARY_PATH" not in os.environ
 
 
 class TestFuseAvailabilityReporting:
@@ -1907,27 +1948,42 @@ class TestEncryptCleanupFailures:
         # appears — "cancelled" still means "nothing written".
         assert not out.exists()
 
-    def test_a_folder_encrypt_survives_a_stranded_staging_zip(self, tmp_path,
-                                                              monkeypatch):
+    def test_a_folder_encrypt_never_writes_a_plaintext_staging_file(self, tmp_path):
+        """The folder is archived straight into the cipher.  The output
+        directory is watched at every progress step: the only files that
+        may ever appear there are the 0600 ciphertext temp and the result.
+        (The previous design zipped to a plaintext staging file beside the
+        output — on a synced or removable destination, a copy of the
+        plaintext that survived its own deletion.)"""
         folder = tmp_path / "docs"
         folder.mkdir()
-        (folder / "a.txt").write_bytes(b"hello")
+        (folder / "a.txt").write_bytes(b"hello " * 10_000)
+        (folder / "b.bin").write_bytes(os.urandom(70_000))
         out = tmp_path / "docs.qcx"
-        real_remove = os.remove
+        seen: set[str] = set()
 
-        def _selective(p):
-            if "qc-staging" in os.path.basename(p):
-                raise OSError(errno.EPERM, "staging is pinned")
-            return real_remove(p)
+        def watch(_msg):
+            seen.update(p.name for p in tmp_path.iterdir())
 
-        monkeypatch.setattr(os, "remove", _selective)
         result = pkg.encrypt_to_qcx(str(folder), str(out), mode="password",
-                                    password=PW)
-        monkeypatch.undo()
+                                    password=PW, progress=watch)
+        seen.update(p.name for p in tmp_path.iterdir())
         assert result["filename"] == "docs.zip"
         assert out.exists() and out.stat().st_size > 0
-        # The completed encryption is what matters; the litter is secondary.
-        assert any("qc-staging" in p.name for p in tmp_path.iterdir())
+        assert not [n for n in seen if "staging" in n or n.endswith(".zip")], seen
+        assert all(n in ("docs", "docs.qcx") or n.startswith(".docs.qcx.qc-enc-")
+                   for n in seen), seen
+        # And the archive inside is a normal zip: stored where deflate
+        # cannot help, deflated where it can, every member intact.
+        got = pkg.decrypt_qcx(str(out), str(tmp_path / "restore"), password=PW) \
+            if (tmp_path / "restore").mkdir() is None else None
+        import zipfile
+        with zipfile.ZipFile(got["output"]) as zf:
+            assert zf.testzip() is None
+            kinds = {i.filename: i.compress_type for i in zf.infolist()}
+            assert kinds["docs/a.txt"] == zipfile.ZIP_DEFLATED
+            assert kinds["docs/b.bin"] == zipfile.ZIP_STORED
+            assert zf.read("docs/b.bin") == (folder / "b.bin").read_bytes()
 
 
 class TestDecryptQcxFailurePaths:
@@ -2269,8 +2325,10 @@ class TestVolumeCreateCancellation:
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestContentIntegrityCheck:
-    """The per-chunk GCM tags authenticate the ciphertext; the whole-file
-    SHA-256 in the envelope is the second, end-to-end guard."""
+    """The per-chunk GCM tags authenticate the ciphertext.  Format-1 files
+    also carry a whole-file SHA-256 in the envelope; format 2 dropped it
+    (the tags, AAD and authenticated chunk count already prove every byte),
+    but a recorded hash is still honoured when one is present."""
 
     @pytest.fixture(scope="class")
     def encrypted(self, tmp_path_factory):
@@ -2287,22 +2345,48 @@ class TestContentIntegrityCheck:
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
         import base64
         argon = cc.argon2id_derive(PW.encode(),
-                                   base64.b64decode(meta["argon_salt"]))
+                                   base64.b64decode(meta["argon_salt"]),
+                                   meta.get("argon2"))
         sk = cc.aes_gcm_decrypt(argon,
                                 base64.b64decode(meta["kyber_sk_enc_nonce"]),
                                 base64.b64decode(meta["kyber_sk_enc"]))
-        ss = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]))
+        ss = cc.kyber_decaps(sk, base64.b64decode(meta["kyber_kem_ct"]),
+                             cc.validate_kem(meta.get("kem")))
         return str(enc), meta, cc.xor_bytes(argon, ss), src.read_bytes()
 
-    def test_a_matching_hash_decrypts(self, encrypted):
+    def test_a_format_2_envelope_carries_no_hash_and_decrypts(self, encrypted):
+        import base64
         import io
         path, meta, key, original = encrypted
+        inner = json.loads(cc.aes_gcm_decrypt(
+            key, base64.b64decode(meta["filename_nonce"]),
+            base64.b64decode(meta["filename_enc"])))
+        assert "sha256" not in inner
         buf = io.BytesIO()
         name, size, ts = cc.decrypt_streaming(path, buf, dict(meta), key)
         assert buf.getvalue() == original
         assert name == "data.bin"
         assert size == len(original)
         assert ts > 0
+
+    def test_a_matching_recorded_hash_decrypts(self, encrypted):
+        """A format-1 style envelope: the hash is present and agrees."""
+        import base64
+        import hashlib
+        import io
+        path, meta, key, original = encrypted
+        inner = json.loads(cc.aes_gcm_decrypt(
+            key, base64.b64decode(meta["filename_nonce"]),
+            base64.b64decode(meta["filename_enc"])))
+        inner["sha256"] = hashlib.sha256(original).hexdigest()
+        nonce, ct = cc.aes_gcm_encrypt(
+            key, json.dumps(inner, separators=(",", ":")).encode())
+        hashed = dict(meta)
+        hashed["filename_nonce"] = base64.b64encode(nonce).decode()
+        hashed["filename_enc"] = base64.b64encode(ct).decode()
+        buf = io.BytesIO()
+        cc.decrypt_streaming(path, buf, hashed, key)
+        assert buf.getvalue() == original
 
     def test_a_disagreeing_recorded_hash_is_refused(self, encrypted):
         import base64

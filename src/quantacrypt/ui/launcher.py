@@ -129,7 +129,7 @@ class LauncherApp(tk.Toplevel):
             and os.path.splitext(p)[1].lower() in (".qcx", ".qcv")
         ]
         if not accepted:
-            self._set_hint("Drop a .qcx or .qcv file — other files can't be opened here.",
+            self._set_hint("Drop a .qcx or .qcv file. Other files can't be opened here.",
                            error=True)
             return
 
@@ -216,7 +216,10 @@ class LauncherApp(tk.Toplevel):
         # ── Recent files ───────────────────────────────────────────────────────
         self._recent_frame = tk.Frame(self, bg=C["bg"])
         self._recent_frame.pack(fill="x", padx=P, pady=(SP["m"], 0))
-        self._build_recent()
+        try:
+            self._build_recent()
+        except Exception:
+            pass   # a broken recents store must not stop the app opening
 
         # ── Footer: version + shortcuts on one line ───────────────────────────
         sc = "  ·  ".join([
@@ -482,7 +485,7 @@ class LauncherApp(tk.Toplevel):
         if meta.get("mode") == "single":
             mode_str = "Password"
         else:
-            mode_str = (f"Split key — any {meta.get('threshold')} of "
+            mode_str = (f"Split key: any {meta.get('threshold')} of "
                         f"{meta.get('total')} shares open it")
         rows = [
             ("File",       os.path.basename(path)),

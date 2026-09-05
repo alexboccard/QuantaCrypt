@@ -77,7 +77,7 @@ struct VolumesView: View {
             // metadata on a fresh mount within seconds — the first save then
             // truncates the suspicious tail for good. This matches the Tk
             // wording, which tells the user to keep a copy first.
-            Text("\(volume.name)'s records don't match what QuantaCrypt last wrote — it may have been altered or swapped for an older copy. It was mounted using the last state that checks out.\n\nIf you didn't expect this, unmount now and keep a copy of the .qcv file before writing anything: macOS writes to a new drive within seconds, and the first write destroys the records that raised this.")
+            Text("\(volume.name)'s records don't match what QuantaCrypt last wrote. It may have been altered or swapped for an older copy. It was mounted using the last state that checks out.\n\nIf you didn't expect this, unmount now and keep a copy of the .qcv file before writing anything: macOS writes to a new drive within seconds, and the first write destroys the records that raised this.")
         }
     }
 
@@ -101,7 +101,7 @@ struct VolumesView: View {
                 .fixedSize(horizontal: false, vertical: true)
             componentRow("Disk mounting support (macFUSE or FUSE-T)", fuse.fuseBackend)
             componentRow("Mounting helper", fuse.fusepy)
-            Text("Install it with Homebrew — a package manager you run in Terminal. If you don't have Homebrew, get it from brew.sh first.")
+            Text("Install it with Homebrew, a package manager you run in Terminal. If you don't have Homebrew, get it from brew.sh first.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -119,7 +119,7 @@ struct VolumesView: View {
                         .controlSize(.small)
                 }
             }
-            Text("It will ask for your Mac's administrator password. FUSE-T is the recommended choice. If you already have macFUSE, that works too — QuantaCrypt uses whichever it finds.")
+            Text("It will ask for your Mac's administrator password. FUSE-T is the recommended choice. If you already have macFUSE, that works too; QuantaCrypt uses whichever it finds.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -184,11 +184,11 @@ struct VolumesView: View {
                     .focused($focus, equals: .createConfirmation)
                     .onSubmit(model.createVolume)
                 strengthRow
-                WarningStrip(text: "If you forget this password the volume is gone — QuantaCrypt cannot recover it, and neither can anyone else.")
+                WarningStrip(text: "If you forget this password the volume is gone. QuantaCrypt cannot recover it, and neither can anyone else.")
             case .splitKey:
                 SplitKeyFields(threshold: $model.createThreshold, total: $model.createTotal)
             }
-            Text("The volume grows as you add files — no fixed size to choose.")
+            Text("The volume grows as you add files, so there's no fixed size to choose.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if model.fuse != nil && !model.mountingAvailable {
@@ -358,7 +358,7 @@ struct VolumesView: View {
             }
             if model.mounted.isEmpty {
                 if model.listLoaded {
-                    Text("No volumes are open. Choose a volume below and unlock it — it appears in Finder as a drive until you unmount it.")
+                    Text("No volumes are open. Choose a volume below and unlock it. It appears in Finder as a drive until you unmount it.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {

@@ -30,9 +30,9 @@ final class ShareValidationTests: XCTestCase {
     }
 
     func testMessageCountsAgainstThreshold() {
-        XCTAssertEqual(ShareValidation.message(shares: ["", ""], threshold: 2), "Enter 2 shares — shares 1, 2 are empty.")
-        XCTAssertEqual(ShareValidation.message(shares: [code, ""], threshold: 2), "Enter 2 shares — share 2 is empty.")
-        XCTAssertEqual(ShareValidation.message(shares: [code, otherCode], threshold: 3), "Enter 3 shares — 2 so far.")
+        XCTAssertEqual(ShareValidation.message(shares: ["", ""], threshold: 2), "Enter 2 shares. Shares 1, 2 are empty.")
+        XCTAssertEqual(ShareValidation.message(shares: [code, ""], threshold: 2), "Enter 2 shares. Share 2 is empty.")
+        XCTAssertEqual(ShareValidation.message(shares: [code, otherCode], threshold: 3), "Enter 3 shares. 2 so far.")
         XCTAssertNil(ShareValidation.message(shares: [code, otherCode], threshold: 2))
         XCTAssertNil(ShareValidation.message(shares: [code, otherCode, ""], threshold: 2))
         // Unknown threshold (auth block unreadable): two or more, the helper says the rest.
@@ -42,7 +42,7 @@ final class ShareValidationTests: XCTestCase {
 
     func testMessageNamesTheUnreadableShare() {
         XCTAssertEqual(ShareValidation.message(shares: [code, "typo"], threshold: 2),
-                       "Share 2 can't be read — expected a QCSHARE- code or a 50-word phrase, got 1 word.")
+                       "Share 2 can't be read: expected a QCSHARE- code or a 50-word phrase, got 1 word.")
     }
 
     func testDuplicatesCompareByDecodedIdentity() {

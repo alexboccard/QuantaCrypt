@@ -379,7 +379,7 @@ class VolumeManagerApp(tk.Toplevel):
         self._fuse_warn = card(parent, padx=SP["m"], pady=SP["s"])
         wrow = tk.Frame(self._fuse_warn, bg=C["surface"])
         wrow.pack(fill="x")
-        tk.Label(wrow, text=f"{ICON['warn']}  Mounting needs disk-mounting support — "
+        tk.Label(wrow, text=f"{ICON['warn']}  Mounting needs disk-mounting support. "
                             "set it up under Mount Existing.",
                  font=F["caption"], bg=C["surface"], fg=C["warning"],
                  wraplength=340, justify="left").pack(side="left", fill="x", expand=True)
@@ -401,7 +401,7 @@ class VolumeManagerApp(tk.Toplevel):
         FlatButton(row, "Browse…", self._browse_save_location,
                    primary=False, small=True).pack(side="left", padx=(SP["s"], 0))
         tk.Label(parent, text="One .qcv file holds everything. The volume grows "
-                              "as you add files — no fixed size to choose.",
+                              "as you add files, so there's no fixed size to choose.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
                  wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(SP["xs"], 0))
 
@@ -446,14 +446,14 @@ class VolumeManagerApp(tk.Toplevel):
         srow.pack(fill="x")
         ncol = tk.Frame(srow, bg=C["bg"])
         ncol.pack(side="left", padx=(0, SP["xl"]))
-        tk.Label(ncol, text="Total shares (n)", font=F["body_b"],
+        tk.Label(ncol, text="Total shares", font=F["body_b"],
                  bg=C["bg"], fg=C["text"]).pack(anchor="w")
         self._n_var = tk.StringVar(value="3")
         self._n_entry = styled_entry(ncol, textvariable=self._n_var, width=6)
         self._n_entry.pack(anchor="w", pady=(SP["xs"], 0))
         kcol = tk.Frame(srow, bg=C["bg"])
         kcol.pack(side="left")
-        tk.Label(kcol, text="Required to unlock (k)", font=F["body_b"],
+        tk.Label(kcol, text="Required to unlock", font=F["body_b"],
                  bg=C["bg"], fg=C["text"]).pack(anchor="w")
         self._k_var = tk.StringVar(value="2")
         self._k_entry = styled_entry(kcol, textvariable=self._k_var, width=6)
@@ -461,8 +461,9 @@ class VolumeManagerApp(tk.Toplevel):
         self._n_entry.bind("<Return>", lambda e: self._k_entry.focus_set())
         self._k_entry.bind("<Return>", lambda e: self._do_create())
         tk.Label(self._shamir_frame,
-                 text="Split key: any k of the n shares unlock the volume. There is "
-                      "no password — you get the shares right after creation.",
+                 text="Split key: you choose how many shares are needed to unlock the "
+                      "volume. There is "
+                      "no password; you get the shares right after creation.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
                  wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(SP["s"], 0))
 
@@ -603,7 +604,7 @@ class VolumeManagerApp(tk.Toplevel):
                 pass  # probe unavailable → fall through to the prompt
             if not confirm(self, "Overwrite volume?",
                            f"{os.path.basename(path)} already exists. Creating a new "
-                           "volume here will PERMANENTLY destroy the existing one — "
+                           "volume here will PERMANENTLY destroy the existing one. "
                            "its contents cannot be recovered.\n\nOverwrite it?",
                            yes="Overwrite", no="Cancel", danger=True):
                 return
@@ -679,7 +680,7 @@ class VolumeManagerApp(tk.Toplevel):
             return
         self._cancel_event.set()
         self._cancel_btn.enable(False)
-        self._err.config(text="Cancelling — finishing the current step, then "
+        self._err.config(text="Cancelling. Finishing the current step, then "
                               "deleting the unfinished volume…", fg=C["text3"])
 
     def _end_create_busy(self):
@@ -692,7 +693,7 @@ class VolumeManagerApp(tk.Toplevel):
         if self._progress is not None:
             self._progress.stop()
         self._end_create_busy()
-        self._err.config(text="Creation cancelled — nothing was kept.", fg=C["text3"])
+        self._err.config(text="Creation cancelled. Nothing was kept.", fg=C["text3"])
         self._loc_entry.focus_set()
 
     def _on_create_done(self, path: str, meta: dict, shares: list | None = None):
@@ -726,7 +727,7 @@ class VolumeManagerApp(tk.Toplevel):
         # Accept either an exception or a raw string; translate to a
         # user-friendly message before displaying.
         msg = friendly_error(err) if isinstance(err, BaseException) else str(err)
-        self._err.config(text=f"Couldn't create the volume — {msg}", fg=C["error"])
+        self._err.config(text=f"Couldn't create the volume: {msg}", fg=C["error"])
         self._loc_entry.focus_set()
 
     def _show_shares_dialog(self, shares: list[str], meta: dict):
@@ -776,6 +777,12 @@ class VolumeManagerApp(tk.Toplevel):
             btn.set_text(f"{ICON['ok']} Copied")
             win.after(1500, lambda: btn.set_text("Copy") if btn.winfo_exists() else None)
 
+        def _copy_event(_event, share: str, btn: FlatButton):
+            # ⌘C and the context menu's Copy both raise <<Copy>> on the
+            # Text; Tk's stock handler would skip the marker and the wipe.
+            _copy(share, btn)
+            return "break"
+
         for i, share in enumerate(shares):
             inner = card(win, padx=SP["m"], pady=SP["s"])
             inner.outer.pack(fill="x", padx=P, pady=(0, SP["xs"] + 2))
@@ -796,6 +803,7 @@ class VolumeManagerApp(tk.Toplevel):
             txt.config(state="disabled")
             txt.pack(fill="x", pady=(SP["xs"], 0))
             bind_context_menu(txt)
+            txt.bind("<<Copy>>", lambda e, s=share, h=holder: _copy_event(e, s, h["btn"]))
 
         timer_lbl.pack(padx=P, anchor="w")
         saved_lbl.pack(padx=P, anchor="w")
@@ -811,7 +819,7 @@ class VolumeManagerApp(tk.Toplevel):
             )
             if not p:
                 return
-            lines = [f"QuantaCrypt recovery shares — {k} of {n} needed", ""]
+            lines = [f"QuantaCrypt recovery shares: {k} of {n} needed", ""]
             for i, share in enumerate(shares):
                 lines += [f"Share {i + 1} of {n}:", share, ""]
             try:
@@ -825,15 +833,15 @@ class VolumeManagerApp(tk.Toplevel):
             note = (f" A file named {os.path.basename(p)} already existed, so this one "
                     f"was saved as {os.path.basename(written)}." if renamed else "")
             saved_lbl.config(text=f"{ICON['ok']} Saved all {n} shares to "
-                                  f"{os.path.basename(written)} — keep that file somewhere "
+                                  f"{os.path.basename(written)}. Keep that file somewhere "
                                   f"safe, then split it up.{note}")
 
         def _finish():
             if not state["saved"]:
-                extra = (" Copying isn't enough — the clipboard clears in 60 seconds."
+                extra = (" Copying isn't enough; the clipboard clears in 60 seconds."
                          if state["copied"] else "")
                 ok = confirm(win, "Shares not saved",
-                             f"Save the shares first — without them, {vol_name} can "
+                             f"Save the shares first. Without them, {vol_name} can "
                              f"never be opened again.{extra}\n\nLeave and discard the shares?",
                              yes="Leave and discard", no="Go back", danger=True)
                 # Tk has no grab stack — the confirm took this window's
@@ -947,7 +955,7 @@ class VolumeManagerApp(tk.Toplevel):
                 # "-m pip" would just respawn QuantaCrypt.  fusepy ships
                 # inside the bundle, so a missing import means the
                 # install is broken, not incomplete.
-                detail_lbl.config(text="The helper ships inside the app — this copy "
+                detail_lbl.config(text="The helper ships inside the app. This copy "
                                        "is damaged. Download QuantaCrypt again to fix it.")
                 btn = FlatButton(btn_row, "Get QuantaCrypt again",
                                  lambda: webbrowser.open(_RELEASES_URL), small=True)
@@ -1046,11 +1054,11 @@ class VolumeManagerApp(tk.Toplevel):
                         ])
                     except Exception:
                         widgets["detail_lbl"].config(
-                            text="Couldn't open Terminal — copy the command above "
+                            text="Couldn't open Terminal. Copy the command above "
                                  "and run it yourself.", fg=C["error"])
                         return
                     self._start_ticker("fuse_backend",
-                                       "Check Terminal — install in progress…")
+                                       "Check Terminal. Install in progress…")
                     term_btn.enable(False)
 
                 term_btn = FlatButton(btn_row, "Open in Terminal", _open_terminal,
@@ -1132,7 +1140,7 @@ class VolumeManagerApp(tk.Toplevel):
             self._focus_first()
         else:
             self._recheck_lbl.config(
-                text=f"Checked just now — still missing: {', '.join(missing)}.")
+                text=f"Checked just now. Still missing: {', '.join(missing)}.")
 
     # ── Mount UI ─────────────────────────────────────────────────────────────
 
@@ -1169,7 +1177,7 @@ class VolumeManagerApp(tk.Toplevel):
         self._mount_point_entry.bind("<Return>", lambda e: self._do_mount())
         FlatButton(row2, "Choose…", self._browse_mount_point,
                    primary=False, small=True).pack(side="left", padx=(SP["s"], 0))
-        tk.Label(parent, text="Filled in from the volume name — a folder in your "
+        tk.Label(parent, text="Filled in from the volume name, a folder in your "
                               "home directory that appears as a drive while mounted.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
                  wraplength=self._WRAP, justify="left").pack(anchor="w", pady=(2, 0))
@@ -1215,7 +1223,7 @@ class VolumeManagerApp(tk.Toplevel):
                                           primary=False, small=True)
         self._mount_load_btn.pack(side="right")
         tk.Label(self._mount_shares_frame,
-                 text="Paste one share per line — QCSHARE- codes or 50-word phrases — "
+                 text="Paste one share per line, as QCSHARE- codes or 50-word phrases. "
                       "or load the share files this app saved.",
                  font=F["caption"], bg=C["bg"], fg=C["text3"],
                  wraplength=self._WRAP, justify="left").pack(anchor="w")
@@ -1282,7 +1290,7 @@ class VolumeManagerApp(tk.Toplevel):
             k = auth_params.get("threshold", "?")
             n = auth_params.get("total", "?")
             self._vol_info_lbl.config(
-                text=f"Split-key volume — needs {k} of {n} shares{size_hint}",
+                text=f"Split-key volume: needs {k} of {n} shares{size_hint}",
                 fg=C["text3"])
         else:
             self._mount_auth_var.set("password")
@@ -1483,7 +1491,7 @@ class VolumeManagerApp(tk.Toplevel):
         name = os.path.basename(vol_path)
         if confirm(
                 self, "This volume may have been altered",
-                f"{name}'s records don't match what QuantaCrypt last wrote — "
+                f"{name}'s records don't match what QuantaCrypt last wrote. "
                 "it may have been altered or swapped for an older copy. It was "
                 "mounted using the last state that checks out.\n\n"
                 "If you didn't expect this, unmount now and keep a copy of the "
@@ -1506,11 +1514,11 @@ class VolumeManagerApp(tk.Toplevel):
                        "folder in your home directory, e.g. "
                        f"~/QuantaCrypt Volumes/{name}.")
             else:
-                msg = (f"Couldn't create the mount point folder at {mount_point} — "
+                msg = (f"Couldn't create the mount point folder at {mount_point}: "
                        "pick a folder you're allowed to write to.")
             focus = self._mount_point_entry
         elif isinstance(msg, BaseException):
-            msg = f"Couldn't mount — {friendly_error(msg)}"
+            msg = f"Couldn't mount: {friendly_error(msg)}"
             if "password" in msg.lower() or "share" in msg.lower():
                 focus = (self._mount_pw_entry if self._mount_auth_var.get() == "password"
                          else self._mount_shares_text)
@@ -1557,7 +1565,7 @@ class VolumeManagerApp(tk.Toplevel):
             return
         detail = friendly_error(err)
         self._row_notes[mount_point] = (
-            f"{ICON['err']} Couldn't unmount — something is still using it.", C["error"])
+            f"{ICON['err']} Couldn't unmount. Something is still using it.", C["error"])
         self._refresh_mounted_list(force=True)
         self._set_status(f"Couldn't unmount {name}", C["error"])
         alert(self, f"Couldn't unmount {name}",
@@ -1575,7 +1583,7 @@ class VolumeManagerApp(tk.Toplevel):
     def _reveal_mount(self, mount_point: str):
         if not reveal_path(mount_point):
             self._row_notes[mount_point] = (
-                f"Couldn't open the file manager — it's at {mount_point}", C["warning"])
+                f"Couldn't open the file manager. It's at {mount_point}", C["warning"])
             self._refresh_mounted_list(force=True)
 
     # ── Mounted list ─────────────────────────────────────────────────────────

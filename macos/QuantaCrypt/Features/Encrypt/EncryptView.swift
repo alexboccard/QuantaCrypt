@@ -38,7 +38,7 @@ struct EncryptView: View {
             }
             Button("Cancel", role: .cancel) { model.wrongSection = nil }
         } message: { target in
-            Text("\(Format.fileName(target.path)) is a QuantaCrypt file. Encrypting it again would just wrap it in a second layer — you probably want to open it instead.")
+            Text("\(Format.fileName(target.path)) is a QuantaCrypt file. Encrypting it again would just wrap it in a second layer. You probably want to open it instead.")
         }
         // The outcome lands far below the button that was pressed; without
         // this a VoiceOver user gets silence and has to go hunting for it.
@@ -70,7 +70,7 @@ struct EncryptView: View {
                          systemImage: "arrow.down.doc",
                          chooseTitle: "Choose file or folder…",
                          onChoose: model.chooseSource,
-                         accepts: { _ in true },
+                         accepts: EncryptModel.acceptsDrop,
                          onDrop: { model.setSource($0.path) })
             }
         }
@@ -87,7 +87,7 @@ struct EncryptView: View {
             // blobs and a sheet that will not close until files are saved.
             Text(model.mode == .password
                  ? "One password opens the file. Anyone who has it can open the file; nobody who doesn't, can."
-                 : "The key is split into shares handed to different people. Any k of them can open the file together; fewer cannot.")
+                 : "The key is split into shares handed to different people. You choose how many of them are needed to open the file; fewer than that cannot.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -95,7 +95,7 @@ struct EncryptView: View {
             case .password:
                 NewPasswordFields(password: $model.password, confirmation: $model.confirmation,
                                   onSubmit: model.encrypt)
-                WarningStrip(text: "If you forget this password the file is gone — QuantaCrypt cannot recover it, and neither can anyone else.")
+                WarningStrip(text: "If you forget this password the file is gone. QuantaCrypt cannot recover it, and neither can anyone else.")
             case .splitKey:
                 SplitKeyFields(threshold: $model.threshold, total: $model.total)
             }
@@ -182,12 +182,11 @@ struct EncryptView: View {
                 // still fresh in mind.
                 Button("Check it opens") { state.verifyEncrypted(result.output) }
                 Button("Show in Finder") { Finder.reveal(result.output) }
-                if result.mode == "shamir", let shares = result.shares, let k = result.threshold, let n = result.total {
+                // Gone once "Check it opens" has verified the file: the
+                // shares are dropped from the model at that point.
+                if result.mode == "shamir", result.shares != nil {
                     Button("Show shares again") {
-                        model.sharesToShow = SharesPresentation(
-                            shares: shares,
-                            context: ShareFiles.Context(stem: Format.stem(result.output),
-                                                        protectedName: result.filename, k: k, n: n, kind: .qcxFile))
+                        model.sharesToShow = result.makeSharesPresentation()
                     }
                 }
                 Button("Encrypt another file", action: model.reset)

@@ -230,6 +230,7 @@ class TestLoadPkg:
     def _make_meta(self):
         return {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
+            "kem": cc.KEM_DEFAULT, "argon2": cc.argon2_params(),
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
             "kyber_sk_enc":"aa==","payload_nonce":"aa==","payload_chunk_count":1,
             "filename_nonce":"aa==","filename_enc":"aa==","hmac":"x",
@@ -378,6 +379,7 @@ class TestMagicConstant:
     def test_magic_used_in_file_format(self):
         meta = {
             "version": cc.FORMAT_VERSION, "mode": "single", "key_bits": 512,
+            "kem": cc.KEM_DEFAULT, "argon2": cc.argon2_params(),
             "argon_salt":"aa==","kyber_kem_ct":"aa==","kyber_sk_enc_nonce":"aa==",
             "kyber_sk_enc":"aa==","payload_nonce":"aa==","payload_chunk_count":1,
             "filename_nonce":"aa==","filename_enc":"aa==","hmac":"x",
@@ -1071,11 +1073,15 @@ class TestSizeAnnotation:
 class TestStreamingConstants:
     """Crypto core constants and module-level exports."""
 
-    def test_format_version_is_1(self):
-        assert cc.FORMAT_VERSION == 1
+    def test_format_version_is_2(self):
+        """Format 2: ML-KEM-768, recorded Argon2 parameters, full HMAC."""
+        assert cc.FORMAT_VERSION == 2
 
-    def test_max_format_version_is_1(self):
-        assert cc.MAX_FORMAT_VERSION == 1
+    def test_max_format_version_is_2(self):
+        assert cc.MAX_FORMAT_VERSION == 2
+
+    def test_format_1_is_still_readable(self):
+        assert cc.MIN_FORMAT_VERSION == 1
 
     def test_chunk_size_is_power_of_two(self):
         cs = cc.CHUNK_SIZE
@@ -1215,11 +1221,11 @@ class TestStreamingRoundTrip:
                                base64.b64decode(meta2["kyber_sk_enc_nonce"]),
                                base64.b64decode(meta2["kyber_sk_enc"]))
 
-    def test_version_field_is_1(self, tmp_path):
+    def test_version_field_is_the_current_format(self, tmp_path):
         import os
         data = os.urandom(256)
         _, _, _, _, meta = self._enc_dec(tmp_path, data)
-        assert meta["version"] == 1
+        assert meta["version"] == cc.FORMAT_VERSION == 2
 
     def test_no_payload_field_in_meta(self, tmp_path):
         """Meta never stores the payload blob in JSON — it's on disk as chunks."""
@@ -1367,7 +1373,7 @@ class TestShamirStreaming:
             f.write(cc.MAGIC + len(blob).to_bytes(4, "big") + blob)
 
         assert len(shares) == 3
-        assert meta["version"] == 1
+        assert meta["version"] == cc.FORMAT_VERSION
         assert meta["payload_chunk_count"] > 0
 
         # Decrypt with k=2 shares (shares 0 and 2)
@@ -1877,7 +1883,7 @@ class TestVolumeManagerParseShareText:
 
     def _save_all_text(self, shares, k=2, n=3):
         # Exactly the layout VolumeManagerApp._show_shares_dialog._save_all writes
-        lines = [f"QuantaCrypt recovery shares — {k} of {n} needed", ""]
+        lines = [f"QuantaCrypt recovery shares: {k} of {n} needed", ""]
         for i, share in enumerate(shares):
             lines += [f"Share {i + 1} of {n}:", share, ""]
         return "\n".join(lines)

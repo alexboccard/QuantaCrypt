@@ -113,7 +113,12 @@ class Service:
     # ── I/O ──────────────────────────────────────────────────────────────────
 
     def emit(self, obj: dict) -> None:
-        line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        # allow_nan=False: Python would happily write NaN/Infinity, which
+        # no strict JSON decoder (the Swift client's included) accepts —
+        # the line would be dropped and the request would never finish.
+        # Failing here turns that into an error event instead.
+        line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False,
+                          allow_nan=False)
         with self._wlock:
             self._out.write(line + "\n")
             self._out.flush()
