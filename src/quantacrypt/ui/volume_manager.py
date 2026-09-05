@@ -1023,7 +1023,11 @@ class VolumeManagerApp(tk.Toplevel):
                            if result.stderr.strip() else "Unknown error")
                     self._after(lambda: self._on_install_fail(component_key, err))
             except Exception as e:
-                self._after(lambda: self._on_install_fail(component_key, str(e)))
+                # Bound now: Python unbinds ``e`` when the except block ends,
+                # and this lambda runs later on the Tk thread — it raised
+                # NameError, the failure was never rendered, the ticker
+                # counted on and the button stayed disabled.
+                self._after(lambda exc=e: self._on_install_fail(component_key, str(exc)))
 
         threading.Thread(target=_worker, daemon=True).start()
 

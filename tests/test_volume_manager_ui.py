@@ -1593,15 +1593,15 @@ class TestSetupScreen:
             lambda: app._comp_widgets["fusepy"]["detail_lbl"].cget("text") ==
             "Install failed: Unknown error")
 
-    def test_an_install_that_cannot_start_leaves_the_row_stuck(
+    def test_an_install_that_cannot_start_reports_the_failure(
             self, env, monkeypatch):
-        """Documents a real defect.  ``_run_install`` hands the exception to
-        ``after`` as ``lambda: self._on_install_fail(key, str(e))``; Python
-        unbinds ``e`` when the except block ends, so the callback raises
-        NameError, the failure is never rendered, the elapsed ticker keeps
-        counting and the button stays disabled.  The create and mount workers
-        next door use the ``lambda exc=e:`` form that survives.  Reported as a
-        defect."""
+        """``_run_install`` used to hand the exception to ``after`` as
+        ``lambda: ... str(e)``; Python unbinds ``e`` when the except block
+        ends, so the callback raised NameError, the failure was never
+        rendered, the elapsed ticker kept counting and the button stayed
+        disabled.  (The earlier version of this test pinned that stuck state
+        by watching the ticker read exactly "1s", which is how it became the
+        one flaky test in CI.)"""
         app = _setup_app(env)
 
         def _boom(cmd, **kw):
@@ -1610,13 +1610,13 @@ class TestSetupScreen:
         monkeypatch.setattr(env.vm.subprocess, "run", _boom)
         btn = _button(app._setup_frame, "Install helper")
         btn._fire()
-        # A whole second after the failure the row is still counting up.
         assert _pump_until(
             app,
-            lambda: app._comp_widgets["fusepy"]["detail_lbl"].cget("text") ==
-            "Installing… 1s", 4)
-        assert "fusepy" in app._tickers
-        assert not btn._enabled
+            lambda: app._comp_widgets["fusepy"]["detail_lbl"].cget("text").startswith(
+                "Install failed"))
+        assert "timed out" in app._comp_widgets["fusepy"]["detail_lbl"].cget("text")
+        assert btn._enabled, "the user must be able to try again"
+        assert "fusepy" not in app._tickers
 
     def test_a_bundled_copy_points_at_a_re_download_instead_of_pip(
             self, env, monkeypatch):
